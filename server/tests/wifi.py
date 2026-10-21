@@ -1,72 +1,168 @@
-"""WiFi 测试 - on/off 开关切换测试 (产线友好, 不需 AP)
+"""WiFi 测试 —— 软件开关 + 射频检查 + 扫描 (§6.4)
 
-逻辑:
-  - N 次循环, 每次:
-    1. ip link set wlan0 up    → 检查 /sys/.../operstate = "up"
-    2. 停 per_op 秒
-    3. ip link set wlan0 down  → 检查 operstate = "down"
-    4. 停 0.5s
-  - 任一次失败 → 立即 fail
-  - 全部 N 次通过 → pass
+4 步顺序执行, 每步都有明确的失败归因:
 
-适用:
-  - 工厂无 AP / 屏蔽室场景
-  - 测 WiFi 子系统基本开关功能 + 驱动稳定性
-  - 不依赖 RF / 信号强度
+  ① 软件开关响应  ip link set down → 等 1s → ip link set up
+                   两句都退出 0 才算驱动响应了命令
+  ② 状态确认      ip link show <iface> → state UP (操作确实生效)
+  ③ 射频检查      rfkill list wifi → 无 `blocked: yes` (软/硬都没被屏蔽)
+  ④ 扫描执行      iw dev <iface> scan (≤15s), 走 4a-4d 降级链
 
-driver 兼容: 步骤 1 用 iw / iwlist / nmcli 检测接口存在, 兼容 skw 等厂商驱动
+**为什么 ④ 要有降级链 —— 环境问题 ≠ 设备问题**:
+  `iw dev wlan0 scan` 在周边一个 AP 都没有的环境下, 驱动照样正常完成扫描,
+  输出 BSS 表头 + `scan completed`, **退出码 0**, 只是结果列表为空。
+  这条命令成功跑完 = 射频通路已工作。扫不到 SSID 仅仅是环境里没 AP,
+  不该判设备坏。所以:
+
+    4a 首次扫描        扫到 ≥1 SSID                    → passed
+    4b 重试            仍未命中, 间隔 5s 重试, 最多 2 次 (共 3 次)
+    4c 命令级降级      0 SSID 但 rc=0 且输出含扫描完成标志 → passed
+                       + degraded=true + "环境无 AP, 射频通路已验证"
+    4d 驱动级失败      报错 / 非 0 退出 / 超时 / 无扫描完成标志
+                       → failed, **不设降级** —— 驱动报错就是驱动坏了, 必须暴露
+
+**为什么不连 AP / 不验 WPA**: 凭证管理、握手超时、AP 型号差异都会引入大量
+额外变量, 反而降低可重复性。屏蔽这层换来「不依赖特定 AP / 不依赖凭证 /
+老化阶段纯驱动检查」的稳定测试。WPA 层缺陷率约 5%, 出货后现场报修成本可控。
+
+**为什么不卡 RSSI 阈值**: 工位信号强度受隔墙/金属工位/邻机干扰影响很大,
+卡固定 dBm 会把"能用但现场信号弱"误判为不合格。本项只验「驱动/射频/扫描」
+三件事全通。
 """
 import asyncio
 import os
 import re
-import shutil
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional
+from typing import List, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, run_cmd, is_root, find_wifi_iface, with_sudo, sudo_hint_if_unavailable
+from ._tools import find_tool, find_wifi_iface, with_sudo, sudo_hint_if_unavailable
+
+# §11.3: 精确正则, 不做 substring 匹配。
+# **注意**: 行内空白一律用 `[ \t]` 不用 `\s` —— Python 的 `\s` 包含 \n,
+# 用 `\s*` 会跨行, 把下一行的内容吃进来 (空 SSID 行曾把 "scan completed"
+# 当成 SSID 读走)。
+#
+# `ip link show` 里 "UP" 同时出现在 flags 的 <NO-CARRIER,...,UP> 里和
+# "state UP" 里, 所以只认 state 后面的取值。
+_RE_LINK_STATE = re.compile(
+    r"\bstate[ \t]+(UP|DOWN|UNKNOWN|DORMANT|LOWERLAYERDOWN|TESTING)\b"
+)
+_RE_RFKILL_BLOCKED = re.compile(
+    r"^[ \t]*(?:Soft|Hard)[ \t]+blocked:[ \t]*(yes|no)[ \t]*$", re.MULTILINE
+)
+# 扫描完成标志 —— 4c 降级通道的判定依据 (三个任一)
+_RE_SCAN_COMPLETED = re.compile(
+    r"^[ \t]*scan[ \t]+completed[ \t]*$", re.MULTILINE | re.IGNORECASE
+)
+_RE_BSS_HEADER = re.compile(r"^BSS[ \t]+[0-9a-f]{2}(?::[0-9a-f]{2}){5}", re.MULTILINE)
+_RE_RESULTS = re.compile(r"^[ \t]*Results:[ \t]*$", re.MULTILINE)
+# 每条 BSS 的 SSID 行 —— 缩进后跟 "SSID: xxx"
+_RE_SSID_LINE = re.compile(r"^[ \t]+SSID:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 
 
-@dataclass
-class _CmdResult:
-    returncode: int
-    stdout: str
-    stderr: str
+def _scan_completed(text: str) -> bool:
+    """输出是否表明扫描真的跑完了 —— 4c 的判定依据。"""
+    return bool(
+        _RE_SCAN_COMPLETED.search(text)
+        or _RE_BSS_HEADER.search(text)
+        or _RE_RESULTS.search(text)
+    )
 
 
-async def _read_operstate(iface: str) -> str:
-    """读 /sys/class/net/<iface>/operstate, 返回 'up' / 'down' / 'unknown' / '?'."""
-    p = Path(f"/sys/class/net/{iface}/operstate")
-    try:
-        return p.read_text().strip()
-    except Exception:
-        return "?"
+def _parse_ssids(text: str) -> List[str]:
+    """提取扫描到的 SSID 列表 —— 按 BSS 分段, 只认 BSS 段内的 SSID 行。
 
-
-async def _iface_exists(iface: str) -> bool:
-    return os.path.isdir(f"/sys/class/net/{iface}")
+    直接数 `SSID:` 行会把 `iw dev wlan0` 开头那行接口自身的 SSID 也算进去,
+    所以先按 BSS 头切段, 再在每段里取 SSID。
+    """
+    hits = list(_RE_BSS_HEADER.finditer(text))
+    out: List[str] = []
+    for i, m in enumerate(hits):
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(text)
+        s = _RE_SSID_LINE.search(text, m.end(), end)
+        if s and s.group(1):
+            out.append(s.group(1))
+    return out
 
 
 @register
 class WiFiTest(TestCase):
     name = "wifi"
-    display_name = "WiFi 开关测试"
-    description = "多次开/关 wlan0, 验证切换功能 + 驱动稳定性"
+    display_name = "WiFi 验证"
+    description = "软件开关 + 射频检查 + 扫描 (环境无 AP 时走降级通道)"
+
+    def __init__(self):
+        self.proc = None
+        self.cancel_done = False
+
+    async def cancel(self):
+        """runner.stop() 会 await 到这里 —— 让正在跑的 iw scan 立刻停下。"""
+        if self.proc and self.proc.returncode is None and not self.cancel_done:
+            self.cancel_done = True
+            try:
+                self.proc.terminate()
+                try:
+                    await asyncio.wait_for(self.proc.wait(), 2)
+                except asyncio.TimeoutError:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    async def _run(self, cmd: List[str], timeout: float) -> Tuple[int, str, str]:
+        """跑一条已包好 sudo 的命令, 返回 (rc, stdout, stderr). 超时 kill."""
+        self.cancel_done = False
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return -1, "", f"command not found: {' '.join(cmd)}"
+        try:
+            out, err = await asyncio.wait_for(self.proc.communicate(), timeout=timeout)
+            rc = self.proc.returncode if self.proc.returncode is not None else -1
+            return rc, out.decode(errors="replace"), err.decode(errors="replace")
+        except asyncio.TimeoutError:
+            await self.cancel()
+            return -1, "", f"timeout after {timeout}s"
 
     async def run(self, ctx: TestContext) -> TestResult:
         result = TestResult()
         t_cfg = ctx.test_config
-        times = max(1, int(t_cfg.get("times", 5)))
-        per_op = max(0.5, float(t_cfg.get("per_op_sec", 1.0)))
-        # 自动找 WiFi 接口 (A527 skw 驱动常在 wlan0, 但有些板用 wlp* 或 wlx*)
-        iface = ctx.config.get("interfaces", {}).get("wifi")
-        if not iface or iface == "wlan0":  # 没指定或默认值, 试自动找
-            detected = find_wifi_iface()
-            if detected:
-                iface = detected
-        await ctx.on_log(f"[WiFi] 接口: {iface}")
+
+        # 接口名: 显式配置优先。**只在留空时**才自动探测 —— 一块板上可能有
+        # wlan0/wlan1 两块无线, 自动探测按字典序取第一个, 未必是产线要测的那块。
+        # 曾经写成 `iface == "wlan0"` 也触发探测, 会让操作员显式指定的值被覆盖。
+        iface = (t_cfg.get("iface")
+                 or ctx.config.get("interfaces", {}).get("wifi") or "").strip()
+        if not iface:
+            iface = find_wifi_iface() or "wlan0"
+
+        settle = float(t_cfg.get("switch_settle_sec", 1.0))
+        scan_timeout = float(t_cfg.get("scan_timeout_sec", 15))
+        scan_retries = int(t_cfg.get("scan_retry_count", 2))    # 4b: 额外重试次数
+        scan_retry_gap = float(t_cfg.get("scan_retry_gap_sec", 5))
+
+        # ── 工具预检 (§11.1 find_tool) ──
+        ip_bin = find_tool("ip")
+        rfkill_bin = find_tool("rfkill")
+        iw_bin = find_tool("iw")
+        missing = [n for n, b in (("ip", ip_bin), ("rfkill", rfkill_bin),
+                                 ("iw", iw_bin)) if not b]
+        if missing:
+            result.status = "error"
+            result.error = (
+                f"未找到: {', '.join(missing)}. 解决: sudo bash scripts/install_deps.sh "
+                "(见 docs/需求设计.md §11.7)"
+            )
+            await ctx.on_log(f"[WiFi] ✗ {result.error}")
+            return result
 
         # §11.2: 需要 root 的调用走命令级 sudo -n (服务本身不提权启动)。
         # sudo 不可用 → 判 error, **不**静默降级成 skipped —— 那会让工人
@@ -75,176 +171,187 @@ class WiFiTest(TestCase):
             await ctx.on_log(f"[WiFi] ✗ {result.error}")
             return result
 
-        # 必须有 ip
-        ip_bin = find_tool("ip")
-        if not ip_bin:
-            result.status = "error"
-            result.error = "未找到 ip 命令. 解决: sudo bash scripts/install_deps.sh"
-            await ctx.on_log(f"[WiFi] ✗ {result.error}")
-            return result
-
-        # 接口存在性
-        if not await _iface_exists(iface):
+        if not os.path.isdir(f"/sys/class/net/{iface}"):
             result.status = "error"
             detected = find_wifi_iface() or "(找不到)"
             result.error = (
-                f"接口 {iface} 不存在. "
-                f"自动找: {detected}. "
+                f"接口 {iface} 不存在. 自动找: {detected}. "
                 f"原因: 1) 没 WiFi 硬件 2) skw 驱动未加载 3) 接口名不同"
             )
             await ctx.on_log(f"[WiFi] ✗ {result.error}")
             return result
 
-        # rfkill 检查: 软件 / 硬件 block 都会让 up 后 operstate != "up"
-        rfkill_bin = find_tool("rfkill")
-        if rfkill_bin:
-            rc, _, _ = await run_cmd(with_sudo([rfkill_bin, "list"]), 5.0)
-            if rc == 0 and "soft blocked: yes" in _:
+        await ctx.on_log(
+            f"[WiFi] 接口={iface} | 工具: ip={ip_bin}, rfkill={rfkill_bin}, iw={iw_bin}"
+        )
+        result.metrics["iface"] = iface
+
+        async def fail_at(step: int, reason: str):
+            """任一步失败 → failed, 并在 step_failed 里指出是哪一步 (§6.4)。"""
+            result.status = "failed"
+            result.metrics["step_failed"] = step
+            result.metrics["step_failed_reason"] = reason[:400]
+            result.error = f"第 {step} 步失败: {reason[:300]}"
+            await ctx.on_log(f"[WiFi] ❌ {result.error}")
+
+        # ══════════ ① 软件开关响应 ══════════
+        await ctx.on_progress(10, "① 软件开关响应")
+        await ctx.on_log(
+            f"[WiFi] ① 软件开关响应 — ip link set down → 等 {settle}s → set up"
+        )
+        rc, _, err = await self._run(
+            with_sudo([ip_bin, "link", "set", iface, "down"]), 5
+        )
+        if rc != 0:
+            await fail_at(1, f"`ip link set {iface} down` 退出码 {rc}: "
+                            f"{(err or '').strip()[:200]}")
+            await ctx.on_progress(100, "失败")
+            return result
+
+        if await ctx.is_cancelled():
+            result.status = "stopped"
+            return result
+
+        await asyncio.sleep(settle)
+        rc, _, err = await self._run(
+            with_sudo([ip_bin, "link", "set", iface, "up"]), 5
+        )
+        if rc != 0:
+            await fail_at(1, f"`ip link set {iface} up` 退出码 {rc}: "
+                            f"{(err or '').strip()[:200]}")
+            await ctx.on_progress(100, "失败")
+            return result
+        await ctx.on_log("[WiFi]   ✓ down / up 两句都退出 0 —— 驱动响应了命令")
+        await ctx.on_progress(25, "① 开关 OK")
+
+        # ══════════ ② 状态确认 ══════════
+        await ctx.on_log("[WiFi] ② 状态确认 — ip link show")
+        rc, out, err = await self._run(with_sudo([ip_bin, "link", "show", iface]), 5)
+        if rc != 0:
+            await fail_at(2, f"`ip link show {iface}` 退出码 {rc}: "
+                            f"{(err or '').strip()[:200]}")
+            await ctx.on_progress(100, "失败")
+            return result
+
+        m = _RE_LINK_STATE.search(out)
+        state = m.group(1) if m else "UNKNOWN"
+        result.metrics["ip_link_state"] = state
+        if state != "UP":
+            await fail_at(2, f"操作后 state 是 '{state}', 期望 'UP' —— 开关未实际生效")
+            await ctx.on_progress(100, "失败")
+            return result
+        await ctx.on_log(f"[WiFi]   ✓ state={state} —— 操作实际生效")
+        await ctx.on_progress(45, "② 状态 UP")
+
+        # ══════════ ③ 射频检查 ══════════
+        await ctx.on_log("[WiFi] ③ 射频检查 — rfkill list wifi")
+        rc, out, err = await self._run(with_sudo([rfkill_bin, "list", "wifi"]), 5)
+        blocked = "no"
+        if rc != 0:
+            # rfkill 报错本身不判 failed: 有些内核没有 rfkill 支持, 而 ① ② 已经
+            # 证明射频通路响应了命令。记 unknown 交给产线人工看, 不据此否掉整项。
+            blocked = "unknown"
+            await ctx.on_log(
+                f"[WiFi]   ⚠ rfkill list 退出码 {rc} ({(err or '').strip()[:120]}), "
+                f"记为 unknown —— ① ② 已证明射频通路工作, 不据此判失败"
+            )
+        else:
+            # 精确解析: 逐条读 Soft/Hard blocked, 任一 yes 即视为被屏蔽
+            flags = _RE_RFKILL_BLOCKED.findall(out)
+            blocked = "yes" if "yes" in flags else "no"
+            if blocked == "yes":
                 await ctx.on_log(
-                    f"[WiFi] ⚠️ {iface} 被 soft block, 先 unblock"
+                    f"[WiFi]   射频被屏蔽 (soft/hard blocked: yes), 尝试 unblock"
                 )
-                await run_cmd(
-                    with_sudo([rfkill_bin, "unblock", "wifi"]), 3.0
+                await self._run(with_sudo([rfkill_bin, "unblock", "wifi"]), 3)
+                rc2, out2, _ = await self._run(
+                    with_sudo([rfkill_bin, "list", "wifi"]), 5
                 )
+                if rc2 == 0:
+                    flags2 = _RE_RFKILL_BLOCKED.findall(out2)
+                    blocked = "yes" if "yes" in flags2 else "no"
 
-        # 用 iw/iwlist/nmcli 探 driver (兼容 skw)
-        iw_bin = find_tool("iw")
-        iwlist_bin = find_tool("iwlist")
-        nmcli_bin = find_tool("nmcli")
+        result.metrics["rfkill_blocked"] = blocked
+        if blocked == "yes":
+            await fail_at(3, "rfkill 报 blocked: yes —— 射频被软/硬屏蔽, "
+                            "且 unblock 后仍屏蔽")
+            await ctx.on_progress(100, "失败")
+            return result
+        await ctx.on_log(f"[WiFi]   ✓ 射频未被屏蔽 (rfkill_blocked={blocked})")
+        await ctx.on_progress(60, "③ 射频 OK")
+
+        # ══════════ ④ 扫描执行 (4a-4d 降级链) ══════════
         await ctx.on_log(
-            f"[WiFi] 工具: ip={ip_bin}, iw={iw_bin or 'n/a'}, "
-            f"iwlist={iwlist_bin or 'n/a'}, nmcli={nmcli_bin or 'n/a'}"
+            f"[WiFi] ④ 扫描 — iw dev {iface} scan (超时 {scan_timeout}s, "
+            f"最多 {scan_retries + 1} 次)"
         )
-        await ctx.on_log(
-            f"[WiFi] 接口 {iface} 计划: {times} 次开/关, 每步 {per_op}s"
-        )
-        await ctx.on_progress(0, "开始")
+        await ctx.on_progress(70, "④ 扫描中")
 
-        all_passed = True
-        round_results: List[dict] = []
+        ssids: List[str] = []
+        scan_cmd_ok = False
+        last_out = ""
+        last_err = ""
+        retries_done = 0
+        scan_ms = 0
 
-        for i in range(times):
+        for attempt in range(scan_retries + 1):
             if await ctx.is_cancelled():
                 result.status = "stopped"
-                break
-            round_idx = i + 1
-            await ctx.on_log(
-                f"[WiFi] 第 {round_idx}/{times} 轮"
-            )
-
-            # === 步骤 1: 拉起 ===
-            up_started = time.time()
-            rc, out, err = await run_cmd(
-                with_sudo([ip_bin, "link", "set", iface, "up"]), 5.0
-            )
-            if rc != 0:
-                err_text = err.strip()[:200] or f"rc={rc}"
-                await ctx.on_log(f"[WiFi] ❌ ip up 失败: {err_text}")
-                result.status = "failed"
-                result.error = f"第 {round_idx} 轮 up 失败: {err_text}"
-                all_passed = False
-                round_results.append({"round": round_idx, "up_ok": False, "down_ok": None})
-                break
-
-            await asyncio.sleep(per_op)
-            up_state = await _read_operstate(iface)
-            up_elapsed = round(time.time() - up_started, 2)
-            await ctx.on_log(
-                f"[WiFi]   ↑ up 用 {up_elapsed}s → operstate={up_state}"
-            )
-            # up 后 operstate 可能是 "up" / "unknown" (驱动初始化中) / "down" (被 rfkill 阻塞)
-            if up_state not in ("up", "unknown"):
-                # 可能是 rfkill, 再 unblock 一次
-                if rfkill_bin:
-                    await run_cmd(with_sudo([rfkill_bin, "unblock", "wifi"]), 3.0)
-                    await asyncio.sleep(1)
-                    up_state = await _read_operstate(iface)
-                    await ctx.on_log(
-                        f"[WiFi]   重新 unblock 后 operstate={up_state}"
-                    )
-                if up_state not in ("up", "unknown"):
-                    await ctx.on_log(
-                        f"[WiFi] ❌ up 后状态是 '{up_state}' (期望 'up' / 'unknown', 驱动可能没起来)"
-                    )
-                    all_passed = False
-                    round_results.append({
-                        "round": round_idx, "up_ok": False,
-                        "up_state": up_state, "down_ok": None,
-                    })
-                    continue
-
-            # === 步骤 2: 拉下 ===
-            down_started = time.time()
-            rc, out, err = await run_cmd(
-                with_sudo([ip_bin, "link", "set", iface, "down"]), 5.0
-            )
-            if rc != 0:
-                err_text = err.strip()[:200] or f"rc={rc}"
-                await ctx.on_log(f"[WiFi] ❌ ip down 失败: {err_text}")
-                result.status = "failed"
-                result.error = f"第 {round_idx} 轮 down 失败: {err_text}"
-                all_passed = False
-                round_results.append({
-                    "round": round_idx, "up_ok": True,
-                    "up_state": "up", "down_ok": False,
-                })
-                # 尝试恢复
-                await run_cmd(with_sudo([ip_bin, "link", "set", iface, "up"]), 5.0)
-                break
-
-            await asyncio.sleep(0.5)
-            down_state = await _read_operstate(iface)
-            down_elapsed = round(time.time() - down_started, 2)
-            await ctx.on_log(
-                f"[WiFi]   ↓ down 用 {down_elapsed}s → operstate={down_state}"
-            )
-            # down 后 operstate 可能是 "down" / "unknown" (驱动处理中)
-            if down_state not in ("down", "unknown"):
+                return result
+            if attempt > 0:
+                retries_done = attempt
                 await ctx.on_log(
-                    f"[WiFi] ❌ down 后状态是 '{down_state}' (期望 'down')"
+                    f"[WiFi]   4b 重试 {attempt}/{scan_retries} —— "
+                    f"间隔 {scan_retry_gap}s 排除射频刚唤醒的抖动"
                 )
-                all_passed = False
-                round_results.append({
-                    "round": round_idx, "up_ok": True,
-                    "up_state": "up", "down_ok": False,
-                    "down_state": down_state,
-                })
+                await asyncio.sleep(scan_retry_gap)
+
+            t0 = time.time()
+            rc, out, err = await self._run(
+                with_sudo([iw_bin, "dev", iface, "scan"]), scan_timeout
+            )
+            scan_ms = int((time.time() - t0) * 1000)
+            last_out, last_err = out, err
+            done = _scan_completed(out)
+            scan_cmd_ok = (rc == 0) and done
+            ssids = _parse_ssids(out)
+
+            await ctx.on_log(
+                f"[WiFi]   扫描 #{attempt + 1}: rc={rc}, {scan_ms}ms, "
+                f"SSID×{len(ssids)}, 扫描完成标志={'有' if done else '无'}"
+            )
+            if ssids:            # 4a 命中 → 直接过, 不再重试
+                break
+            if scan_cmd_ok:      # 4c 候选 → 仍按 4b 重试确认不是抖动
                 continue
 
-            # 完美
-            await ctx.on_log(
-                f"[WiFi]   ✓ 切换正常 (up→down 流畅)"
-            )
-            round_results.append({
-                "round": round_idx,
-                "up_ok": True, "up_state": "up",
-                "down_ok": True, "down_state": "down",
-                "up_elapsed_sec": up_elapsed,
-                "down_elapsed_sec": down_elapsed,
-            })
-            await ctx.on_progress(
-                int((i + 1) / times * 100),
-                f"{round_idx}/{times} 切换 OK"
-            )
+        result.metrics["scan_duration_ms"] = scan_ms
+        result.metrics["scan_retry_count"] = retries_done
+        result.metrics["scan_cmd_ok"] = scan_cmd_ok
+        result.metrics["scan_ssid_count"] = len(ssids)
+        result.metrics["top_ssid"] = ssids[0] if ssids else ""
+        result.metrics["degraded"] = False
 
-        # 整理 metrics
-        result.metrics["iface"] = iface
-        result.metrics["times"] = times
-        result.metrics["rounds"] = round_results
-        ok_count = sum(1 for r in round_results if r.get("up_ok") and r.get("down_ok"))
-        result.metrics["ok_rounds"] = ok_count
-        result.metrics["failed_rounds"] = len(round_results) - ok_count
-
-        if all_passed and result.status != "stopped":
+        if ssids:                                        # 4a
             result.status = "passed"
             await ctx.on_log(
-                f"[WiFi] ✓ 完成: {ok_count}/{times} 次切换全部成功"
+                f"[WiFi]   ✓ 4a 扫到 {len(ssids)} 个 SSID —— 射频通路已验证"
             )
-        elif result.status == "pending":
-            result.status = "failed"
+        elif scan_cmd_ok:                                # 4c 命令级降级
+            result.status = "passed"
+            result.metrics["degraded"] = True
+            result.metrics["degraded_reason"] = "环境无 AP, 射频通路已验证"
             await ctx.on_log(
-                f"[WiFi] ❌ 完成: {ok_count}/{times} 次切换成功, "
-                f"{result.metrics['failed_rounds']} 次失败"
+                f"[WiFi]   ✓ 4c 降级通过 —— 周边无 AP, 但驱动成功完成了一次射频扫描"
+                f" (rc=0 + 扫描完成标志)。设备能力没问题, 是工位环境没 AP。"
             )
+        else:                                            # 4d 驱动级失败, 无降级
+            detail = (last_err or last_out).strip()
+            if "timeout" in last_err:
+                detail = f"扫描超时 {scan_timeout}s (共试 {retries_done + 1} 次)"
+            await fail_at(4, f"`iw dev {iface} scan` 驱动级失败: {detail[:300]}")
+            await ctx.on_progress(100, "失败")
+            return result
 
+        await ctx.on_progress(100, "完成")
         return result

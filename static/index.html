@@ -173,16 +173,6 @@
                                     <span class="summary-metric-v">{{ typeof v === 'number' ? v.toFixed(1) : v }}</span>
                                 </span>
                             </div>
-                            <!-- 展开轮次明细 (WiFi 这种多 round 测试) -->
-                            <div v-if="r.metrics && r.metrics.rounds && r.metrics.rounds.length" class="rounds-detail">
-                                <div class="rounds-title">轮次详情 ({{ r.metrics.rounds.length }} 轮):</div>
-                                <div v-for="rd in r.metrics.rounds" :key="rd.round" class="round-item">
-                                    <span class="round-num">#{{ rd.round }}</span>
-                                    <span v-if="rd.up_ok && rd.down_ok" class="status-passed">✓ 切换 OK ({{ rd.up_elapsed_sec || '?' }}s + {{ rd.down_elapsed_sec || '?' }}s)</span>
-                                    <span v-else-if="rd.up_ok === false" class="status-failed">✗ up 失败: {{ rd.up_state || '?' }}</span>
-                                    <span v-else class="status-failed">✗ down 失败: {{ rd.down_state || '?' }}</span>
-                                </div>
-                            </div>
                             <!-- §6.6 / §6.4: 环境问题显式披露 —— 不能让「跳过」看起来像「通过」 -->
                             <div
                                 v-if="r.status === 'skipped' && r.metrics && r.metrics.skipped_reason"
