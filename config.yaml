@@ -1,0 +1,97 @@
+# ============================================================
+# 工厂老化测试工具 - 配置文件
+# 设备: 全志 A527 (ARM Cortex-A55 + Mali-G57)
+# ============================================================
+
+# 服务监听
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+# 网络接口 (根据实际设备改)
+interfaces:
+  wifi: "wlan0"
+
+# 网口测试配置 (§6.6)
+# 链路 + DHCP + 出网, **不做吞吐** —— 吞吐不在老化测试范围
+eth:
+  iface: "eth0"                # 网口设备名
+  # ── 第 ③ 步出网: 三级降级, 任一级通过即算通过 ──
+  ping_gateway: "auto"         # 优先级 1: "auto" = 从 `ip route` 自动取默认网关
+  ping_dns: "223.5.5.5"        # 优先级 2: DNS 服务器
+  ping_target: "www.baidu.com" # 优先级 3: 公网域名
+  ping_count: 6                # 每级 ping 包数
+  ping_timeout_sec: 2          # 单包超时
+  # ── 第 ② 步取 IP ──
+  dhcp_timeout_sec: 10         # DHCP 取 IP 超时, 超时转静态兜底
+  static_ip: "192.168.1.50/24" # DHCP 失败时的静态兜底地址
+
+# 风扇 GPIO (普通 IO 控制,无 tach 反馈)
+# PI5 = 40-pin 物理针脚 5
+# 在 T527/A527 上 PI5 一般映射到 gpiochipN 的 line M
+# 请用 'ls /dev/gpiochip*' + 'gpioinfo /dev/gpiochipN' 确认
+# 默认: 假设映射到 gpiochip0 line 5 (常见 A527 底板)
+fan:
+  gpio_chip: 0
+  gpio_line: 5            # PI5 物理针脚 5,根据实际板子调整
+  active_level: "high"    # "high" 或 "low"
+  check_duration_sec: 30  # 持续监测时间
+
+# 测试默认参数 (UI 上可改)
+defaults:
+  cpu:
+    enabled: true
+    times: 1
+    duration_sec: 300
+    threads: 0              # 0 = 全部核
+    max_temp_c: 85
+  gpu:
+    # §6.3: glmark2 以"一轮完整跑完"为最小粒度, 单轮时长由驱动决定,
+    # 因此本项 **不提供 [次数] / [时长]**, 只给一个超时兜底
+    enabled: true
+    timeout_sec: 600         # 超时即 error, 防个别机器跑飞挂死整个 run
+  wifi:
+    enabled: true
+    times: 5                     # 5 次开/关切换
+    per_op_sec: 1.0              # 每次 ip up/down 后等 1 秒再检查 operstate
+    iface: wlan0                 # 接口名 (默认 wlan0, 可改)
+  usb:
+    enabled: true
+    times: 5
+    min_write_mbps: 20
+  ethernet:
+    # §6.6: 网口是单次 3 步流程 (链路→DHCP→出网), 时长由各步超时决定,
+    # 因此**不提供** [次数]/[时长], 配置项在上面的 `eth:` 段
+    enabled: true
+  hdmi:
+    enabled: true
+    times: 1
+    target_resolution: "1920x1080@60"
+  fan:
+    enabled: true
+    min_gpio_high: true
+  tfcard:
+    enabled: true
+    inserted: false         # UI 上勾选才执行
+    duration_sec: 60
+    min_read_mbps: 10
+  memory:
+    enabled: true
+    times: 1
+    duration_sec: 60
+    size_mb: 1024
+  emmc:
+    enabled: true
+    times: 1
+    duration_sec: 60
+    min_read_mbps: 80
+
+# 报告
+report:
+  output_dir: "reports"
+  title: "工厂老化测试报告"
+
+# 日志
+logging:
+  level: "INFO"             # DEBUG / INFO / WARNING / ERROR
+  file: "logs/run.log"

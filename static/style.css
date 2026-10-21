@@ -1,0 +1,732 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: #f5f6fa;
+    color: #2c3e50;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+#app { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 0;
+    border-bottom: 2px solid #e1e4e8;
+    margin-bottom: 24px;
+}
+header h1 { font-size: 22px; }
+.header-right { display: flex; align-items: center; gap: 16px; }
+.device-tag {
+    background: #e3f2fd;
+    color: #1976d2;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+section {
+    background: #fff;
+    border-radius: 8px;
+    padding: 20px 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    margin-bottom: 16px;
+}
+section h2 {
+    font-size: 16px;
+    margin-bottom: 16px;
+    color: #2c3e50;
+}
+
+/* ============== Test List ============== */
+.test-list { display: flex; flex-direction: column; gap: 4px; }
+.test-item {
+    padding: 12px 0;
+    border-bottom: 1px solid #f0f0f0;
+}
+.test-item:last-child { border-bottom: none; }
+
+.test-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    font-size: 14px;
+}
+.test-row input[type="checkbox"] { transform: scale(1.3); cursor: pointer; }
+.test-name { font-weight: 500; min-width: 90px; }
+.test-desc { color: #7f8c8d; font-size: 12px; flex: 1; }
+
+.test-options {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 8px 0 0 32px;
+    font-size: 13px;
+    color: #555;
+    flex-wrap: wrap;
+}
+.test-options .num-input {
+    width: 70px;
+    padding: 4px 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 13px;
+}
+.inline-check { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.ssid-tag {
+    background: #e8f5e9;
+    color: #2e7d32;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+/* ============== Buttons ============== */
+button { cursor: pointer; border: none; font-size: 14px; }
+button:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.btn-primary {
+    background: #1976d2;
+    color: #fff;
+    padding: 10px 24px;
+    border-radius: 4px;
+    font-weight: 500;
+}
+.btn-primary:hover:not(:disabled) { background: #1565c0; }
+
+.btn-secondary {
+    background: #fff;
+    color: #555;
+    padding: 10px 20px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+.btn-secondary:hover { background: #f5f5f5; }
+
+.btn-warning {
+    background: #e67e22;
+    color: #fff;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 4px;
+    font-weight: 500;
+    cursor: pointer;
+}
+.btn-warning:hover:not(:disabled) { background: #cf6d1c; }
+
+/* §7.6 drag-and-drop 排序 */
+.test-item {
+    position: relative;
+    padding-left: 22px;
+}
+.test-item .drag-handle {
+    position: absolute;
+    left: 4px;
+    top: 12px;
+    color: #bbb;
+    cursor: grab;
+    user-select: none;
+    font-size: 14px;
+    line-height: 1;
+}
+.test-item .drag-handle:hover { color: #888; }
+.test-item.dragging { opacity: 0.4; }
+.test-item.dragging .drag-handle { cursor: grabbing; }
+
+/* §7.6 5 秒静默期提示 */
+.interval-hint {
+    margin-top: 6px;
+    padding: 4px 10px;
+    background: #fff8e1;
+    color: #b07a00;
+    border-left: 3px solid #e67e22;
+    font-size: 13px;
+    border-radius: 3px;
+}
+
+.btn-danger {
+    background: #d32f2f;
+    color: #fff;
+    padding: 6px 14px;
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+.btn-text {
+    background: transparent;
+    color: #1976d2;
+    padding: 4px 8px;
+}
+.btn-text:hover { text-decoration: underline; }
+
+.btn-small {
+    background: #f0f7ff;
+    color: #1976d2;
+    padding: 4px 10px;
+    border-radius: 3px;
+    font-size: 12px;
+    border: 1px solid #bbdefb;
+}
+
+.actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid #f0f0f0;
+}
+
+/* ============== Results ============== */
+.results-list { display: flex; flex-direction: column; gap: 8px; }
+.result-item {
+    background: #fafbfc;
+    border: 1px solid #e8e8e8;
+    border-radius: 6px;
+    padding: 12px 16px;
+    border-left: 4px solid #bdc3c7;
+}
+.result-item.running { border-left-color: #1976d2; background: #f0f7ff; }
+.result-item.passed { border-left-color: #4caf50; background: #f1f8e9; }
+.result-item.failed { border-left-color: #f44336; background: #ffebee; }
+.result-item.error { border-left-color: #ff9800; background: #fff3e0; }
+.result-item.skipped { border-left-color: #9e9e9e; background: #f5f5f5; }
+.result-item.stopped { border-left-color: #607d8b; background: #eceff1; }
+
+.result-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.result-name { font-weight: 500; flex: 1; }
+.result-status {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(0,0,0,0.05);
+}
+.result-time { font-size: 12px; color: #888; }
+
+.result-detail {
+    margin-top: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 12px;
+}
+.metric {
+    background: #fff;
+    padding: 2px 8px;
+    border-radius: 3px;
+    border: 1px solid #e0e0e0;
+}
+.metric b { color: #1976d2; }
+
+.result-error {
+    margin-top: 8px;
+    padding: 6px 10px;
+    background: rgba(244, 67, 54, 0.08);
+    color: #c62828;
+    border-radius: 3px;
+    font-size: 12px;
+    font-family: monospace;
+}
+
+.progress-bar {
+    position: relative;
+    height: 18px;
+    background: #e0e0e0;
+    border-radius: 9px;
+    margin-top: 8px;
+    overflow: hidden;
+}
+.progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #1976d2, #42a5f5);
+    transition: width 0.3s;
+}
+.progress-text {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    text-align: center;
+    line-height: 18px;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    text-shadow: 0 0 2px rgba(0,0,0,0.3);
+}
+
+/* ============== Log ============== */
+.log-panel { margin-top: 20px; }
+.log-panel h3 { font-size: 14px; margin-bottom: 8px; }
+.log-stream {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 12px;
+    border-radius: 4px;
+    font-family: "Consolas", "Monaco", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* ============== Modal ============== */
+.modal-mask {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+.modal {
+    background: #fff;
+    border-radius: 8px;
+    padding: 24px;
+    width: 500px;
+    max-width: 90%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+/* 环境问题披露条 —— §6.6 网口 / §6.4 WiFi 跳过或降级时显示 */
+.env-banner {
+    margin-top: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.6;
+    border-radius: 4px;
+    border-left: 3px solid #d32f2f;
+    background: #fdecea;
+    color: #8c1c13;
+}
+.env-banner.warn {
+    border-left-color: #f9a825;
+    background: #fff8e1;
+    color: #7a5800;
+}
+.env-note { display: block; color: #999; margin-top: 2px; }
+
+.modal.is-alert { border-top: 4px solid #d32f2f; }
+.modal.is-alert h3 { color: #d32f2f; }
+.modal-msg { margin: 0; font-size: 14px; line-height: 1.7; color: #444; }
+.modal-hint {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.6;
+    color: #888;
+    border-top: 1px solid #f0f0f0;
+    padding-top: 10px;
+}
+.wifi-list {
+    list-style: none;
+    max-height: 280px;
+    overflow-y: auto;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+}
+.wifi-list li {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid #f0f0f0;
+    cursor: pointer;
+}
+.wifi-list li:hover { background: #f5f5f5; }
+.wifi-list li.active { background: #e3f2fd; border-left: 3px solid #1976d2; }
+.wifi-list .ssid { flex: 1; font-weight: 500; }
+.wifi-list .signal { font-size: 12px; color: #7f8c8d; }
+.wifi-list .security { font-size: 11px; color: #999; }
+
+.modal label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #555; }
+.modal input[type="password"] {
+    padding: 8px 10px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+}
+.modal .actions { border: none; margin: 0; padding: 0; justify-content: flex-end; }
+
+.empty { color: #999; font-style: italic; padding: 20px; text-align: center; }
+
+/* ============== History ============== */
+.history-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+}
+.history-table th, .history-table td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid #eee;
+}
+.history-table th { background: #fafbfc; font-weight: 500; color: #555; }
+.history-table tbody tr { cursor: pointer; }
+.history-table tbody tr:hover { background: #f5f7fa; }
+.status-passed { color: #2e7d32; font-weight: 500; }
+.status-failed { color: #c62828; font-weight: 500; }
+.status-stopped { color: #607d8b; font-weight: 500; }
+.status-error { color: #ef6c00; font-weight: 500; }
+.status-running { color: #1976d2; font-weight: 500; }
+
+.history-detail { margin-top: 24px; padding-top: 16px; border-top: 2px solid #e1e4e8; }
+
+/* ============== Wizard (一测试一屏) ============== */
+.wizard-panel {
+    min-height: 70vh;
+    display: flex;
+    flex-direction: column;
+}
+.wizard-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #eef0f4;
+    margin-bottom: 20px;
+}
+.wizard-step-counter {
+    font-size: 14px;
+    color: #6a737d;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 60px;
+}
+.step-current { font-size: 24px; color: #1976d2; font-weight: 600; }
+.step-divider { color: #ccc; }
+.step-total { color: #888; }
+.wizard-progress-bar {
+    flex: 1;
+    height: 6px;
+    background: #eef0f4;
+    border-radius: 3px;
+    overflow: hidden;
+}
+.wizard-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #1976d2, #2e86ab);
+    transition: width 0.3s ease;
+}
+.wizard-current {
+    flex: 1;
+    padding: 24px 0;
+}
+.wizard-step-label {
+    color: #888;
+    font-size: 13px;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.wizard-name {
+    font-size: 36px;
+    font-weight: 600;
+    color: #2c3e50;
+    margin-bottom: 12px;
+}
+.wizard-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 14px;
+    font-weight: 500;
+    margin-bottom: 20px;
+}
+.wizard-status .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+}
+.wizard-status.pending { background: #f5f5f5; color: #888; }
+.wizard-status.running { background: #e3f2fd; color: #1976d2; }
+.wizard-status.running .status-dot { animation: pulse 1.2s ease-in-out infinite; }
+.wizard-status.passed { background: #e8f5e9; color: #2e7d32; }
+.wizard-status.failed { background: #ffebee; color: #c62828; }
+.wizard-status.error { background: #fff3e0; color: #ef6c00; }
+.wizard-status.skipped { background: #eceff1; color: #607d8b; }
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+.wizard-progress-line {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 20px 0;
+}
+.wizard-progress-line-bar {
+    flex: 1;
+    height: 10px;
+    background: #eef0f4;
+    border-radius: 5px;
+    overflow: hidden;
+}
+.wizard-progress-line-bar .progress-fill {
+    height: 100%;
+    background: #1976d2;
+    border-radius: 5px;
+    transition: width 0.3s ease;
+}
+.wizard-progress-pct { font-weight: 600; color: #1976d2; min-width: 40px; }
+.wizard-progress-msg { color: #888; font-size: 13px; }
+
+.wizard-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 20px 0;
+}
+.wizard-metric-chip {
+    display: flex;
+    flex-direction: column;
+    padding: 8px 14px;
+    background: #f5f7fa;
+    border-radius: 6px;
+    border: 1px solid #eef0f4;
+    min-width: 80px;
+}
+.wizard-metric-chip .metric-label {
+    color: #888;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+.wizard-metric-chip .metric-value {
+    color: #2c3e50;
+    font-size: 18px;
+    font-weight: 600;
+    margin-top: 2px;
+}
+
+.wizard-error {
+    background: #ffebee;
+    color: #c62828;
+    padding: 10px 16px;
+    border-radius: 6px;
+    border-left: 3px solid #c62828;
+    margin: 16px 0;
+}
+
+.wizard-prev {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 16px;
+    padding: 10px 14px;
+    background: #fafbfc;
+    border-radius: 6px;
+    font-size: 13px;
+}
+.prev-label { color: #888; }
+.status-pill {
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+.status-pill.passed { background: #e8f5e9; color: #2e7d32; }
+.status-pill.failed { background: #ffebee; color: #c62828; }
+.status-pill.error { background: #fff3e0; color: #ef6c00; }
+.status-pill.skipped { background: #eceff1; color: #607d8b; }
+.status-pill.pending { background: #f5f5f5; color: #888; }
+.status-pill.running { background: #e3f2fd; color: #1976d2; }
+
+.wizard-log {
+    margin-top: auto;
+    padding-top: 16px;
+    border-top: 1px solid #eef0f4;
+}
+.wizard-log h3 {
+    font-size: 13px;
+    color: #888;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+}
+.wizard-log-stream {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 12px 16px;
+    border-radius: 6px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    height: 180px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+
+/* ============== Summary (总结报告) ============== */
+.summary-panel {
+    min-height: 70vh;
+}
+.summary-header {
+    text-align: center;
+    padding: 24px 0 32px 0;
+    border-bottom: 1px solid #eef0f4;
+    margin-bottom: 24px;
+}
+.summary-emoji {
+    font-size: 64px;
+    margin-bottom: 12px;
+}
+.summary-emoji.passed { color: #2e7d32; }
+.summary-emoji.failed { color: #c62828; }
+.summary-title {
+    font-size: 24px;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+.summary-status {
+    display: inline-block;
+    padding: 4px 14px;
+    border-radius: 16px;
+    font-size: 13px;
+    font-weight: 500;
+}
+.summary-status.passed { background: #e8f5e9; color: #2e7d32; }
+.summary-status.failed { background: #ffebee; color: #c62828; }
+
+.summary-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 24px;
+}
+.summary-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 16px;
+    background: #fafbfc;
+    border-radius: 6px;
+    border-left: 3px solid #ccc;
+}
+.summary-row.passed { border-left-color: #2e7d32; }
+.summary-row.failed { border-left-color: #c62828; }
+.summary-row.error { border-left-color: #ef6c00; }
+.summary-row.skipped { border-left-color: #607d8b; }
+.summary-row.running { border-left-color: #1976d2; }
+.summary-row.pending { border-left-color: #ccc; }
+.summary-status-icon {
+    font-size: 22px;
+    min-width: 30px;
+    text-align: center;
+}
+.summary-row-content { flex: 1; }
+.summary-row-name {
+    font-weight: 500;
+    font-size: 15px;
+    color: #2c3e50;
+    margin-bottom: 4px;
+}
+.summary-row-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 4px;
+}
+.summary-metric {
+    font-size: 12px;
+    color: #6a737d;
+}
+.summary-metric-k { color: #999; }
+.summary-metric-v { color: #2c3e50; font-weight: 500; margin-left: 4px; }
+.summary-row-error {
+    color: #c62828;
+    font-size: 12px;
+    margin-top: 4px;
+    font-style: italic;
+}
+
+/* 轮次明细 (WiFi 等多 round 测试) */
+.rounds-detail {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #fafbfc;
+    border-radius: 4px;
+    border-left: 2px solid #bdc3c7;
+}
+.rounds-title {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    margin-bottom: 6px;
+}
+.round-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 13px;
+}
+.round-num {
+    font-weight: 600;
+    color: #555;
+    min-width: 30px;
+}
+
+.summary-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+    padding-top: 16px;
+    border-top: 1px solid #eef0f4;
+}
+
+/* ============== 依赖检查 banner ============== */
+.dep-banner {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: #fff3e0;
+    border-left: 4px solid #ef6c00;
+    color: #6d4c41;
+    padding: 14px 20px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+}
+.dep-banner-icon {
+    font-size: 24px;
+}
+.dep-banner-content {
+    flex: 1;
+}
+.dep-banner-title {
+    font-weight: 600;
+    color: #c62828;
+    margin-bottom: 4px;
+}
+.dep-banner-detail {
+    font-size: 13px;
+    line-height: 1.6;
+}
+.dep-banner-detail code {
+    background: rgba(0,0,0,0.05);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    color: #c62828;
+}
+.dep-missing {
+    color: #c62828;
+    font-weight: 500;
+    font-family: "SFMono-Regular", Consolas, monospace;
+}

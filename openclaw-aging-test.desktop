@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=工厂老化测试
+Name[zh_CN]=工厂老化测试
+GenericName=Aging Test
+Comment=单击启动硬件体检 + 老化测试 (后台服务 · 自动开浏览器)
+Comment[zh_CN]=单击启动硬件体检 + 老化测试 (后台服务 · 自动开浏览器)
+Exec=/home/User/.claude/aging-test/start.sh start
+Icon=applications-system
+Terminal=false
+Categories=Utility;Test;Hardware;
+StartupNotify=true
+StartupWMClass=aging-test
+Keywords=aging;test;factory;hardware;老化;测试;硬件;

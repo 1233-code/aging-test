@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>工厂老化测试工具</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>🏭 工厂老化测试工具</h1>
+            <div class="header-right">
+                <span class="device-tag" v-if="config">设备配置: {{ Object.keys(config.interfaces || {}).length }} 接口</span>
+                <button class="btn-text" v-if="view === 'main'" @click="goHistory">历史记录</button>
+                <button class="btn-text" v-else @click="goConfig">← 返回配置</button>
+            </div>
+        </header>
+
+        <!-- 依赖检查 banner: 仅在配置页 + 有缺时显示 -->
+        <div v-if="view === 'main' && depsInfo && !depsInfo.all_ok" class="dep-banner">
+            <div class="dep-banner-icon">⚠</div>
+            <div class="dep-banner-content">
+                <div class="dep-banner-title">
+                    缺失 {{ depsInfo.critical_missing.length }} 个关键工具
+                </div>
+                <div class="dep-banner-detail">
+                    缺失: <span class="dep-missing">{{ depsInfo.critical_missing.join(', ') }}</span>
+                    <br>跑测试前请先装:
+                    <code>sudo bash scripts/install_deps.sh</code>
+                </div>
+            </div>
+            <button class="btn-text" @click="loadDeps">重新检查</button>
+        </div>
+
+        <!-- =============== 配置页 =============== -->
+        <main v-if="view === 'main'">
+            <section class="config-panel">
+                <h2>测试配置</h2>
+                <div class="test-list">
+                    <div class="test-item"
+                         v-for="(t, idx) in orderedTests"
+                         :key="t.name"
+                         :draggable="true"
+                         @dragstart="dragStart($event, idx)"
+                         @dragover="dragOver"
+                         @drop="dropAt($event, idx)"
+                         :class="{ dragging: draggedIdx === idx }">
+                        <span class="drag-handle" title="拖动调整顺序">⋮⋮</span>
+                        <label class="test-row">
+                            <input type="checkbox" v-model="tests[t.name].enabled">
+                            <span class="test-name">{{ t.display_name }}</span>
+                            <span class="test-desc">{{ t.description }}</span>
+                        </label>
+                        <div class="test-options" v-show="tests[t.name].enabled">
+                            <span v-if="'times' in tests[t.name]">
+                                次数: <input type="number" v-model.number="tests[t.name].times" min="1" max="100" class="num-input">
+                            </span>
+                            <span v-if="'duration_sec' in tests[t.name]">
+                                时长: <input type="number" v-model.number="tests[t.name].duration_sec" min="5" max="86400" class="num-input"> s
+                            </span>
+                            <span v-if="t.name === 'wifi'">
+                                <span class="hint-tag">仅扫描 · 不连 AP · 全自动 ≤ 10s</span>
+                                模式:
+                                <select v-model="tests[t.name].mode" class="num-input">
+                                    <option value="full">完整 (查 RSSI)</option>
+                                    <option value="functional">仅功能 (不查 RSSI)</option>
+                                </select>
+                            </span>
+                            <span v-if="t.name === 'tfcard'">
+                                <span class="hint-tag">运行时自动检测 · 未插弹提示</span>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="actions">
+                    <button class="btn-secondary" @click="selectAll(true)">全选</button>
+                    <button class="btn-secondary" @click="selectAll(false)">全不选</button>
+                    <button class="btn-text" @click="resetOrder" title="恢复推荐顺序">↺ 重置顺序</button>
+                    <button class="btn-primary" @click="startTest" :disabled="!hasAnyEnabled">▶ 开始测试</button>
+                </div>
+            </section>
+        </main>
+
+        <!-- =============== 向导式测试页 (一个测试一个界面) =============== -->
+        <main v-else-if="view === 'wizard'">
+            <section class="wizard-panel">
+                <div class="wizard-header">
+                    <div class="wizard-step-counter">
+                        <span class="step-current">{{ currentTestIndex + 1 }}</span>
+                        <span class="step-divider">/</span>
+                        <span class="step-total">{{ resultList.length }}</span>
+                    </div>
+                    <div class="wizard-progress-bar">
+                        <div class="wizard-progress-fill" :style="{ width: overallProgress + '%' }"></div>
+                    </div>
+                    <button class="btn-danger" @click="stopTest">停止</button>
+                </div>
+
+                <div class="wizard-current" v-if="currentTest">
+                    <div class="wizard-step-label">当前测试</div>
+                    <div class="wizard-name">{{ currentTest.display_name }}</div>
+                    <div :class="['wizard-status', currentTest.status]">
+                        <span class="status-dot"></span>
+                        {{ statusText(currentTest.status) }}
+                    </div>
+
+                    <!-- 进度条 (running 时) -->
+                    <div v-if="currentTest.status === 'running'" class="wizard-progress-line">
+                        <div class="wizard-progress-line-bar">
+                            <div class="progress-fill" :style="{ width: currentTest.pct + '%' }"></div>
+                        </div>
+                        <span class="wizard-progress-pct">{{ currentTest.pct }}%</span>
+                        <span v-if="currentTest.progress_msg" class="wizard-progress-msg">{{ currentTest.progress_msg }}</span>
+                    </div>
+
+                    <!-- 关键指标 -->
+                    <div v-if="currentTest.metrics && Object.keys(currentTest.metrics).length" class="wizard-metrics">
+                        <div v-for="(v, k) in currentTest.metrics" :key="k" class="wizard-metric-chip">
+                            <span class="metric-label">{{ k }}</span>
+                            <span class="metric-value">{{ typeof v === 'number' ? v.toFixed(1) : v }}</span>
+                        </div>
+                    </div>
+
+                    <!-- 错误信息 -->
+                    <div v-if="currentTest.error" class="wizard-error">
+                        <span class="error-icon">⚠</span>
+                        {{ currentTest.error }}
+                    </div>
+
+                    <!-- 上一项状态 -->
+                    <div v-if="previousTest" class="wizard-prev">
+                        <span class="prev-label">上一项</span>
+                        <span :class="['status-pill', previousTest.status]">
+                            {{ previousTest.display_name }} · {{ statusText(previousTest.status) }}
+                        </span>
+                    </div>
+                </div>
+
+                <!-- 实时日志 -->
+                <div class="wizard-log">
+                    <h3>实时日志</h3>
+                    <pre class="wizard-log-stream" ref="logEl">{{ logs.slice(-30).join('\n') }}</pre>
+                </div>
+            </section>
+        </main>
+
+        <!-- =============== 总结报告页 =============== -->
+        <main v-else-if="view === 'summary'">
+            <section class="summary-panel">
+                <div class="summary-header">
+                    <div :class="['summary-emoji', lastStatus]">
+                        {{ lastStatus === 'passed' ? '✅' : '❌' }}
+                    </div>
+                    <h1 class="summary-title">
+                        {{ passedCount }} 通过 / {{ failedCount + errorCount }} 失败 / {{ skippedCount }} 跳过
+                    </h1>
+                    <div :class="['summary-status', lastStatus]">
+                        {{ lastStatus === 'passed' ? '整体通过' : (lastStatus === 'failed' ? '存在失败项' : '已完成 (部分跳过)') }}
+                    </div>
+                </div>
+
+                <div class="summary-list">
+                    <div v-for="r in resultList" :key="r.name" :class="['summary-row', r.status]">
+                        <div class="summary-status-icon">{{ statusText(r.status).split(' ')[0] }}</div>
+                        <div class="summary-row-content">
+                            <div class="summary-row-name">{{ r.display_name }}</div>
+                            <div v-if="r.metrics && Object.keys(r.metrics).length" class="summary-row-metrics">
+                                <span v-for="(v, k) in r.metrics" :key="k" class="summary-metric">
+                                    <span class="summary-metric-k">{{ k }}</span>
+                                    <span class="summary-metric-v">{{ typeof v === 'number' ? v.toFixed(1) : v }}</span>
+                                </span>
+                            </div>
+                            <!-- 展开轮次明细 (WiFi 这种多 round 测试) -->
+                            <div v-if="r.metrics && r.metrics.rounds && r.metrics.rounds.length" class="rounds-detail">
+                                <div class="rounds-title">轮次详情 ({{ r.metrics.rounds.length }} 轮):</div>
+                                <div v-for="rd in r.metrics.rounds" :key="rd.round" class="round-item">
+                                    <span class="round-num">#{{ rd.round }}</span>
+                                    <span v-if="rd.up_ok && rd.down_ok" class="status-passed">✓ 切换 OK ({{ rd.up_elapsed_sec || '?' }}s + {{ rd.down_elapsed_sec || '?' }}s)</span>
+                                    <span v-else-if="rd.up_ok === false" class="status-failed">✗ up 失败: {{ rd.up_state || '?' }}</span>
+                                    <span v-else class="status-failed">✗ down 失败: {{ rd.down_state || '?' }}</span>
+                                </div>
+                            </div>
+                            <!-- §6.6 / §6.4: 环境问题显式披露 —— 不能让「跳过」看起来像「通过」 -->
+                            <div
+                                v-if="r.status === 'skipped' && r.metrics && r.metrics.skipped_reason"
+                                class="env-banner"
+                            >
+                                ⚠️ <b>环境原因跳过</b> —— {{ envReasonText(r.metrics.skipped_reason) }}
+                                <span class="env-note">不计入通过率, 建议处理工位环境后复测</span>
+                            </div>
+                            <div v-if="r.metrics && r.metrics.degraded" class="env-banner warn">
+                                ⚠️ <b>降级通过</b> —— {{ r.metrics.degraded_reason || '走了兜底路径' }}
+                                <span class="env-note">设备本身正常, 但工位环境有异常, 建议核查</span>
+                            </div>
+                            <div v-if="r.error" class="summary-row-error">{{ r.error }}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="summary-actions">
+                    <button class="btn-primary" @click="goConfig">🔁 重新测试</button>
+                    <button
+                        v-if="hasFailedItems"
+                        class="btn-warning"
+                        @click="retestFailed"
+                        :disabled="isRunning"
+                    >🔂 重测失败项 ({{ failedCount }})</button>
+                    <button class="btn-secondary" @click="goHistory">📋 历史记录</button>
+                </div>
+            </section>
+        </main>
+
+        <!-- =============== 历史页 =============== -->
+        <main v-else-if="view === 'history'">
+            <section class="history-panel">
+                <h2>历史记录</h2>
+                <table class="history-table" v-if="history.length">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>开始时间</th>
+                            <th>耗时</th>
+                            <th>状态</th>
+                            <th>通过/失败</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="h in history" :key="h.id" @click="loadHistoryDetail(h.id)">
+                            <td>{{ h.id }}</td>
+                            <td>{{ formatTime(h.started_at) }}</td>
+                            <td>{{ formatDuration(h.started_at, h.finished_at) }}</td>
+                            <td :class="'status-' + h.status">{{ statusText(h.status) }}</td>
+                            <td v-if="h.summary">{{ h.summary.passed }} / {{ h.summary.total }}</td>
+                            <td v-else>-</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p v-else class="empty">暂无历史记录</p>
+
+                <div v-if="historyDetail" class="history-detail">
+                    <h3>报告 #{{ historyDetail.id }}</h3>
+                    <div class="results-list">
+                        <div class="result-item" v-for="r in historyDetail.results" :key="r.test_name" :class="r.status">
+                            <div class="result-head">
+                                <span class="result-name">{{ displayNameOf(r.test_name) }}</span>
+                                <span class="result-status">{{ statusText(r.status) }}</span>
+                                <span class="result-time">{{ r.duration_sec ? r.duration_sec.toFixed(1) + 's' : '' }}</span>
+                            </div>
+                            <div class="result-error" v-if="r.error">{{ r.error }}</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- =============== TF 卡"未插"提示 (任意视图上叠加) =============== -->
+        <div v-if="tfPrompt.visible" class="modal-mask" @click.self="tfSkip">
+            <div class="modal">
+                <h3>💳 TF 卡未检测到</h3>
+                <p class="modal-msg">
+                    检测不到 TF 卡挂载点。该测试已标为 <b>skipped</b>。<br>
+                    选 一个操作:
+                </p>
+                <div class="actions">
+                    <button class="btn-secondary" @click="tfSkip">跳过此项</button>
+                    <button class="btn-primary" @click="tfInserted">已插好 · 重测仅 TF 卡</button>
+                </div>
+                <p class="modal-hint">点 "已插好" 后只需重新插入 TF 卡, 系统会重测这一项。</p>
+            </div>
+        </div>
+
+        <!-- =============== 网口"未插网线"提示 (§6.6, 任意视图上叠加) =============== -->
+        <div v-if="ethPrompt.visible" class="modal-mask" @click.self="ethSkip">
+            <div class="modal is-alert">
+                <h3>🔌 未插网线</h3>
+                <p class="modal-msg">
+                    <code>ethtool</code> 报 <b>Link detected: no</b> —— PHY 层没链路。<br>
+                    该测试已标为 <b>skipped</b>（环境问题，<b>不计入通过率</b>）。<br>
+                    选一个操作:
+                </p>
+                <div class="actions">
+                    <button class="btn-secondary" @click="ethSkip">跳过此项</button>
+                    <button class="btn-primary" @click="ethPlugged">已插好 · 重测仅网口</button>
+                </div>
+                <p class="modal-hint">
+                    重测会重走 §6.6 三步：链路 → DHCP（失败转静态兜底）→ 三级降级 ping。
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

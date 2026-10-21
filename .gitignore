@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+reports/*.html
+reports/*.pdf
+.DS_Store
+*.swp
+.idea/
+.vscode/
+# 注: 原 assets/test_videos/*.mkv|mp4 忽略规则已移除 —— GPU 改走 glmark2-es2
+#     全屏渲染 (§6.3), 项目不再携带任何视频素材
