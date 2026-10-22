@@ -98,15 +98,17 @@ else
 fi
 
 # 厂商 GPIO 节点 —— 由出货内核镜像提供, apt 包补不了 (§6.8)
+# ⚠️ **只测可读, 绝不测可写** —— 写这个节点会让板子 kernel panic。
+#    用 `test -w` 验收一件我们根本不做的事, 只会诱导别人去试写。
 GPIO_NODE="/proc/rp_gpio/pi5"
 if [ -e "$GPIO_NODE" ]; then
-    if [ -w "$GPIO_NODE" ]; then
-        sc_block "厂商 GPIO 节点 $GPIO_NODE" ok
+    if [ -r "$GPIO_NODE" ]; then
+        sc_block "厂商 GPIO 节点 $GPIO_NODE (只读)" ok
     else
-        sc_block "厂商 GPIO 节点 $GPIO_NODE" err "节点存在但不可写, 权限被改"
+        sc_block "厂商 GPIO 节点 $GPIO_NODE (只读)" err "节点存在但不可读, 权限被改"
     fi
 else
-    sc_block "厂商 GPIO 节点 $GPIO_NODE" err "内核镜像缺该节点, 非本工具可修复, 由镜像侧解决 (§6.8)"
+    sc_block "厂商 GPIO 节点 $GPIO_NODE (只读)" err "内核镜像缺该节点, 非本工具可修复, 由镜像侧解决 (§6.8)"
 fi
 
 # /dev/dri 可用 —— GPU / HDMI 项前提

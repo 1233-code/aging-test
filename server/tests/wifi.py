@@ -36,7 +36,7 @@ import time
 from typing import List, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, find_wifi_iface, with_sudo, sudo_hint_if_unavailable
+from ._tools import find_tool, find_wifi_iface, with_sudo, kill_proc, sudo_hint_if_unavailable
 
 # §11.3: 精确正则, 不做 substring 匹配。
 # **注意**: 行内空白一律用 `[ \t]` 不用 `\s` —— Python 的 `\s` 包含 \n,
@@ -100,17 +100,10 @@ class WiFiTest(TestCase):
         """runner.stop() 会 await 到这里 —— 让正在跑的 iw scan 立刻停下。"""
         if self.proc and self.proc.returncode is None and not self.cancel_done:
             self.cancel_done = True
-            try:
-                self.proc.terminate()
-                try:
-                    await asyncio.wait_for(self.proc.wait(), 2)
-                except asyncio.TimeoutError:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # 不用裸 terminate/kill —— 子进程是 sudo 起的 root 进程, 普通用户
+            # 对它发信号必然 EPERM, 裸调会把收尾自己炸掉, 还让 root 测试进程
+            # 泄漏在后台。见 _tools.kill_proc 的说明。
+            await kill_proc(self.proc, wait_sec=2.0)
 
     async def _run(self, cmd: List[str], timeout: float) -> Tuple[int, str, str]:
         """跑一条已包好 sudo 的命令, 返回 (rc, stdout, stderr). 超时 kill."""
@@ -133,6 +126,59 @@ class WiFiTest(TestCase):
             return -1, "", f"timeout after {timeout}s"
 
     async def run(self, ctx: TestContext) -> TestResult:
+        """按 `times` 跑多轮, 每轮一整套 §6.4 的 4 步 (开关→状态→射频→扫描)。
+
+        老化场景下反复开关射频 + 反复扫描, 比只跑一次更容易暴露**间歇性**驱动
+        问题 (第 2 轮才 scan 不出来 / 第 3 轮 ip link 不 UP)。默认仍是 1 轮,
+        出货口径不变。
+        """
+        times = max(1, int(ctx.test_config.get("times", 1)))
+        if times == 1:
+            return await self._run_once(ctx)      # 单轮 = 原行为, 一行都不绕
+
+        agg = TestResult()
+        agg.metrics = {}
+        await ctx.on_log(
+            f"[WiFi] 按配置跑 {times} 轮 (每轮: 软件开关 → 状态 → 射频 → 扫描)"
+        )
+        done = 0
+        for i in range(times):
+            if await ctx.is_cancelled():
+                await ctx.on_log("[WiFi] 用户取消")
+                agg.status = "stopped"
+                agg.metrics["rounds_done"] = done
+                return agg
+
+            idx = i + 1
+            await ctx.on_log(f"[WiFi] ── 第 {idx}/{times} 轮 ──")
+            await ctx.on_progress(int((i / times) * 100), f"第 {idx}/{times} 轮")
+
+            r = await self._run_once(ctx)
+            done += 1
+            # 顶层指标沿用最后一轮 (与其他多轮项一致), 逐轮另存 round_N_* 留档
+            agg.metrics.update(r.metrics or {})
+            for k, v in (r.metrics or {}).items():
+                agg.metrics[f"round_{idx}_{k}"] = v
+            agg.log = r.log
+            agg.status = r.status
+            agg.error = r.error
+
+            if r.status != "passed":
+                # failed / error / skipped 任一 → 后面几轮跑完也是同一个结论,
+                # 直接停。与 §6.3 GPU「任一轮失败即整项 failed」同一口径。
+                await ctx.on_log(
+                    f"[WiFi] 第 {idx}/{times} 轮 = {r.status}, 提前结束 "
+                    f"(剩余 {times - done} 轮不跑)"
+                )
+                break
+            await ctx.on_log(f"[WiFi] ✓ 第 {idx}/{times} 轮通过")
+
+        agg.metrics["rounds_done"] = done
+        agg.metrics["rounds_configured"] = times
+        await ctx.on_progress(100, "完成")
+        return agg
+
+    async def _run_once(self, ctx: TestContext) -> TestResult:
         result = TestResult()
         t_cfg = ctx.test_config
 
@@ -307,8 +353,13 @@ class WiFiTest(TestCase):
                 await asyncio.sleep(scan_retry_gap)
 
             t0 = time.time()
+            # **必须带 timeout_sec**: 部分驱动的 `iw scan` 在射频异常时会一直
+            # 挂着不返回。而它被 §11.2 提权成 root 进程后, 我们 (普通用户)
+            # 发不了信号收它 —— 只能让同为 root 的 `timeout` 到点自己杀它,
+            # 否则测试任务永不结束, 连服务关机都会被拖住。
             rc, out, err = await self._run(
-                with_sudo([iw_bin, "dev", iface, "scan"]), scan_timeout
+                with_sudo([iw_bin, "dev", iface, "scan"], timeout_sec=scan_timeout),
+                scan_timeout + 8,
             )
             scan_ms = int((time.time() - t0) * 1000)
             last_out, last_err = out, err

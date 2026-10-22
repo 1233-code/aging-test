@@ -207,6 +207,36 @@ createApp({
             await fetch('/api/test/stop', { method: 'POST' });
         };
 
+        // ========== 关闭服务 ==========
+        // 工人 / 非专业用户不会去敲 `bash start.sh stop` —— 界面上必须有
+        // 一个能关服务的按钮, 否则服务一直占着 8000 端口, 下次点桌面图标
+        // 就打不开。
+        const shuttingDown = ref(false);
+        const shutdownService = async () => {
+            if (isRunning.value) {
+                alert('测试正在运行, 请先点「停止」, 等测试结束后再关闭服务。');
+                return;
+            }
+            if (!confirm(
+                '确定关闭服务?\n\n' +
+                '· 服务会立刻退出, 本页面随之失效, 之后可以关掉浏览器了\n' +
+                '· 本次测试结果已保存, 重启后仍可在「历史记录」里查看\n' +
+                '· 要再测, 双击桌面「工厂老化测试」图标即可重新启动'
+            )) return;
+            shuttingDown.value = true;
+            try {
+                const r = await fetch('/api/shutdown', { method: 'POST' });
+                if (!r.ok) {
+                    const data = await r.json().catch(() => ({}));
+                    shuttingDown.value = false;
+                    alert('关闭失败: ' + (data.detail || ('HTTP ' + r.status)));
+                }
+            } catch (e) {
+                // fetch 抛异常说明连接断了 = 服务大概率已经退了, 就算成功,
+                // 保持 shuttingDown 让用户看到告别页而不是一条红色报错。
+            }
+        };
+
         // 向导 → 总结 / 重测
         const goConfig = () => {
             view.value = 'main';
@@ -363,6 +393,20 @@ createApp({
             ws.onclose = () => setTimeout(connectWS, 2000);
             ws.onerror = () => ws.close();
             window._agingTestWS = ws;
+            // 心跳: 页面每 20s 报个到, 服务据此判断「人还开着页面」。
+            // 后台标签页最坏被 Chrome 节流到 1min 一次, 对 10 分钟的空闲
+            // 窗口来说够用。服务端只在**没有测试在跑**时才会因为静默而退出。
+            clearInterval(window._hbTimer);
+            window._hbTimer = setInterval(window._hbSend, 20000);
+        };
+
+        // 单独抽出来, 因为「从 bfcache 恢复」时 onMounted 不会重跑, setInterval
+        // 可能已经没了 —— 那种情况下靠 visibilitychange 立刻补一个心跳。
+        window._hbSend = () => {
+            const ws = window._agingTestWS;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            }
         };
 
         const handleEvent = async (msg) => {
@@ -485,9 +529,28 @@ createApp({
 
         // ========== 启动 ==========
         onMounted(async () => {
+            // 关窗告别: 让服务走快通道 (goodbye_grace_sec 内退), 不用干等满
+            // 10 分钟。用 pagehide 而不是 beforeunload —— 前者在移动端/标签页
+            // 被回收时也准, 且不挡 bfcache。
+            // 注意**刷新页面同样会触发**它, 所以服务端只是把宽限期缩短, 判断
+            // 「人还在不在」的依据仍然是心跳, 刷新误触发不会把服务弄死。
+            window.addEventListener('pagehide', () => {
+                if (navigator.sendBeacon) {
+                    navigator.sendBeacon('/api/goodbye');
+                }
+            });
             await loadConfig();
             await loadDeps();
             connectWS();
+            // 补心跳的两个场景, 都因为「定时器可能已经不在了」而必须手动补一发:
+            //   · 标签页从 bfcache 恢复 —— onMounted 不会重跑, interval 也没了
+            //   · 息屏 / 锁屏很久后回来 —— 定时器被浏览器节流到近乎停摆
+            // 不补的话, 页面明明在眼前开着, 服务却会因为「静默」把自己关掉。
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') {
+                    window._hbSend && window._hbSend();
+                }
+            });
         });
 
         watch(view, (v) => {
@@ -500,7 +563,7 @@ createApp({
             isRunning, resultList, logs, logEl,
             history, historyDetail, runId,
             tfPrompt, ethPrompt, currentTestIndex, lastStatus,
-            depsInfo,
+            depsInfo, shuttingDown,
             // computed
             hasAnyEnabled, hasFailedItems, failedCount,
             passedCount, errorCount, skippedCount,
@@ -508,7 +571,7 @@ createApp({
             orderedTests, draggedIdx,
             // methods
             statusText, formatTime, formatDuration, displayNameOf, envReasonText,
-            selectAll, startTest, stopTest,
+            selectAll, startTest, stopTest, shutdownService,
             goConfig, goHistory, retestFailed,
             tfInserted, tfSkip, ethPlugged, ethSkip,
             dragStart, dragOver, dropAt, resetOrder,

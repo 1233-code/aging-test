@@ -730,3 +730,40 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     font-weight: 500;
     font-family: "SFMono-Regular", Consolas, monospace;
 }
+
+/* ========== 关闭服务 ========== */
+/* 红描边 —— 一眼能看出是「有后果」的操作, 跟旁边中性的 btn-text 拉开距离 */
+.btn-shutdown {
+    background: transparent;
+    color: #c62828;
+    border: 1px solid #e57373;
+    padding: 5px 12px;
+    border-radius: 4px;
+    font-size: 13px;
+    white-space: nowrap;
+}
+.btn-shutdown:hover:not(:disabled) { background: #fdecea; }
+.btn-shutdown:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* 服务已关闭 —— 全屏告别页, z-index 高过所有 modal */
+.shutdown-screen {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+}
+.shutdown-card { text-align: center; max-width: 520px; padding: 0 24px; }
+.shutdown-emoji { font-size: 64px; line-height: 1; }
+.shutdown-card h1 { font-size: 26px; color: #333; margin: 18px 0 12px; }
+.shutdown-msg { font-size: 15px; color: #555; margin: 0 0 18px; }
+.shutdown-hint {
+    margin: 0;
+    padding-top: 14px;
+    border-top: 1px solid #f0f0f0;
+    font-size: 12px;
+    line-height: 1.8;
+    color: #888;
+}

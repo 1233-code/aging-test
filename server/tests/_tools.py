@@ -5,6 +5,7 @@
 import asyncio
 import os
 import shutil
+import signal
 import time
 from typing import List, Optional, Tuple
 
@@ -40,27 +41,10 @@ async def run_proc_with_wallclock(
         await asyncio.wait_for(proc.wait(), timeout=duration_sec + grace_sec)
     except asyncio.TimeoutError:
         killed_by_us = True
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), 2)
-        except asyncio.TimeoutError:
-            pass
+        await kill_proc(proc, signal.SIGKILL)
     except asyncio.CancelledError:
         killed_by_us = True
-        try:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), 2)
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        await kill_proc(proc, signal.SIGTERM, wait_sec=2.0)
         raise
 
     elapsed = time.time() - t0
@@ -111,10 +95,7 @@ async def run_cmd(
             stderr.decode(errors="replace"),
         )
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        await kill_proc(proc, signal.SIGKILL, wait_sec=1.0)
         return -1, "", f"timeout after {timeout}s"
 
 
@@ -127,8 +108,10 @@ def sudo_available() -> bool:
     return find_tool("sudo") is not None
 
 
-def with_sudo(cmd: List[str], env: Optional[dict] = None) -> List[str]:
-    """把命令包成命令级 sudo 提权 (§11.2).
+def with_sudo(cmd: List[str], env: Optional[dict] = None,
+              timeout_sec: Optional[float] = None,
+              kill_after_sec: float = 5.0) -> List[str]:
+    """把命令包成命令级 sudo 提权 (§11.2)。
 
     统一走 ["sudo", "-n", ...] —— `-n` 非交互, 绝不弹密码提示, 否则产线会卡死。
 
@@ -137,8 +120,22 @@ def with_sudo(cmd: List[str], env: Optional[dict] = None) -> List[str]:
     依赖图形会话的命令在 root 环境下连不上 compositor 必挂。
     所以走 `sudo -n env VAR=... cmd` 而不是裸 `sudo -n cmd`。
 
-    注意: 服务本身以普通用户身份启动, 只有这里包出来的子进程是 root。
+    timeout_sec: **长跑命令必传**。见下面「为什么要 timeout」。
+
+    ── 为什么要 timeout ──
+    §11.2 要求一律 sudo, 于是子进程 real/effective/saved UID 全是 root, 而
+    **服务本身仍以普通用户跑**。POSIX 规定非 root 进程对 root 进程 os.kill
+    一律 EPERM (`PermissionError(1, 'Operation not permitted')`) —— 也就是
+    **服务方根本没法自己收尾**, 只能在 root 领地内部安排 killer。
+
+    `timeout` 就是那个 killer: `sudo -n timeout -k 5 60 memtester ...` 里
+    timeout 和 memtester 同为 root, 到点它自己杀自己的子进程, 服务全程一个
+    信号都不用发, EPERM 从结构上不存在。不这样做时实测: duration_sec=60 的
+    内存测试收尾失败, memtester 已经跑到 537s、占 1.0 GB 还不退出。
     """
+    if timeout_sec is not None:
+        tmo = find_tool("timeout") or "/usr/bin/timeout"
+        cmd = [tmo, "-k", str(kill_after_sec), str(timeout_sec)] + list(cmd)
     if is_root() and not env:
         # 已经是 root 且无需透传环境, 免一层 sudo (免密未配好时也不至于挂)
         return list(cmd)
@@ -146,6 +143,56 @@ def with_sudo(cmd: List[str], env: Optional[dict] = None) -> List[str]:
     if env:
         prefix += ["env"] + [f"{k}={v}" for k, v in env.items()]
     return prefix + list(cmd)
+
+
+# ── 收尾 (with_sudo 的配套) ──
+
+async def kill_proc(proc: Optional[asyncio.subprocess.Process],
+                    sig: int = signal.SIGTERM,
+                    wait_sec: float = 2.0,
+                    ctx=None) -> bool:
+    """终止子进程。返回 True = 已确认退出。
+
+    **不发任何特权信号** —— 见上面 with_sudo 的「为什么要 timeout」。非 root 身份
+    对 root 子进程发信号必然 EPERM; 与其绕道 `sudo kill` 提权, 不如从一开始就让
+    root 领地内部的 `timeout` 负责收尾, 服务这边只处理"确实杀得掉"的普通子进程。
+
+    返回 False = **没能确认进程已退出**, 两种情形:
+      - 子进程是 sudo 起的 root 进程 → 发不了信号, 交给 `timeout` 到点收尾
+      - 普通子进程但没在 wait_sec 内退出 → 调用方继续等或告警
+
+    绝不抛异常: 收尾失败不该把一个跑满挂钟、本该 passed 的项打成 error。
+    """
+    if proc is None:
+        return True
+    try:
+        proc.kill() if sig == signal.SIGKILL else proc.terminate()
+    except ProcessLookupError:
+        return True                          # 已经退了
+    except PermissionError:
+        await _note(ctx, f"[进程] 子进程 {proc.pid} 是 root (with_sudo 起的), "
+                         f"普通用户发不了信号 —— 已交由 `timeout` 在其挂钟上限处"
+                         f"自行收尾, 本次不等它")
+        return False
+    except Exception as e:
+        await _note(ctx, f"[进程] 终止 {proc.pid} 异常: {e!r}")
+        return False
+    try:
+        await asyncio.wait_for(proc.wait(), wait_sec)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _note(ctx, msg: str) -> None:
+    """ctx 是 TestContext (鸭子类型, 避免 _tools 反向 import base)。"""
+    if ctx is None:
+        return
+    try:
+        await ctx.on_log(msg)
+    except Exception:
+        pass
+
 
 
 def sudo_hint_if_unavailable(result, test_name: str) -> bool:

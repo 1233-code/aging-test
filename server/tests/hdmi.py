@@ -7,12 +7,13 @@
 import asyncio
 import os
 import re
+import signal
 import time
 from pathlib import Path
 from typing import List, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, is_root, with_sudo
+from ._tools import find_tool, is_root, with_sudo, kill_proc
 
 
 def _read_drm_sysfs() -> list:
@@ -57,18 +58,21 @@ async def _run_modetest(modetest_bin: str, args: List[str], timeout: int = 15) -
     """跑 modetest, 返回 (rc, stdout, stderr).
 
     §11.2: modetest 需 root 切模式, 走命令级 sudo -n。
+
+    **必须带 timeout_sec**: modetest 默认**无限循环**刷模式, 不会自己退出。
+    而它是 sudo 起的 root 进程, 服务这边发不了信号 (EPERM), 所以收尾只能靠
+    root 领地内部的 `timeout` —— 见 _tools.with_sudo 的「为什么要 timeout」。
     """
-    # §11.2: 需 root 的调用一律 `sudo -n <命令>`, 绝不弹密码提示
-    cmd = with_sudo([modetest_bin, *args])
+    cmd = with_sudo([modetest_bin, *args], timeout_sec=timeout)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout + 8)
     except asyncio.TimeoutError:
-        proc.kill()
+        await kill_proc(proc, signal.SIGKILL, wait_sec=1.0)
         return -1, "", "timeout"
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
@@ -86,17 +90,10 @@ class HDMITest(TestCase):
     async def cancel(self):
         if self.proc and self.proc.returncode is None and not self.cancel_done:
             self.cancel_done = True
-            try:
-                self.proc.terminate()
-                try:
-                    await asyncio.wait_for(self.proc.wait(), 2)
-                except asyncio.TimeoutError:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # 不用裸 terminate/kill —— 子进程是 sudo 起的 root 进程, 普通用户
+            # 对它发信号必然 EPERM, 裸调会把收尾自己炸掉, 还让 root 测试进程
+            # 泄漏在后台。见 _tools.kill_proc 的说明。
+            await kill_proc(self.proc, wait_sec=2.0)
 
     async def run(self, ctx: TestContext) -> TestResult:
         result = TestResult()

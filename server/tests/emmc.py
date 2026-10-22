@@ -29,6 +29,11 @@ def _parse_fio_text(text: str) -> dict:
     return metrics
 
 
+# fio 的挂钟兜底上限 (秒)。够跑完一次 4K 顺序读写, 又不至于让坏块把测试
+# 挂死到没法收场。见 _run_fio_test 里 with_sudo(timeout_sec=) 的说明。
+_FIO_TIMEOUT_SEC = 600
+
+
 async def _run_fio_test(test_file: str, size_mb: int, ctx: TestContext, on_metric=None) -> dict:
     """跑一次 fio 顺序读写,返回 {read_mbps, write_mbps}
 
@@ -43,12 +48,16 @@ async def _run_fio_test(test_file: str, size_mb: int, ctx: TestContext, on_metri
         )
 
     # 写测试
+    # **必须带 timeout_sec**: 下面是裸 `await proc.communicate()`, 本来就
+    # 没有任何超时, fio 一旦卡住 (坏块 / 驱动异常) 就是**永久挂死**, 测试
+    # 任务不结束, 连服务关机都会被拖住。而 fio 被 §11.2 提权成 root 进程后,
+    # 我们 (普通用户) 发不了信号收它 —— 只能让同为 root 的 `timeout` 到点杀它。
     cmd_w = with_sudo([
         fio_bin, "--name=write", "--ioengine=libaio",
         "--direct=1", "--bs=1M", f"--size={size_mb}M",
         f"--filename={test_file}", "--rw=write",
         "--output-format=normal",
-    ])
+    ], timeout_sec=_FIO_TIMEOUT_SEC)
     proc = await asyncio.create_subprocess_exec(
         *cmd_w, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )

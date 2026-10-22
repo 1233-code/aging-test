@@ -25,7 +25,13 @@ port_holder_pid() {
     local port=$1
     # 优先 lsof, fallback ss
     if command -v lsof > /dev/null 2>&1; then
-        lsof -t -i ":$port" 2>/dev/null | head -1
+        # **必须带 -sTCP:LISTEN**: `-i :8000` 匹配的是该端口上的**所有** TCP
+        # 连接 (监听的服务端 + 连进来的客户端), 实测会同时吐出浏览器的
+        # NetworkService (36908) 和 uvicorn (36940), head -1 随机挑一个 ——
+        # 结果 restart/stop 杀的是浏览器, 服务还活着占着端口。
+        # 注意 `-iTCP:"$port"` 中间**不能有空格**: `-iTCP "8000"` 会被 lsof
+        # 当成两个参数, 实测一条都匹配不到 (静默失效, 比原来更糟)。
+        lsof -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1
     else
         # ss -tlnp 在没 sudo 时不显示 PID, 用 fuser 兜底
         fuser "$port/tcp" 2>/dev/null | tr -d ' '
@@ -79,8 +85,16 @@ start_service() {
         kill_port_holder "$PORT"
     fi
 
-    if pid_alive; then
-        log "服务已在运行 (PID: $(cat "$PID_FILE"))"
+    # ── 在线判定: 以 /api/health 为准, **不能只看 pid_alive** ──
+    # 被 SIGTERM 后的 uvicorn 会永久卡在 "Waiting for background tasks to complete"
+    # (测试子进程是 sudo 起的 root 进程, 普通用户发不了信号 → 后台任务永不结束),
+    # 此时 `kill -0` 仍然成功, 但监听端口已关, 对外完全不服务。
+    #
+    # 按 pid_alive 判定的后果实测: 这里判成"已在运行" → 整段启动被跳过 →
+    # 直接开浏览器 → 浏览器连不上, 显示的是**缓存的旧页面**, 会弹出上一次
+    # 跑测残留的「TF 卡未插入」弹窗。现场极难定位。
+    if service_ready; then
+        log "服务已在运行 (PID: $(cat "$PID_FILE" 2>/dev/null || echo 未知))"
     else
         # 首次运行: 建 venv
         if [ ! -d ".venv" ]; then

@@ -124,12 +124,17 @@ class USBTest(TestCase):
             await ctx.on_progress(int((i / times) * 100), f"第 {round_idx} 轮")
 
             # 用 libaio direct 写; §11.2 命令级 sudo -n (裸块设备需 root)
+            # **必须带 timeout_sec**: 下面是裸 `await proc.communicate()`,
+            # 没有任何超时 —— USB 设备异常 / 掉盘时 fio 会**永久挂死**, 测试任务
+            # 不结束, 连服务关机都会被拖住。而 fio 被提权成 root 进程后我们
+            # (普通用户) 发不了信号收它, 只能让同为 root 的 `timeout` 到点杀它。
+            # 32M 写入远用不到 300s, 纯兜底。
             cmd = with_sudo([
                 fio_bin, "--name=write", "--ioengine=libaio", "--iodepth=4",
                 "--direct=1", "--bs=1M", "--size=32M",
                 f"--filename={dev}", "--rw=write",
                 "--output-format=normal",
-            ])
+            ], timeout_sec=300)
             t0 = time.time()
             try:
                 proc = await asyncio.create_subprocess_exec(

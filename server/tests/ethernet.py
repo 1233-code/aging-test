@@ -30,7 +30,7 @@ import time
 from typing import List, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, with_sudo, sudo_hint_if_unavailable
+from ._tools import find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable
 
 # §11.3: 用精确正则而非 substring 模糊匹配 —— 宽松 in 匹配会被无关文本骗到
 _RE_LINK = re.compile(r"^\s*Link detected:\s*(yes|no)\s*$", re.MULTILINE)
@@ -105,17 +105,10 @@ class EthTest(TestCase):
     async def cancel(self):
         if self.proc and self.proc.returncode is None and not self.cancel_done:
             self.cancel_done = True
-            try:
-                self.proc.terminate()
-                try:
-                    await asyncio.wait_for(self.proc.wait(), 2)
-                except asyncio.TimeoutError:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # 不用裸 terminate/kill —— 子进程是 sudo 起的 root 进程, 普通用户
+            # 对它发信号必然 EPERM, 裸调会把收尾自己炸成 error, 还让 root 测试
+            # 进程泄漏在后台。见 _tools.kill_proc 的说明。
+            await kill_proc(self.proc, wait_sec=2.0)
 
     async def _run(self, cmd: List[str], timeout: float) -> Tuple[int, str]:
         """跑一条已包好 sudo 的命令, 返回 (rc, 合并输出). 超时则 kill."""
@@ -137,6 +130,59 @@ class EthTest(TestCase):
             return -1, f"timeout after {timeout}s"
 
     async def run(self, ctx: TestContext) -> TestResult:
+        """按 `times` 跑多轮, 每轮一整套 §6.6 的 3 步 (链路→DHCP→出网)。
+
+        老化场景下反复建链 / 反复续 DHCP, 更容易暴露**间歇性**PHY 和网络栈
+        问题 (插拔网线留下的震荡、DHCP 服务器偶发不响应)。默认仍是 1 轮,
+        出货口径不变。
+        """
+        times = max(1, int(ctx.test_config.get("times", 1)))
+        if times == 1:
+            return await self._run_once(ctx)      # 单轮 = 原行为, 一行都不绕
+
+        agg = TestResult()
+        agg.metrics = {}
+        await ctx.on_log(
+            f"[网口] 按配置跑 {times} 轮 (每轮: 链路检测 → 取 IP → 出网连通)"
+        )
+        done = 0
+        for i in range(times):
+            if await ctx.is_cancelled():
+                await ctx.on_log("[网口] 用户取消")
+                agg.status = "stopped"
+                agg.metrics["rounds_done"] = done
+                return agg
+
+            idx = i + 1
+            await ctx.on_log(f"[网口] ── 第 {idx}/{times} 轮 ──")
+            await ctx.on_progress(int((i / times) * 100), f"第 {idx}/{times} 轮")
+
+            r = await self._run_once(ctx)
+            done += 1
+            # 顶层指标沿用最后一轮 (与其他多轮项一致), 逐轮另存 round_N_* 留档
+            agg.metrics.update(r.metrics or {})
+            for k, v in (r.metrics or {}).items():
+                agg.metrics[f"round_{idx}_{k}"] = v
+            agg.log = r.log
+            agg.status = r.status
+            agg.error = r.error
+
+            if r.status != "passed":
+                # failed / error / skipped 任一 → 后面几轮跑完也是同一个结论,
+                # 直接停。与 §6.3 GPU「任一轮失败即整项 failed」同一口径。
+                await ctx.on_log(
+                    f"[网口] 第 {idx}/{times} 轮 = {r.status}, 提前结束 "
+                    f"(剩余 {times - done} 轮不跑)"
+                )
+                break
+            await ctx.on_log(f"[网口] ✓ 第 {idx}/{times} 轮通过")
+
+        agg.metrics["rounds_done"] = done
+        agg.metrics["rounds_configured"] = times
+        await ctx.on_progress(100, "完成")
+        return agg
+
+    async def _run_once(self, ctx: TestContext) -> TestResult:
         result = TestResult()
         eth_cfg = ctx.config.get("eth", {})
 
@@ -212,8 +258,14 @@ class EthTest(TestCase):
 
         t0 = time.time()
         # -f 前台 / -n 拿不到 lease 就退出 / -q 拿到就退出 —— 防止 udhcpc 自行 daemonize
+        # **必须带 timeout_sec**: udhcpc 在部分驱动/交换机组合下拿不到 lease
+        # 也不退出, 会一直挂着。而它被 §11.2 sudo 提权成 root 进程后, 我们
+        # (普通用户) 发不了信号去收它 —— 只能让同为 root 的 `timeout` 到点
+        # 自己杀它, 否则整个测试任务永不结束, 连服务关机都会被拖住。
         rc, _ = await self._run(
-            with_sudo([udhcpc_bin, "-i", iface, "-f", "-n", "-q"]), dhcp_timeout
+            with_sudo([udhcpc_bin, "-i", iface, "-f", "-n", "-q"],
+                      timeout_sec=dhcp_timeout),
+            dhcp_timeout + 8,
         )
         dhcp_ms = int((time.time() - t0) * 1000)
         result.metrics["dhcp_duration_ms"] = dhcp_ms

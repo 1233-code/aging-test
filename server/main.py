@@ -3,10 +3,11 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -27,6 +28,7 @@ async def startup():
     Config.load()
     await db.Database.init()
     print(f"[server] 项目根目录: {PROJECT_ROOT}")
+    asyncio.create_task(_idle_watchdog())
 
 
 # ==================== 静态资源 ====================
@@ -155,6 +157,165 @@ async def test_status():
     return runner.snapshot()
 
 
+# ==================== 关闭服务 (UI 按钮) ====================
+# 工人 / 非专业用户不会敲 `bash start.sh stop` —— 界面上必须有个能关服务的
+# 按钮, 否则服务会一直留着占住 8000 端口, 下次点桌面图标就打不开。
+_PID_FILE = PROJECT_ROOT / "logs" / "server.pid"
+_LOG_FILE = PROJECT_ROOT / "logs" / "server.log"
+
+
+@app.post("/api/shutdown")
+async def shutdown(request: Request):
+    """关掉自己 —— UI 上「⏻ 关闭服务」按钮的落点。"""
+    # 服务绑在 0.0.0.0, 同网段任何人都能打到这个接口。关服务比「开始/停止测试」
+    # 危险得多 (它会把整台机器上的服务弄没), 所以默认**只允许本机操作**。
+    # 产线确实要用平板远程关的话, 在 config.yaml 的 `service:` 里开
+    # allow_remote_shutdown —— 那是显式的取舍, 不该是默认。
+    if not (Config.get("service", {}) or {}).get("allow_remote_shutdown", False):
+        peer = request.client.host if request.client else ""
+        if not (peer.startswith("127.") or peer in ("::1", "localhost")):
+            raise HTTPException(
+                403,
+                f"「关闭服务」只允许从本机操作 (当前来源 {peer or '未知'})。"
+                "产线需远程关闭请在 config.yaml 设 service.allow_remote_shutdown: true",
+            )
+    if runner.status == "running":
+        # 测试子进程是 §11.2 命令级 sudo 起的 root 进程, 服务一死就再没人管
+        # 它们, 只能各自等 `timeout` 到点 —— 一次烧机会留成孤儿进程继续烧
+        # CPU/内存, 结果也丢了。所以必须先「停止」再关。
+        raise HTTPException(
+            409, "测试正在运行, 请先点「停止」, 等测试结束后再关闭服务"
+        )
+    asyncio.create_task(_exit_soon())
+    return {"ok": True, "message": "服务正在关闭"}
+
+
+async def _exit_soon(delay: float = 1.0):
+    """把 HTTP 响应送出去之后再退。
+
+    **先 delay**: 响应此刻还没写回 socket, 立刻退出会让前端的 fetch 抛
+    "网络错误", 用户看到红色报错而不是干净的告别页。
+    """
+    await asyncio.sleep(delay)
+    _do_exit("收到 UI 关闭请求, 服务退出")
+
+
+def _do_exit(reason: str):
+    """服务唯一的退出路径: 记一行日志 → 清 PID 文件 → 退。
+
+    **用 os._exit 而不是发信号**: 调用到这里已经确认没有测试在跑, 没有正在
+    写的数据库、没有要收尾的子进程, 优雅关闭那套仪式对这里没有意义, 直接退
+    干净即可。也不需要 SIGKILL 兜底 —— uvicorn 收到 SIGTERM 卡在
+    "Waiting for background tasks" 不退的那个毛病, 在这里绕开了。
+    """
+    pid = os.getpid()
+    line = f"{reason} (PID {pid})"
+    print(line, flush=True)
+    try:
+        with open(_LOG_FILE, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
+    except Exception:
+        pass
+    # 清 PID 文件, 别给 start.sh 留一个「以为还活着」的文件。只在记的确实
+    # 是本进程时才删 —— 万一记的是别的进程, 宁可留给 service_ready 去判僵尸。
+    try:
+        if _PID_FILE.exists() and _PID_FILE.read_text().strip() == str(pid):
+            _PID_FILE.unlink()
+    except Exception:
+        pass
+    os._exit(0)
+
+
+# ==================== 空闲自动关闭 (关掉浏览器 → 服务跟着退) ====================
+# **不能直接拿「WebSocket 断开」当「浏览器关了」** —— 刷新页面 / 切后台 /
+# 锁屏 / 网线掉了 / 浏览器崩溃, 在服务端看全是同一个信号: 连接没了, 分不出
+# 来。而这个工具自己就会制造断连 (WiFi 测试扫频切接口、网口测试重配 DHCP),
+# 照直做会把跑到一半的烧机直接杀掉, 结果全丢。
+#
+# 所以做成「心跳 + 宽限期 + 只在空闲时才退」:
+#   · 页面每 20s 经 WS 发一个 ping。后台标签页最坏被 Chrome 节流到 1min 一次,
+#     对 10 分钟的窗口来说完全够。
+#   · 心跳断了、**且当前没有测试在跑**、且静默超过 idle_exit_sec → 退出
+#   · 心跳断了、**但正在跑测试** → 绝不退出, 等测试跑完再说
+#   · 页面关窗时用 sendBeacon 主动告别 → 走快通道, goodbye_grace_sec 后就退
+_SERVICE_T0 = time.time()
+_last_seen = time.time()
+_ever_connected = False
+_goodbye_at = None            # Optional[float]
+
+
+def _touch(connected: bool = False):
+    """收到客户端活动 —— 刷新空闲计时, 并作废过期的「告别」快通道。
+
+    **这里有个必须踩过的坑**: `pagehide` 在**刷新页面时同样会触发**, 所以
+    「告别」标记不能一设了就长期有效 —— 否则工人每刷新一次页面, 就等于按下
+    一枚 30 秒引信, 而页面明明活得好好的、心跳一直在发, 服务还是会自杀。
+    实测就是这么挂的: 日志里退出行写「静默 2s」—— 心跳 2 秒前刚来过。
+    """
+    global _last_seen, _ever_connected, _goodbye_at
+    _last_seen = time.time()
+    if _goodbye_at is not None and _last_seen > _goodbye_at:
+        # 告别之后**又**有活动 → 页面回来了, 那是刷新/切页, 不是真关窗。
+        _goodbye_at = None
+    if connected:
+        _ever_connected = True
+
+
+@app.middleware("http")
+async def _count_http_activity(request, call_next):
+    # 页面上任何一次 API 调用 (点开始/停止/看历史) 都算「人还在用」——
+    # 即使 WebSocket 恰好断了, 也不该把人正在操作的会话判成空闲。
+    _touch()
+    return await call_next(request)
+
+
+@app.post("/api/goodbye")
+async def goodbye():
+    """页面关窗时由 navigator.sendBeacon 调 —— 走快通道, 不用等满 10 分钟。
+
+    sendBeacon 在页面卸载时也能发出去, 但**刷新页面同样会触发**, 所以它只能
+    在「此后一直没有任何活动」的前提下缩短宽限期 (见 _touch / _idle_watchdog)。
+    """
+    global _goodbye_at
+    _touch()                  # 算作一次活动, 把 _last_seen 推到当下
+    _goodbye_at = _last_seen  # 盖在刚才那一刻上 —— 之后任何活动都会作废它
+    return {"ok": True}
+
+
+async def _idle_watchdog():
+    """定时看一眼: 现在该不该退。时长全部可配 (config.yaml 的 `service:`)。"""
+    cfg = Config.get("service", {}) or {}
+    idle_exit = int(cfg.get("idle_exit_sec", 600))
+    goodbye_grace = int(cfg.get("goodbye_grace_sec", 30))
+    never_connected_exit = int(cfg.get("never_connected_exit_sec", 3600))
+    tick = 15
+
+    print(
+        f"[server] 空闲自退已启用: 无活动 {idle_exit}s 退; "
+        f"关窗告别 {goodbye_grace}s 退; 测试运行中永不退",
+        flush=True,
+    )
+    while True:
+        await asyncio.sleep(tick)
+        # ① 测试在跑 → 永不退出。这是硬红线: 一次 8 小时烧机不能被心跳误杀。
+        if runner.status == "running":
+            continue
+        now = time.time()
+        if not _ever_connected:
+            # 起了服务但没人连上来 (比如 xdg-open 失败) —— 给足 1 小时, 别刚
+            # 启动就被当成空闲杀掉。
+            deadline = _SERVICE_T0 + never_connected_exit
+        elif _goodbye_at is not None and _last_seen <= _goodbye_at:
+            # 快通道成立的前提是「告别之后一直没有任何活动」。心跳/请求一旦
+            # 刷新过 _last_seen, 就说明页面回来了 —— 这时必须走 idle 分支,
+            # 绝不能让一条过期的告别标记压过活跃的心跳。
+            deadline = _goodbye_at + goodbye_grace
+        else:
+            deadline = _last_seen + idle_exit
+        if now >= deadline:
+            _do_exit(f"页面已关闭且无测试在跑, 空闲自动退出 (静默 {int(now - _last_seen)}s)")
+
+
 # ==================== 重测 / mini-run (§7.7) ====================
 class RetestRequest(BaseModel):
     run_id: int
@@ -185,12 +346,13 @@ async def history_detail(run_id: int):
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    _touch(connected=True)   # 空闲自退的「有人在线」起点
     q = runner.subscribe()
     # 先发一帧当前快照
     await ws.send_json({"type": "snapshot", **runner.snapshot()})
     try:
         while True:
-            # 同时检查 client 发来的消息 (如停止)
+            # 同时检查 client 发来的消息 (心跳 ping / 停止)
             send_task = asyncio.create_task(_drain_queue(ws, q))
             recv_task = asyncio.create_task(ws.receive_text())
             done, pending = await asyncio.wait(
@@ -203,6 +365,9 @@ async def ws_endpoint(ws: WebSocket):
             if recv_task in done:
                 try:
                     msg = json.loads(recv_task.result())
+                    # 收到什么帧都算「页面还活着」, ping 只是为了在没有别的
+                    # 消息流的时候 (比如盯着总结页发呆) 维持心跳。
+                    _touch()
                     if msg.get("type") == "stop":
                         await runner.stop()
                 except Exception:

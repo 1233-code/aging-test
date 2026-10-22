@@ -8,6 +8,16 @@ server:
   host: "0.0.0.0"
   port: 8000
 
+# 服务生命周期 (关浏览器 → 服务自动退)
+# ⚠️ 正在跑测试时**永远不会**因为空闲而退出, 这条只在没有任何测试在跑时生效。
+service:
+  idle_exit_sec: 600          # 页面静默多久后自动退出 (10 分钟)
+  goodbye_grace_sec: 30       # 页面主动告别 (sendBeacon) 后的宽限
+  never_connected_exit_sec: 3600  # 起了服务但一直没人访问时的存活上限
+  # 「关闭服务」默认只接受本机 (127.x) 的调用 —— 服务绑在 0.0.0.0, 不设防的话
+  # 同网段任何人都能把服务点掉。产线要用平板远程关, 才把这里改成 true。
+  allow_remote_shutdown: false
+
 # 网络接口 (根据实际设备改)
 interfaces:
   wifi: "wlan0"
@@ -26,16 +36,29 @@ eth:
   dhcp_timeout_sec: 10         # DHCP 取 IP 超时, 超时转静态兜底
   static_ip: "192.168.1.50/24" # DHCP 失败时的静态兜底地址
 
-# 风扇 GPIO (普通 IO 控制,无 tach 反馈)
-# PI5 = 40-pin 物理针脚 5
-# 在 T527/A527 上 PI5 一般映射到 gpiochipN 的 line M
-# 请用 'ls /dev/gpiochip*' + 'gpioinfo /dev/gpiochipN' 确认
-# 默认: 假设映射到 gpiochip0 line 5 (常见 A527 底板)
+# 风扇 GPIO (B 类纯 GPIO 通断, 无 tach 反馈)
+# PI5 = 40-pin 物理针脚 5, 厂家内核镜像把它暴露成 0666 的直通文件。
+# §6.8: 该节点由出货镜像提供, apt 包补不了 —— 缺失判 error, 不静默回退。
+#
+# ✅ **读写双向可用** (2026-10-22 实测): 终端 `echo 0/1 > /proc/rp_gpio/pi5`
+#    能正常启停风扇; Python 侧用 `os.open`+`os.write` 写、`os.open`+`os.read` 读,
+#    每次写完回读校验, 四次往返全部一致, 电平可还原。
+#
+# ⚠️ **必须用裸系统调用** (`os.open`/`os.read`/`os.write`), 不能用 Python 的
+#    `open(p,'rb')` —— 缓冲读会 kernel panic。实测表见 server/tests/fan.py 顶部。
 fan:
-  gpio_chip: 0
-  gpio_line: 5            # PI5 物理针脚 5,根据实际板子调整
-  active_level: "high"    # "high" 或 "low"
-  check_duration_sec: 30  # 持续监测时间
+  procfs_path: "/proc/rp_gpio/pi5"   # 厂家脚位暴露路径
+  drive: true                  # true = 主动拉低/拉高轮转 (风扇会真的启停);
+                               # false = 只读体检, 只测「节点能不能稳定读出电平」
+  active_level: "high"         # "high" = 1 是风扇运行; "low" = 0 是运行
+  cycles: 2                    # 轮转轮数 (drive=true) / 连读采样次数 (drive=false)
+  sample_gap_sec: 0.3          # 只读模式下两次采样之间的间隔
+  drive_settle_sec: 5.0        # 写完电平到回读之间的等待。这 5 秒里同步发生三件事:
+                               #   ① 电平稳定 ~10ms  ② 风扇物理启转 ~0.5-1.5s
+                               #   ③ 操作员目视确认启停 ~2s
+                               # 设太小的话风扇刚起步就回读了, 工人来不及看 ——
+                               # 而「看见风扇转起来」正是确认虚焊/不转的唯一手段。
+                               # 产线 5.0s, 返修可调到 8.0s。
 
 # 测试默认参数 (UI 上可改)
 defaults:
@@ -46,13 +69,17 @@ defaults:
     threads: 0              # 0 = 全部核
     max_temp_c: 85
   gpu:
-    # §6.3: glmark2 以"一轮完整跑完"为最小粒度, 单轮时长由驱动决定,
-    # 因此本项 **不提供 [次数] / [时长]**, 只给一个超时兜底
+    # §6.3: 默认 1 轮 = 原单轮行为, 出货判定口径不变; 可手动调大加强覆盖。
+    # 不提供 [时长] —— 单轮时长由 GL 驱动决定, 调时长没意义。
     enabled: true
-    timeout_sec: 600         # 超时即 error, 防个别机器跑飞挂死整个 run
+    rounds: 1                # 跑几轮完整 glmark2; 多轮还能看出分数衰减趋势
+    timeout_sec: 600         # 单轮超时上限 (非整项上限), 超时即 error
   wifi:
-    # §6.4: 单次 4 步流程 (开关→状态→射频→扫描), **不提供** [次数]/[时长]
+    # §6.4: 每轮是 4 步流程 (开关→状态→射频→扫描), 单轮时长由各步超时决定,
+    # 所以**只给 [次数]、不给 [时长]**。默认 1 = 出货口径不变; 老化加强时
+    # 调大, 反复开关射频 + 反复扫描更容易暴露间歇性驱动问题。
     enabled: true
+    times: 1
     iface: "wlan0"               # 接口名 (默认 wlan0, 留空则自动探测 wlp*/wlx*)
     switch_settle_sec: 1.0       # ① down 与 up 之间的间隔
     scan_timeout_sec: 15         # ④ 单次 iw scan 超时
@@ -63,16 +90,27 @@ defaults:
     times: 5
     min_write_mbps: 20
   ethernet:
-    # §6.6: 网口是单次 3 步流程 (链路→DHCP→出网), 时长由各步超时决定,
-    # 因此**不提供** [次数]/[时长], 配置项在上面的 `eth:` 段
+    # §6.6: 每轮是 3 步流程 (链路→DHCP→出网), 单轮时长由各步超时决定,
+    # 所以**只给 [次数]、不给 [时长]**。默认 1 = 出货口径不变; 老化加强
+    # 时调大, 反复建链 / 反复续 DHCP 更容易暴露间歇性 PHY 和网络栈问题。
     enabled: true
+    times: 1
   hdmi:
     enabled: true
     times: 1
     target_resolution: "1920x1080@60"
   fan:
+    # 默认开启。**读写双向**: 主动把电平拉低/拉高若干轮, 每步都回读校验,
+    # 写什么读回什么才判通过 —— 这样「虚焊 / 接触不良 / 风扇压根不转」这条
+    # 才算真覆盖到了, 而不是只测「节点能不能读」。
+    #
+    # 跑完 (无论通过/失败/取消/异常) 都会在 finally 里把电平还原成起始值,
+    # 不会把设备留在「风扇停止」状态。
+    #
+    # 轮转期间风扇会真的启停 —— 产线上要确认机箱内无异物。
+    # 想保守一点只做只读体检: 改上面的 `fan.drive: false`。
     enabled: true
-    min_gpio_high: true
+    cycles: 2
   tfcard:
     enabled: true
     inserted: false         # UI 上勾选才执行

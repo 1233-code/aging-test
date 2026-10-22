@@ -5,7 +5,7 @@ import time
 import re
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, run_cmd, is_root, run_proc_with_wallclock, with_sudo, sudo_hint_if_unavailable
+from ._tools import find_tool, run_cmd, is_root, run_proc_with_wallclock, with_sudo, kill_proc, sudo_hint_if_unavailable
 
 
 @register
@@ -50,7 +50,11 @@ class MemoryTest(TestCase):
             await ctx.on_log(f"[内存] 第 {round_idx}/{times} 轮")
             await ctx.on_progress(int((i / times) * 100), f"第 {round_idx} 轮")
 
-            cmd = with_sudo([tool, f"{size_mb}M", "1"])
+            # §11.2 一律 sudo → 子进程是 root, 而服务是普通用户 → **我们发不了信号**
+            # (os.kill 对 root 进程必然 EPERM)。所以挂钟收尾交给 root 领地内部的
+            # `timeout`: 它和 memtester 同为 root, 到点自己杀自己的子进程,
+            # 服务全程一个信号都不用发。见 _tools.with_sudo 的「为什么要 timeout」。
+            cmd = with_sudo([tool, f"{size_mb}M", "1"], timeout_sec=duration)
             await ctx.on_log(f"[内存] 执行: {' '.join(cmd)}")
 
             t0 = time.time()
@@ -59,15 +63,17 @@ class MemoryTest(TestCase):
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
                 )
 
-                # memtester 没有 --timeout,用 wall-clock 控制
+                # memtester 没有自己的 --timeout, 由上面的 `timeout <duration>` 兜底。
+                # 这个 readline 循环只负责**读输出**, 退出以读到 EOF 为准。
                 lines_buf = []
+                hit_wallclock = False
                 while True:
                     if await ctx.is_cancelled():
-                        proc.terminate()
-                        try:
-                            await asyncio.wait_for(proc.wait(), 3)
-                        except asyncio.TimeoutError:
-                            proc.kill()
+                        if not await kill_proc(proc, ctx=ctx):
+                            await ctx.on_log(
+                                f"[内存] 子进程 {proc.pid} 仍在跑 —— 已交由 `timeout` "
+                                f"在 {duration}s 处收尾, 本次不等它"
+                            )
                         result.status = "stopped"
                         all_passed = False
                         break
@@ -75,15 +81,11 @@ class MemoryTest(TestCase):
                     try:
                         line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
                     except asyncio.TimeoutError:
-                        # 检查超时
-                        if time.time() - t0 > duration:
-                            proc.terminate()
-                            try:
-                                await asyncio.wait_for(proc.wait(), 3)
-                            except asyncio.TimeoutError:
-                                proc.kill()
-                            await ctx.on_log(f"[内存] ⏰ 超过时长 {duration}s,终止")
-                            break
+                        # 只提示一次, **既不 break 也不 terminate** —— `timeout` 才是
+                        # 挂钟的唯一权威, 它收尾后进程退出, 这里自然读到 EOF。
+                        if not hit_wallclock and time.time() - t0 > duration * 0.95:
+                            hit_wallclock = True
+                            await ctx.on_log(f"[内存] ⏰ 挂钟 {duration}s 快到 —— 由 `timeout` 收尾")
                         continue
 
                     if not line:
@@ -102,25 +104,31 @@ class MemoryTest(TestCase):
                             phase_pct = int(pct.rstrip("%"))
                         except ValueError:
                             phase_pct = 0
-                        elapsed = time.time() - t0
                         overall = (i + phase_pct / 100) / times * 100
                         await ctx.on_progress(int(overall), f"{phase} {pct}")
 
-                rc = await proc.wait() if proc.returncode is None else proc.returncode
+                # 挂钟必须**无条件**算 —— 旧代码只在进度分支里赋值, 一旦 memtester
+                # 输出里没匹配到百分比行, 下面的 elapsed 会 NameError。
+                elapsed = time.time() - t0
                 result.log = "\n".join(lines_buf)
 
                 if result.status == "stopped":
+                    # 立刻返回, **不 await proc.wait()** —— 收尾失败时进程还活着
+                    # (root 子进程发不了信号, 见 kill_proc), 等它等于干等到
+                    # `timeout` 到点。用户点了「停止」却要再等几十秒, 是最糟的卡。
                     return result
+
+                rc = await proc.wait() if proc.returncode is None else proc.returncode
 
                 # memtester 退出码 + 特定失败模式双重判断
                 if rc != 0 and not await ctx.is_cancelled():
-                    # 重要: 如果 elapsed >= duration 的 90%, 说明是挂钟到了我们 SIGTERM 杀的
-                    # 这种情况 rc=-15 是预期的, 不算 fail (memtester 跑满了)
-                    ran_full = elapsed >= duration * 0.9
+                    # `timeout` 到点收尾时退出码是 124 (GNU coreutils 约定),
+                    # 说明挂钟跑满了, 是**预期**行为, 不算 fail。
+                    timed_out = (rc == 124)
+                    ran_full = timed_out or elapsed >= duration * 0.9
                     if ran_full:
-                        await ctx.on_log(
-                            f"[内存] 跑满挂钟 {elapsed:.0f}s (被我们 SIGTERM 杀, rc={rc})"
-                        )
+                        why = "`timeout` 到点收尾" if timed_out else "挂钟已跑满"
+                        await ctx.on_log(f"[内存] 跑满挂钟 {elapsed:.0f}s ({why}, rc={rc})")
                         # 不 break, 继续到下面的 ok_count 统计
                     else:
                         await ctx.on_log(f"[内存] ❌ memtester 返回 {rc} (跑了 {elapsed:.0f}s)")
@@ -129,14 +137,15 @@ class MemoryTest(TestCase):
                         all_passed = False
                         break
 
-                # memtester 内部错误检测:
-                #   在 PASS 输出里, 每行 "test N:  ..." 都以 "ok" 结尾
-                #   在 FAIL 输出里, 某行会以 "FAIL" 结尾 (大写)
-                fail_line = re.search(
-                    r"^\s*test\s+\d+:[^\n]*\bFAIL\b",
-                    result.log,
-                    re.MULTILINE,
-                )
+                # memtester 输出格式 —— **本机是 4.3.0, 别用老版本的正则**
+                #   4.x:   "  Stuck Address       : <进度>ok"  (进度用退格符原地重绘)
+                #   1.x:   "test 1: mlock  1MB  1 touch ok"
+                # 老代码只认 1.x 的 "test N:" → 在 4.x 上 ok_count 恒为 0,
+                # 更糟的是 FAIL 分支也永远不触发 —— **内存真坏了照样判 passed**。
+                # 注意**不能**加前导 \b: memtester 4.x 打印的是
+                # "setting 3FAILURE at ..." —— "3" 和 "FAILURE" 之间没有词边界,
+                # \bFAIL 匹配不上 (这就是老代码漏检的同一类错)。
+                fail_line = re.search(r"FAIL(?:URE)?\b", result.log, re.MULTILINE)
                 if fail_line:
                     await ctx.on_log(
                         f"[内存] ❌ memtester 报失败: {fail_line.group(0).strip()[:200]}"
@@ -146,9 +155,24 @@ class MemoryTest(TestCase):
                     all_passed = False
                     break
 
-                # 算 pass 的测试数
-                ok_count = len(re.findall(r"^\s*test\s+\d+:[^\n]*\bok\b", result.log, re.MULTILINE))
-                await ctx.on_log(f"[内存]   全部 {ok_count} 项测试通过 ✓")
+                # 算 pass 的测试数: "  Test Name      : ...ok" 一行算一项
+                ok_count = len(re.findall(
+                    r"^\s*\S[^\n:]*:\s*[^\n]*\bok\b", result.log, re.MULTILINE
+                ))
+
+                # **一项都没解析出来 = 我们根本没能力判定内存好坏** → error, 不判 passed。
+                # §9.3 点名的危险失效模式: 静默的"通过"比明确的"失败"有害得多。
+                if ok_count == 0:
+                    result.status = "error"
+                    result.error = (
+                        f"memtester 一项 ok 都没解析到 —— 无法判定内存好坏。"
+                        f"(输出前 3 行: {result.log.splitlines()[:3]})"
+                        f"可能是 memtester 版本/输出格式变了, 或根本没跑起来。"
+                    )
+                    await ctx.on_log(f"[内存] ✗ {result.error}")
+                    return result
+
+                await ctx.on_log(f"[内存]   {ok_count} 项测试全部 ok ✓")
                 result.metrics[f"round_{round_idx}_ok_tests"] = ok_count
                 result.metrics[f"round_{round_idx}_size_mb"] = size_mb
 

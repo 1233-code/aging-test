@@ -5,7 +5,7 @@ import time
 from typing import Optional
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, with_sudo, sudo_hint_if_unavailable
+from ._tools import find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable
 
 
 @register
@@ -58,7 +58,7 @@ class CPUTest(TestCase):
                 "--cpu", str(threads),
                 "--timeout", f"{duration}s",
                 "--metrics-brief",
-            ])
+            ], timeout_sec=duration + 30)
             await ctx.on_log(f"[CPU] 执行: {' '.join(cmd)}")
 
             t0 = time.time()
@@ -73,11 +73,9 @@ class CPUTest(TestCase):
                 lines_buf = []
                 while True:
                     if await ctx.is_cancelled():
-                        proc.terminate()
-                        try:
-                            await asyncio.wait_for(proc.wait(), timeout=3)
-                        except asyncio.TimeoutError:
-                            proc.kill()
+                        # 不用裸 terminate/kill —— 子进程是 sudo 起的 root
+                        # 进程, 普通用户对它发信号必然 EPERM。见 kill_proc。
+                        await kill_proc(proc, wait_sec=3.0, ctx=ctx)
                         result.status = "stopped"
                         all_passed = False
                         break

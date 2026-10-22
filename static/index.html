@@ -15,6 +15,13 @@
                 <span class="device-tag" v-if="config">设备配置: {{ Object.keys(config.interfaces || {}).length }} 接口</span>
                 <button class="btn-text" v-if="view === 'main'" @click="goHistory">历史记录</button>
                 <button class="btn-text" v-else @click="goConfig">← 返回配置</button>
+                <!-- 关闭服务: 工人不敲命令, 关服务的唯一入口。跑测试时禁用。 -->
+                <button
+                    class="btn-shutdown"
+                    @click="shutdownService"
+                    :disabled="isRunning"
+                    :title="isRunning ? '测试运行中不能关闭服务, 请先停止' : '退出后双击桌面图标可再次启动'"
+                >⏻ 关闭服务</button>
             </div>
         </header>
 
@@ -60,13 +67,20 @@
                             <span v-if="'duration_sec' in tests[t.name]">
                                 时长: <input type="number" v-model.number="tests[t.name].duration_sec" min="5" max="86400" class="num-input"> s
                             </span>
+                            <!-- §6.3 GPU: 轮次可调 (默认 1 = 原单轮行为), 不给时长 -->
+                            <span v-if="'rounds' in tests[t.name]">
+                                轮次: <input type="number" v-model.number="tests[t.name].rounds" min="1" max="20" class="num-input">
+                                <span class="hint-tag">单轮时长由驱动决定, 不可调</span>
+                            </span>
+                            <!-- §6.8 风扇: 轮转次数可调 (默认 2), 不给时长 -->
+                            <span v-if="'cycles' in tests[t.name]">
+                                轮转: <input type="number" v-model.number="tests[t.name].cycles" min="1" max="50" class="num-input"> 次
+                            </span>
                             <span v-if="t.name === 'wifi'">
-                                <span class="hint-tag">仅扫描 · 不连 AP · 全自动 ≤ 10s</span>
-                                模式:
-                                <select v-model="tests[t.name].mode" class="num-input">
-                                    <option value="full">完整 (查 RSSI)</option>
-                                    <option value="functional">仅功能 (不查 RSSI)</option>
-                                </select>
+                                <span class="hint-tag">4 步直测 · 不连 AP · 无 AP 时降级通过</span>
+                            </span>
+                            <span v-if="t.name === 'ethernet'">
+                                <span class="hint-tag">3 步 · 未插网线弹提示 · 不测吞吐</span>
                             </span>
                             <span v-if="t.name === 'tfcard'">
                                 <span class="hint-tag">运行时自动检测 · 未插弹提示</span>
@@ -199,6 +213,8 @@
                         :disabled="isRunning"
                     >🔂 重测失败项 ({{ failedCount }})</button>
                     <button class="btn-secondary" @click="goHistory">📋 历史记录</button>
+                    <!-- 跑完了 → 这里就是「我干完了」的地方, 放一个最顺手的关闭入口 -->
+                    <button class="btn-shutdown" @click="shutdownService" :disabled="isRunning">⏻ 关闭服务</button>
                 </div>
             </section>
         </main>
@@ -277,6 +293,19 @@
                 </div>
                 <p class="modal-hint">
                     重测会重走 §6.6 三步：链路 → DHCP（失败转静态兜底）→ 三级降级 ping。
+                </p>
+            </div>
+        </div>
+
+        <!-- =============== 服务已关闭 (全屏告别页, 盖住一切) =============== -->
+        <div v-if="shuttingDown" class="shutdown-screen">
+            <div class="shutdown-card">
+                <div class="shutdown-emoji">🔌</div>
+                <h1>服务已关闭</h1>
+                <p class="shutdown-msg">现在可以关掉这个浏览器页面了。</p>
+                <p class="shutdown-hint">
+                    本次测试结果已保存, 重启后仍可在「历史记录」里查看。<br>
+                    要再测, 双击桌面的「工厂老化测试」图标即可重新启动。
                 </p>
             </div>
         </div>
