@@ -81,7 +81,16 @@ defaults:
     enabled: true
     times: 1
     iface: "wlan0"               # 接口名 (默认 wlan0, 留空则自动探测 wlp*/wlx*)
-    switch_settle_sec: 1.0       # ① down 与 up 之间的间隔
+    switch_settle_sec: 1.0       # ① down 与 up 之间的间隔 (**不含**等 up 生效的时间,
+                               #     那是下面 state_timeout_sec 的事)
+    # ② set up 之后轮询 `ip link show` 直到 state=UP 的上限。
+    # **必须轮询, 不能固定 sleep**: 无线驱动 set up 后还要初始化射频, 这段
+    # 时间内核报 state DORMANT (接口已 up, 链路未就绪), 属正常中间态。
+    # 2026-10-22 本机实测 DORMANT→UP 要 3.22 秒, 而原先固定等 1.0s 就去读 ——
+    # run 43/44/47 三次全倒在这。改成轮询后驱动初始化多慢都能过, 真超时才 fail,
+    # 且报错能区分「没等到」(超时) 和「等到了但状态不对」。
+    # 驱动就绪耗时记进 metrics.state_wait_ms, 老化时可看出初始化有没有变慢。
+    state_timeout_sec: 10.0
     scan_timeout_sec: 15         # ④ 单次 iw scan 超时
     scan_retry_count: 2          # ④ 4b 额外重试次数 (共最多 3 次)
     scan_retry_gap_sec: 5        # ④ 4b 重试间隔

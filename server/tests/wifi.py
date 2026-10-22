@@ -178,6 +178,42 @@ class WiFiTest(TestCase):
         await ctx.on_progress(100, "完成")
         return agg
 
+    async def _wait_state_up(
+        self, ctx: TestContext, ip_bin: str, iface: str, timeout: float
+    ) -> Tuple[str, int]:
+        """轮询 `ip link show` 直到 state=UP, 返回 (最终 state, 等待毫秒)。
+
+        **为什么必须轮询, 不能固定 sleep —— 2026-10-22 实测踩过的坑**:
+        无线驱动在 `ip link set up` 之后还要初始化射频, 这段时间内核报
+        `state DORMANT` (= 接口已 up, 链路未就绪), 是**正常中间态**。
+        本机实测 DORMANT→UP 要 **3.22 秒**, 而原先固定等 `switch_settle_sec`
+        (1.0s) 就去读 —— 必然读到 DORMANT 判 fail, run 43/44/47 全倒在这。
+
+        改轮询后驱动初始化多慢都能过, 只有真超时才 fail, 而且报错能区分
+        「没到」和「到了但状态不对」。
+
+        ⚠️ `mode DORMANT` 与 `state DORMANT` 是两回事: 前者在 `ip link show`
+        行的 `mode` 后面 (射频省电模式, 正常), 后者才是链路状态。正则只锚
+        `state`, 不会误取 —— 已用本机真实输出逐条验证过。
+        """
+        deadline = time.monotonic() + timeout
+        t0 = time.monotonic()
+        state = "UNKNOWN"
+        while True:
+            if await ctx.is_cancelled():
+                return state, int((time.monotonic() - t0) * 1000)
+            rc, out, _ = await self._run(
+                with_sudo([ip_bin, "link", "show", iface]), 5
+            )
+            if rc == 0:
+                m = _RE_LINK_STATE.search(out)
+                state = m.group(1) if m else "UNKNOWN"
+            if state == "UP":
+                return state, int((time.monotonic() - t0) * 1000)
+            if time.monotonic() >= deadline:
+                return state, int((time.monotonic() - t0) * 1000)
+            await asyncio.sleep(0.3)
+
     async def _run_once(self, ctx: TestContext) -> TestResult:
         result = TestResult()
         t_cfg = ctx.test_config
@@ -191,6 +227,7 @@ class WiFiTest(TestCase):
             iface = find_wifi_iface() or "wlan0"
 
         settle = float(t_cfg.get("switch_settle_sec", 1.0))
+        state_timeout = float(t_cfg.get("state_timeout_sec", 10.0))
         scan_timeout = float(t_cfg.get("scan_timeout_sec", 15))
         scan_retries = int(t_cfg.get("scan_retry_count", 2))    # 4b: 额外重试次数
         scan_retry_gap = float(t_cfg.get("scan_retry_gap_sec", 5))
@@ -270,23 +307,31 @@ class WiFiTest(TestCase):
         await ctx.on_log("[WiFi]   ✓ down / up 两句都退出 0 —— 驱动响应了命令")
         await ctx.on_progress(25, "① 开关 OK")
 
-        # ══════════ ② 状态确认 ══════════
-        await ctx.on_log("[WiFi] ② 状态确认 — ip link show")
-        rc, out, err = await self._run(with_sudo([ip_bin, "link", "show", iface]), 5)
-        if rc != 0:
-            await fail_at(2, f"`ip link show {iface}` 退出码 {rc}: "
-                            f"{(err or '').strip()[:200]}")
-            await ctx.on_progress(100, "失败")
-            return result
-
-        m = _RE_LINK_STATE.search(out)
-        state = m.group(1) if m else "UNKNOWN"
+        # ══════════ ② 状态确认 (轮询等 UP, 不是固定 sleep) ══════════
+        await ctx.on_log(
+            f"[WiFi] ② 状态确认 — 轮询 `ip link show` 直到 state=UP "
+            f"(上限 {state_timeout}s, 每 0.3s 一次)"
+        )
+        state, waited_ms = await self._wait_state_up(ctx, ip_bin, iface, state_timeout)
         result.metrics["ip_link_state"] = state
+        result.metrics["state_wait_ms"] = waited_ms
+
         if state != "UP":
-            await fail_at(2, f"操作后 state 是 '{state}', 期望 'UP' —— 开关未实际生效")
+            if await ctx.is_cancelled():
+                result.status = "stopped"
+                await ctx.on_log("[WiFi] ⏹ 用户取消 (轮询等 UP 期间)")
+                return result
+            await fail_at(
+                2,
+                f"`set up` 后 {waited_ms / 1000:.1f}s 内 state 始终是 '{state}', "
+                f"不是 'UP'。DORMANT = 接口已 up 但射频仍在初始化, 属正常中间态; "
+                f"DOWN/UNKNOWN 才说明开关没生效或驱动异常。"
+            )
             await ctx.on_progress(100, "失败")
             return result
-        await ctx.on_log(f"[WiFi]   ✓ state={state} —— 操作实际生效")
+        await ctx.on_log(
+            f"[WiFi]   ✓ state=UP (驱动就绪耗时 {waited_ms}ms) —— 操作实际生效"
+        )
         await ctx.on_progress(45, "② 状态 UP")
 
         # ══════════ ③ 射频检查 ══════════
