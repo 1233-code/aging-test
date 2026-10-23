@@ -41,6 +41,12 @@ class TFCardTest(TestCase):
     display_name = "TF 卡"
     description = "自动检测挂载点 · 未插弹提示让工人选「已插好 / 跳过」"
 
+    def expected_seconds(self, test_config: dict) -> Optional[float]:
+        # duration_sec 是**每个阶段**的时长, 一轮 = 写 + 读 = ×2
+        times = max(1, int(test_config.get("times", 1)))
+        duration = max(10, int(test_config.get("duration_sec", 30)))
+        return times * duration * 2
+
     async def run(self, ctx: TestContext) -> TestResult:
         result = TestResult()
         t_cfg = ctx.test_config
@@ -72,10 +78,19 @@ class TFCardTest(TestCase):
         await ctx.on_progress(15, f"挂载点 {mount}")
 
         # === 步骤 2: 跑 fio 测试 ===
-        size_mb = 64
+        # duration_sec: 写、读各自跑满多少秒。TF 卡可能很慢 (低速卡 / 接触不良
+        # 正是要挑出来的那类), 所以工作集比 eMMC 小, 但**时长照跑** ——
+        # 以前这里写死 64MB 且不带 --runtime, 一张卡几秒就测完了, 配的时长形同虚设。
+        size_mb = max(16, int(t_cfg.get("size_mb", 64)))
+        duration = max(10, int(t_cfg.get("duration_sec", 30)))
+        round_sec = duration * 2
         test_file = os.path.join(mount, ".aging_test_tf.bin")
         all_passed = True
-        await ctx.on_progress(20, "准备写入测试文件")
+        await ctx.on_log(
+            f"[TF] {times} 轮 × (写 {duration}s + 读 {duration}s)"
+            f" = 约 {round_sec * times}s, 工作集 {size_mb}MB"
+        )
+        await ctx.on_progress(15, f"准备写入 · 预计 {round_sec * times}s")
 
         try:
             for i in range(times):
@@ -85,17 +100,31 @@ class TFCardTest(TestCase):
                     break
 
                 round_idx = i + 1
-                pct_base = int(20 + (i / times) * 75)
                 await ctx.on_log(f"[TF] 第 {round_idx}/{times} 轮")
-                await ctx.on_progress(pct_base, f"第 {round_idx} 轮")
+
+                async def tick(phase: str, phase_elapsed: float, phase_total: float,
+                               i=i, round_idx=round_idx):
+                    done_sec = (0 if phase == "write" else phase_total) + phase_elapsed
+                    frac = min(1.0, done_sec / round_sec)
+                    await ctx.on_progress(
+                        int(15 + (i + frac) / times * 85),
+                        f"第 {round_idx}/{times} 轮 · {'写' if phase == 'write' else '读'}"
+                        f" {phase_elapsed:.0f}s / {phase_total:.0f}s",
+                    )
 
                 t0 = time.time()
-                m = await _run_fio_test(test_file, size_mb, ctx, on_metric=ctx.on_metric)
+                m = await _run_fio_test(
+                    test_file, size_mb, ctx, duration,
+                    on_metric=ctx.on_metric, on_progress=tick,
+                )
                 elapsed = time.time() - t0
 
                 read_mbps = m.get("read_mbps", 0)
                 write_mbps = m.get("write_mbps", 0)
-                await ctx.on_log(f"[TF] 读 {read_mbps:.1f} MB/s, 写 {write_mbps:.1f} MB/s")
+                await ctx.on_log(
+                    f"[TF] 读 {read_mbps:.1f} MB/s, 写 {write_mbps:.1f} MB/s"
+                    f" (耗时 {elapsed:.1f}s)"
+                )
 
                 if read_mbps < min_read:
                     await ctx.on_log(f"[TF] ❌ 读速度 {read_mbps:.1f} < {min_read} MB/s")
@@ -129,3 +158,14 @@ class TFCardTest(TestCase):
 
         await ctx.on_progress(100, "完成")
         return result
+
+    def operator_prompt(self, result: TestResult):
+        """卡槽是空的 → 停下来等工人插卡 (§7.8)。
+
+        卡槽空不是设备缺陷, 也不是「测完了」—— 它是「料没到位」。
+        工人只有两个选择: 插上卡重测, 或者跳过。选完之前整轮必须停住,
+        否则下一项会在他犹豫的时候开跑, 屏幕就跑到别的地方去了。
+        """
+        if result.status == "skipped" and (result.metrics or {}).get("no_mount"):
+            return {"text": "未检测到 TF 卡。请插入 TF 卡后选「已插好重测」, 或选「跳过」。"}
+        return None

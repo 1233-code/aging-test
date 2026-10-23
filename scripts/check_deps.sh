@@ -29,7 +29,7 @@ declare -A CRITICAL=(
     ["ip"]="通用 (iproute2)"
     ["lsusb"]="USB 枚举 (usbutils)"
     ["lsblk"]="块设备枚举 (util-linux)"
-    ["modetest"]="HDMI 切模式 (libdrm-tests)"
+    ["xrandr"]="HDMI 读当前实际输出 (x11-xserver-utils)"
 )
 
 # ───────────────────────── ② 包类·备份路径 ─────────────────────────
@@ -180,8 +180,8 @@ if [ "$BLOCK" = "1" ]; then
     echo "    sudo apt install software-properties-common"
     echo "    sudo add-apt-repository universe && sudo apt update"
     echo ""
-    echo "  提示: modetest 属于 libdrm-tests; libdrm-tools 这个包名在"
-    echo "        Ubuntu(focal) 仓库中不存在, 写错会让 apt-get download 直接失败"
+    echo "  提示: xrandr 属于 x11-xserver-utils; libdrm-tools / modetest 已"
+    echo "        不再需要 —— HDMI 模式切换整块移除 (见 docs §6.7.1)"
     exit 1
 fi
 

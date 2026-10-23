@@ -2,6 +2,7 @@
 import asyncio
 import json
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from .tests.base import TestCase, TestContext, TestResult, TEST_REGISTRY
@@ -24,6 +25,14 @@ RECOMMENDED_ORDER: List[str] = [
 # §7.6 静默期硬规则 - 每项结束后留 N 秒, 可设但默认 5
 INTERVAL_BETWEEN_TESTS_SEC: int = 5
 
+# §7.8 等操作员: 卡槽空 / 网线没插 这类「料没到位」的结果, 整轮要**真停住**。
+# 超时后自动往下走 —— 操作员可能去拿卡了、页面可能被他关掉, 不设上限的话
+# 一次误操作就能把整轮老化挂到天亮, 剩下的项目一个都不跑, 报告还缺一大半。
+OPERATOR_WAIT_DEFAULT_SEC: int = 300
+# 同一个位置最多让工人重测几次 —— 插了三次都没认出来, 多半是卡本身的问题,
+# 再点一百次也只是在耗老化时长。
+OPERATOR_MAX_RETEST: int = 3
+
 
 class TestRunner:
     """单例 - 全局只有一个测试运行实例"""
@@ -42,6 +51,15 @@ class TestRunner:
         # 不能用 `cls().cancel()`: 那是新建一个空实例, self.proc 是 None,
         # 什么也杀不掉 (而且 cancel 是协程, 不 await 等于什么都没发生)。
         self._current_instance: Optional[object] = None
+        # §7.8 等操作员拍板时的槽位。非 None = 当前**真的停住了**, 正在
+        # 等 /api/test/operator 的决定; 里面 event 一 set, _wait_for_operator
+        # 就醒过来继续往下走。
+        self._operator_wait: Optional[dict] = None
+        # 当前正在跑的这一项: 预计多少秒 + 从什么时候开始 (§7.5)。
+        # 存在 self 上而不是局部变量, 是为了让 snapshot() 能带上它们 ——
+        # 工人跑到一半刷新了页面, 重连后计时条要接着走, 而不是消失。
+        self._current_expected_sec: Optional[float] = None
+        self._current_started_at: Optional[float] = None
 
         # Mini-run 模式
         self.mode: str = "full"               # 'full' | 'mini'
@@ -64,14 +82,31 @@ class TestRunner:
                 pass
 
     def snapshot(self) -> dict:
+        w = self._operator_wait
         snap = {
             "run_id": self.run_id,
             "status": self.status,
             "current_test": self.current_test,
+            # §7.5: 让刷新/重连后的页面把「本项计时」接上。不带这两个值的话,
+            # 工人跑到一半刷新, 界面就退回成没有预计时长的样子, 得一直等到
+            # 这一项跑完才知道它到底要多久。
+            "current_expected_sec": self._current_expected_sec,
+            "current_started_at": self._current_started_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "mode": self.mode,
             "parent_run_id": self.parent_run_id,
+            # §7.8: 页面刷新/重连后靠这一项把弹框重新显示出来。
+            # 不带它的话, 工人刷一下页面, 后端还在等, 界面上却什么提示都没有,
+            # 只能干看着「运行中」等到超时。
+            "waiting_operator": (
+                {
+                    "name": w["name"],
+                    "text": w["text"],
+                    "attempt": w["attempt"],
+                    "timeout_sec": w["timeout_sec"],
+                } if w else None
+            ),
             "results": {
                 name: {
                     "status": r.status,
@@ -227,7 +262,234 @@ class TestRunner:
             await asyncio.sleep(1)
         return True
 
+    async def _run_one(
+        self,
+        name: str,
+        cls: Type[TestCase],
+        config: dict,
+        write_to_parent: bool,
+    ) -> Tuple[TestResult, Optional[TestCase]]:
+        """跑**一遍** name 这一项, 返回 (结果, 实例)。
+
+        拆出来是因为 §7.8 要能原地重跑同一项 —— 「插上卡了, 再试一次」
+        走的是同一个实例的第二次 run(), 而不是开一个 mini-run。
+        返回实例是因为只有它才知道这个结果要不要问操作员。
+        """
+        self.current_test = name
+        # 实例先建出来: 要问它「本项预计多少秒」(见 TestCase.expected_seconds)。
+        # 放在 try 外面是有意的 —— 没有子类定义 __init__, 构造不会抛。
+        instance: Optional[TestCase] = cls()
+        test_cfg = config["tests"].get(name, {})
+        try:
+            expected_sec = instance.expected_seconds(test_cfg)
+        except Exception:
+            # 预计时长只是个「安慰性数字」, 算不出来绝不能影响测试本身
+            traceback.print_exc()
+            expected_sec = None
+        self._current_expected_sec = expected_sec
+        self._current_started_at = time.time()
+        await self._broadcast({
+            "type": "test_started",
+            "name": name,
+            # None = 这一项没有可预期的时长 (WiFi / GPU / 网口 / HDMI / 风扇,
+            # 时长由驱动和环境决定)。前端据此决定**不显示**计时条 ——
+            # 显示一个编出来的秒数比不显示更糟。
+            "expected_sec": expected_sec,
+        })
+        await Database.upsert_result(
+            self.run_id, name,
+            status="running",
+            started_at=time.time()
+        )
+        # mini-run 模式下, 先在父 run 把对应行也设回 running (避免 UI 看到旧状态)
+        if write_to_parent and self.parent_run_id:
+            await Database.upsert_result(
+                self.parent_run_id, name,
+                status="running",
+                started_at=time.time()
+            )
+
+        ctx = TestContext(
+            run_id=self.run_id,
+            config=config,
+            test_config=config["tests"].get(name, {}),
+            on_progress=lambda pct, msg, n=name: self._on_progress(n, pct, msg),
+            on_log=lambda line, n=name: self._on_log(n, line),
+            is_cancelled=self._is_cancelled,
+            on_metric=lambda k, v, n=name: self._on_metric(n, k, v),
+        )
+
+        try:
+            self._current_instance = instance   # 供 stop() 拿到真实实例去 kill 子进程
+            self.results[name] = TestResult(status="running")
+            t0 = time.time()
+            result = await instance.run(ctx)
+            result.duration_sec = time.time() - t0
+            self.results[name] = result
+        except Exception as e:
+            result = TestResult(status="error", error=f"异常: {e!r}")
+            self.results[name] = result
+        finally:
+            self._current_instance = None
+
+        common_fields = {
+            "status": result.status,
+            "finished_at": time.time(),
+            "duration_sec": result.duration_sec,
+            "metrics": result.metrics,
+            "log": result.log,
+            "error": result.error,
+        }
+
+        # 写 mini-run 自己的行。
+        # **写库失败不许掀掉整轮** —— 结果照样广播给前端 (界面照样往下走),
+        # 只是这一项没进历史。报告少一行远好过整个界面冻住: 工人看到的是
+        # 「跑完了不出结果」, 什么线索都没有, 连是哪个测试出问题都无从判断。
+        try:
+            await Database.upsert_result(self.run_id, name, **common_fields)
+            # mini-run 模式下就地更新 parent run 的对应行
+            if write_to_parent and self.parent_run_id:
+                await Database.upsert_result(self.parent_run_id, name, **common_fields)
+        except Exception as e:
+            traceback.print_exc()
+            await self._broadcast({
+                "type": "log",
+                "name": name,
+                "line": f"⚠ 结果写库失败 (该项不会出现在历史里): {e!r}",
+            })
+
+        await self._broadcast({
+            "type": "test_finished",
+            "name": name,
+            "result": {
+                "status": result.status,
+                "duration_sec": result.duration_sec,
+                "metrics": result.metrics,
+                "error": result.error,
+            }
+        })
+
+        # 注意: failed/error **不在这里**置 any_failed —— §7.8 允许原地重测,
+        # 这一遍没过不代表最终没过。标志由主循环拿到最终结果后才算。
+        return result, instance
+
+    async def _wait_for_operator(
+        self, name: str, prompt: dict, attempt: int
+    ) -> str:
+        """§7.8 **真的停在原地**等操作员拍板。
+
+        返回: "retest" / "skip" / "stop" / "timeout"。
+
+        这是整个多项目流程里唯一一处「后端主动等」。之前没有它, 后端
+        test_finished → 静默 5s → 下一项 test_started 一路跑到底, 工人
+        还在弹框前犹豫, 后面两项已经跑完了 —— 于是屏幕停在 USB 上, 而
+        HDMI 的结果早就写进库了, 日志和画面自然对不上。
+
+        超时是必须的: 没人操作时自动往下走, 不能把整轮挂死。
+        """
+        flow_cfg = Config.get("flow", {}) or {}
+        # **用 float, 不要 int** —— int(0.5) 是 0, 超时一旦被截成 0,
+        # wait_for 会立刻抛 TimeoutError, 这个「停下来等」就等于没写,
+        # 而且症状和原来的 bug 一模一样 (界面自己往下跑), 极难联想到配置。
+        timeout = float(flow_cfg.get("operator_wait_sec", OPERATOR_WAIT_DEFAULT_SEC))
+
+        event = asyncio.Event()
+        # 局部持有这个槽位对象的引用: finally 里会把 self._operator_wait
+        # 清成 None, 但 decision 要在清空**之前**读出来。
+        slot = {
+            "name": name,
+            "text": prompt.get("text", ""),
+            "attempt": attempt,
+            "timeout_sec": int(timeout),
+            "event": event,
+            "decision": None,
+        }
+        self._operator_wait = slot
+        await self._broadcast({
+            "type": "waiting_operator",
+            "name": name,
+            "text": prompt.get("text", ""),
+            "attempt": attempt,
+            "max_retest": OPERATOR_MAX_RETEST,
+            "timeout_sec": int(timeout),
+        })
+
+        decision = "skip"
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            decision = slot["decision"] or "skip"
+        except asyncio.TimeoutError:
+            decision = "timeout"
+            await self._broadcast({
+                "type": "operator_wait_timeout",
+                "name": name,
+                "timeout_sec": int(timeout),
+            })
+        finally:
+            self._operator_wait = None
+
+        if self.cancelled:
+            return "stop"
+        return decision
+
+    def answer_operator(self, decision: str) -> dict:
+        """前端弹框上那两个按钮的落点: "retest" (已插好) / "skip" (跳过)。
+
+        只是**唤醒**等待, 真正跑不跑下一项由 _run_tests 的主循环决定 ——
+        决定只有这一个出口, 才不会出现「前端跳了、后端还在跑」那种错位。
+        """
+        w = self._operator_wait
+        if w is None:
+            return {"ok": False, "error": "当前没有在等操作员选择"}
+        if decision not in ("retest", "skip"):
+            return {"ok": False, "error": "decision 只能是 retest 或 skip"}
+        if w.get("decision") is not None:
+            # 已经拍过板了 (双击按钮 / 两个页签同时点)
+            return {"ok": False, "error": "已经选择过了"}
+        w["decision"] = decision
+        w["event"].set()
+        return {"ok": True, "decision": decision, "test": w["name"]}
+
     async def _run_tests(self, enabled_tests, config: dict, write_to_parent: bool):
+        """外层护栏: 保证**一定会**发出 run_finished。
+
+        没有这层时, 内部任何一处没接住的异常都会让整个任务静默死掉 —— 最常见
+        的就是写库失败(比如某项的 metrics 里混进一个 json 序列化不了的对象),
+        它发生在 `_run_one` 的 try 之外, 一抛就把 `_run_tests` 整个掀掉。
+
+        后果是: 前端永远收不到 run_finished, 界面就停在最后一个测试的画面上
+        不动, 工人看着像卡死; 而后端日志里**什么都没有** —— 任务是
+        `create_task()` 起的, 没人 await 它, 异常对象直接被 GC 掉, 连
+        "Task exception was never retrieved" 都不一定打出来。
+
+        这一层把异常兜住、记进日志、并以 status=error 正常收尾, 让操作员
+        至少能看到「这一轮出问题了」和原因, 而不是面对一个冻住的界面。
+        """
+        try:
+            await self._run_tests_body(enabled_tests, config, write_to_parent)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[runner] 测试轮次异常终止: {e!r}", flush=True)
+            self.status = "error"
+            self.finished_at = time.time()
+            self.current_test = None
+            try:
+                await Database.finish_run(
+                    self.run_id, "error", {"reason": repr(e)}
+                )
+            except Exception:
+                pass
+            await self._broadcast({
+                "type": "run_finished",
+                "status": "error",
+                "summary": {"reason": repr(e)},
+                "mode": self.mode,
+                "parent_run_id": self.parent_run_id,
+            })
+
+    async def _run_tests_body(self, enabled_tests, config: dict, write_to_parent: bool):
         if not enabled_tests:
             self.status = "error"
             self.finished_at = time.time()
@@ -244,82 +506,66 @@ class TestRunner:
         })
 
         any_failed = False
+        # 操作员刚在弹框上拍过板 → 下一项**立刻**开始, 不再等静默期。
+        # 静默期是给「结果出来没来得及看」的工人留的; 他已经看着结果点过
+        # 「跳过」了, 再闷 5 秒正是「点了跳过却像没反应」的那种卡顿。
+        immediate_next = False
+
         for i, (name, cls) in enumerate(enabled_tests):
             # §7.6 静默期: 第一项前不需要, 其余每项跑完后等 N 秒
-            if i > 0:
+            if i > 0 and not immediate_next:
                 ok = await self._inter_test_interval(
                     enabled_tests[i][0], INTERVAL_BETWEEN_TESTS_SEC
                 )
                 if not ok:
                     # 用户在静默期中止, 后面所有项 skipped
                     break
+            immediate_next = False
 
-            self.current_test = name
-            await self._broadcast({"type": "test_started", "name": name})
-            await Database.upsert_result(
-                self.run_id, name,
-                status="running",
-                started_at=time.time()
-            )
-            # mini-run 模式下, 先在父 run 把对应行也设回 running (避免 UI 看到旧状态)
-            if write_to_parent and self.parent_run_id:
-                await Database.upsert_result(
-                    self.parent_run_id, name,
-                    status="running",
-                    started_at=time.time()
+            # ── §7.8: 本项可能被要求重测若干次 (插卡 / 插网线) ──
+            attempt = 1
+            final_status = "pending"
+            while True:
+                result, instance = await self._run_one(
+                    name, cls, config, write_to_parent
                 )
+                final_status = result.status
 
-            ctx = TestContext(
-                run_id=self.run_id,
-                config=config,
-                test_config=config["tests"].get(name, {}),
-                on_progress=lambda pct, msg, n=name: self._on_progress(n, pct, msg),
-                on_log=lambda line, n=name: self._on_log(n, line),
-                is_cancelled=self._is_cancelled,
-                on_metric=lambda k, v, n=name: self._on_metric(n, k, v),
-            )
+                # 这一步要不要停下来问人?
+                prompt = None
+                if instance is not None:
+                    try:
+                        prompt = instance.operator_prompt(result)
+                    except Exception:
+                        prompt = None
 
-            try:
-                instance = cls()
-                self._current_instance = instance   # 供 stop() 拿到真实实例去 kill 子进程
-                self.results[name] = TestResult(status="running")
-                t0 = time.time()
-                result = await instance.run(ctx)
-                result.duration_sec = time.time() - t0
-                self.results[name] = result
-            except Exception as e:
-                result = TestResult(status="error", error=f"异常: {e!r}")
-                self.results[name] = result
-            finally:
-                self._current_instance = None
+                # 达到重测上限 → 不再问了, 按当前结果往下走
+                if not prompt or attempt > OPERATOR_MAX_RETEST:
+                    if prompt and attempt > OPERATOR_MAX_RETEST:
+                        await self._broadcast({
+                            "type": "log",
+                            "name": name,
+                            "line": (
+                                f"[{cls.display_name}] 已重测 {OPERATOR_MAX_RETEST} 次仍"
+                                f"未就位, 不再等待, 按 skipped 计"
+                            ),
+                        })
+                    break
 
-            common_fields = {
-                "status": result.status,
-                "finished_at": time.time(),
-                "duration_sec": result.duration_sec,
-                "metrics": result.metrics,
-                "log": result.log,
-                "error": result.error,
-            }
+                decision = await self._wait_for_operator(name, prompt, attempt)
+                if decision != "retest":
+                    immediate_next = True    # skip / timeout / stop → 马上进下一项
+                    break
 
-            # 写 mini-run 自己的行
-            await Database.upsert_result(self.run_id, name, **common_fields)
-            # mini-run 模式下就地更新 parent run 的对应行
-            if write_to_parent and self.parent_run_id:
-                await Database.upsert_result(self.parent_run_id, name, **common_fields)
+                attempt += 1
+                await self._broadcast({
+                    "type": "test_retesting",
+                    "name": name,
+                    "attempt": attempt,
+                    "max_retest": OPERATOR_MAX_RETEST,
+                })
 
-            await self._broadcast({
-                "type": "test_finished",
-                "name": name,
-                "result": {
-                    "status": result.status,
-                    "duration_sec": result.duration_sec,
-                    "metrics": result.metrics,
-                    "error": result.error,
-                }
-            })
-
-            if result.status in ("failed", "error"):
+            if final_status in ("failed", "error"):
                 any_failed = True
             if self.cancelled:
                 break
@@ -369,6 +615,13 @@ class TestRunner:
         if self.status != "running":
             return {"ok": False, "error": "没有正在运行的测试"}
         self.cancelled = True
+        # §7.8: 正卡在「等操作员」时, 没有子进程可杀, 唤醒它的只有这一下。
+        # 不唤醒的话「停止」会一直等到超时才生效, 工人看着什么都没发生,
+        # 只好再点一次 —— 而第二次同样没反应。
+        w = self._operator_wait
+        if w is not None:
+            w["decision"] = "stop"
+            w["event"].set()
         # 通知当前正在跑的那一项 —— 靠真实实例, 子进程才会真被 kill 掉。
         # 取消标志本身通过 ctx.is_cancelled() 让各项自己检查退出点;
         # 这里是补刀: 让各项**立刻**停下, 而不是等它跑到下一个检查点。

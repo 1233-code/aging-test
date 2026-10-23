@@ -35,6 +35,20 @@ async def startup():
 app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "static")), name="static")
 
 
+@app.middleware("http")
+async def no_cache_static(request: Request, call_next):
+    """静态资源每次回源校验 (仍走 ETag/304, 带宽损失可忽略)。
+
+    StaticFiles 不发 Cache-Control 时, 浏览器按启发式规则自行缓存, 可能
+    完全不发 If-None-Match 就用本地旧副本 —— 导致改了 app.js 重启服务后
+    页面仍跑旧逻辑, 且很难看出是缓存问题。
+    """
+    response = await call_next(request)
+    if request.url.path.startswith(("/static", "/")):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 @app.get("/")
 async def index():
     return FileResponse(PROJECT_ROOT / "static" / "index.html")
@@ -155,6 +169,22 @@ async def test_stop():
 @app.get("/api/test/status")
 async def test_status():
     return runner.snapshot()
+
+
+# ── §7.8 等操作员: 卡槽空 / 网线没插时的「已插好重测」/「跳过」 ──
+class OperatorAnswer(BaseModel):
+    decision: str    # "retest" (已插好, 原地再跑一遍这一项) | "skip" (进下一项)
+
+
+@app.post("/api/test/operator")
+async def test_operator(req: OperatorAnswer):
+    """唤醒正卡在 waiting_operator 的那一轮。
+
+    **这个接口只做一件事: 通知后端停止等**。下一步是重测当前项还是直接
+    进下一项, 由 runner 的主循环按 decision 决定 —— 前端不去猜「下一项是
+    几号」, 也就不会再出现「屏幕跳到 USB、日志却在写 HDMI」这种错位。
+    """
+    return runner.answer_operator(req.decision)
 
 
 # ==================== 关闭服务 (UI 按钮) ====================

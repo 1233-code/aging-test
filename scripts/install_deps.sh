@@ -68,6 +68,7 @@ echo "=== 安装老化测试工具的系统依赖 ==="
 # 关键包
 CRITICAL_PKGS=(
     "stress-ng"
+    "glmark2-es2"
     "glmark2-es2-wayland"
     "fio"
     "memtester"
@@ -76,7 +77,7 @@ CRITICAL_PKGS=(
     "busybox"
     "iw"
     "rfkill"
-    "libdrm-tests"
+    "x11-xserver-utils"
     "libgpiod-tools"
     "libgpiod2-tools"
 )
@@ -98,7 +99,8 @@ OPTIONAL_PKGS=(
 
 declare -A CATEGORY=(
     [stress-ng]="CPU 压力"
-    [glmark2-es2-wayland]="GPU 渲染 (提供 glmark2-es2)"
+    [glmark2-es2]="GPU 渲染 (X11 变体, 需 DISPLAY)"
+    [glmark2-es2-wayland]="GPU 渲染 (Wayland 变体, 需 WAYLAND_DISPLAY)"
     [fio]="存储 读写"
     [memtester]="内存"
     [ethtool]="网口 链路"
@@ -106,7 +108,7 @@ declare -A CATEGORY=(
     [busybox]="网口 DHCP (udhcpc)"
     [iw]="WiFi 扫描"
     [rfkill]="WiFi 射频屏蔽检查"
-    [libdrm-tests]="HDMI"
+    [x11-xserver-utils]="HDMI 读当前实际输出 (xrandr)"
     [libgpiod-tools]="GPIO 工具 v1 (gpioget, gpioinfo)"
     [libgpiod2-tools]="GPIO 工具 v2 (Ubuntu 20.04 universe)"
 )

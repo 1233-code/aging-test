@@ -18,6 +18,19 @@ service:
   # 同网段任何人都能把服务点掉。产线要用平板远程关, 才把这里改成 true。
   allow_remote_shutdown: false
 
+# 测试流程中的「等待」 (§7.8)
+flow:
+  # 卡槽空 / 网线没插时, 整轮**真的停住**等工人选「已插好重测」或「跳过」。
+  # 为什么必须停: 后端不停的话, 工人还在弹框前犹豫, 后面几项已经跑完了,
+  # 屏幕停在 USB 上而日志在写 HDMI, 报告自然对不上。
+  #
+  # 超时后自动往下走 —— 没人操作时不能把整轮挂死 (工人去拿卡了、
+  # 页面被他关掉了)。这个值要大于「工人跑去拿卡再插上」的合理时间。
+  #
+  # ⚠️ 别配 1 以下的小数 —— 曾经这里写的是 int(), 0.5 会被截成 0,
+  #    于是「等操作员」瞬间失效, 症状和没写这个功能一模一样。
+  operator_wait_sec: 300
+
 # 网络接口 (根据实际设备改)
 interfaces:
   wifi: "wlan0"
@@ -65,7 +78,9 @@ defaults:
   cpu:
     enabled: true
     times: 1
-    duration_sec: 300
+    # 默认只是**出厂基线**, 产线嫌短自己在页面上调大即可。
+    # 300s → 180s → 120s → 60s: 温度一分钟内就爬到平台, 再长只是白等。
+    duration_sec: 60
     threads: 0              # 0 = 全部核
     max_temp_c: 85
   gpu:
@@ -74,6 +89,15 @@ defaults:
     enabled: true
     rounds: 1                # 跑几轮完整 glmark2; 多轮还能看出分数衰减趋势
     timeout_sec: 600         # 单轮超时上限 (非整项上限), 超时即 error
+    # glmark2 变体选择 (§6.3): "auto" = 按当前图形会话自动挑
+    #   有 WAYLAND_DISPLAY → glmark2-es2-wayland, 前置查 WAYLAND_DISPLAY
+    #   有 DISPLAY         → glmark2-es2,         前置查 DISPLAY
+    # 可强制 "wayland" / "x11"。**别改这个去绕过问题** —— auto 选不出变体
+    # 说明会话环境不对, 报 error 比硬跑一个连不上的二进制安全。
+    # 2026-10-22: 原文写死"用 glmark2-es2 + 必须有 Wayland", 而 glmark2-es2
+    # 实际是 X11 变体(ldd 链 libX11), 两者互斥 —— 本机 x11 会话下 GPU 项
+    # 在 GPU 完全正常时被自己的前置条件挡死(run 41/48)。故改为自动适配。
+    variant: auto
   wifi:
     # §6.4: 每轮是 4 步流程 (开关→状态→射频→扫描), 单轮时长由各步超时决定,
     # 所以**只给 [次数]、不给 [时长]**。默认 1 = 出货口径不变; 老化加强时
@@ -96,8 +120,21 @@ defaults:
     scan_retry_gap_sec: 5        # ④ 4b 重试间隔
   usb:
     enabled: true
-    times: 5
-    min_write_mbps: 20
+    # 3 轮 × 18s = **54s**。18×N 到不了整 60 —— 要正好一分钟得用 20s×3
+    # 或 15s×4, 按产线节拍二选一改这里即可。
+    times: 3
+    # 每轮**持续写入**多少秒 (靠 fio --time_based + --runtime)。
+    # 以前这里只写死 32MB 跑一遍就完, UI 上标的「写 30s / 读 30s」是假的。
+    # ⚠️ 这一项写的是 `/dev/sdX` 裸块设备, 会真的反复擦写 U 盘 ——
+    #    别拿唯一一份、有未备份数据的盘来跑。
+    duration_sec: 18
+    size_mb: 32
+    # 📌 2026-10-23 删除 `min_write_mbps`。**速度不再决定通过与否** —— 同型号 U 盘
+    #    写入个体差异极大, 且 USB 2.0 High-Speed 链路上闪存写入典型值只有 8~20 MB/s
+    #    (要走 FTL 擦写, 普遍比读慢一半)。原来 20 的阈值卡在典型值上沿, 实测一个
+    #    正常 U 盘三轮稳定 10.7~10.9 MB/s 就被判 failed。现在**只有 fio 退出码判定**:
+    #    读写出错、盘报错才算失败; 速度仍作为 `round_N_write_mbps` / `avg_write_mbps`
+    #    上报, 供产线看趋势、排查慢盘。
   ethernet:
     # §6.6: 每轮是 3 步流程 (链路→DHCP→出网), 单轮时长由各步超时决定,
     # 所以**只给 [次数]、不给 [时长]**。默认 1 = 出货口径不变; 老化加强
@@ -106,7 +143,6 @@ defaults:
     times: 1
   hdmi:
     enabled: true
-    times: 1
     target_resolution: "1920x1080@60"
   fan:
     # 默认开启。**读写双向**: 主动把电平拉低/拉高若干轮, 每步都回读校验,
@@ -123,17 +159,29 @@ defaults:
   tfcard:
     enabled: true
     inserted: false         # UI 上勾选才执行
-    duration_sec: 60
+    # ⚠️ **duration_sec 是「每个阶段」的时长** —— 写一遍 duration 秒 + 读一遍
+    #    duration 秒, 所以本项总耗时 = duration_sec × 2 = 60s。
+    #    配置页那个「时长」框填的是单阶段值, 别看到 30 就以为只跑 30 秒。
+    duration_sec: 30
     min_read_mbps: 10
   memory:
     enabled: true
+    # **次数 = memtester 跑几遍**, 这是 memtester 原生接口 `memtester <量> <遍数>`
+    # 真正的旋钮, 也是配置页上给工人调的参数。老化要加强就调大它。
     times: 1
-    duration_sec: 60
+    # ⚠️ **这是超时上限, 不是「本项要跑多久」**。memtester 自己跑完就退出,
+    #    正常情况根本碰不到这个上限 —— 所以界面上**不给内存项显示计时条**
+    #    (预计秒数事先算不出来: 耗时 = 遍数 × 工作集 ÷ 机器内存带宽)。
+    #    刻意不叫 `duration_sec`: 那个键会被 §7.2 渲染成「时长」输入框,
+    #    让工人以为调它就能控制运行时长, 实际调了没用。
+    timeout_sec: 60
     size_mb: 1024
   emmc:
     enabled: true
     times: 1
-    duration_sec: 60
+    # ⚠️ 同 TF 卡: duration_sec 是**每个阶段**的时长 (写一遍 + 读一遍),
+    #    本项总耗时 = duration_sec × 2 = 60s。
+    duration_sec: 30
     min_read_mbps: 80
 
 # 报告

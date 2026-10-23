@@ -486,6 +486,10 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .wizard-progress-pct { font-weight: 600; color: #1976d2; min-width: 40px; }
 .wizard-progress-msg { color: #888; font-size: 13px; }
 
+/* 「本项预计 / 已过 / 剩余」方块的样式 (2026-10-23 随该元素一并移除)。
+   留在这里当记录: 那个方块与 .wizard-progress-line 是两套不同的数 —— 方块按
+   挂钟估秒数, 进度条按后端报的 pct 实测, 并排显示时两个百分比常常对不上。 */
+
 .wizard-metrics {
     display: flex;
     flex-wrap: wrap;

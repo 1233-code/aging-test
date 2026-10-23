@@ -71,6 +71,16 @@ createApp({
             return Math.round((currentTestIndex.value / resultList.value.length) * 100);
         });
 
+        // ---- 本项计时: 2026-10-23 移除 ----
+        // 原来是 nowMs / startTicking / timing computed 三件套, 支撑界面上那块
+        // 「本项预计 / 已过 / 剩余」方块。已按产线要求移除 —— 理由见
+        // docs/需求设计.md §7.5: 方块里的秒数是按挂钟估的, 与后端报的 pct 是
+        // 两套数, 并排显示时两个百分比常常对不上。
+        // 页面上现存一根进度条, 数据源是 pct。
+        //
+        // 后端 TestCase.expected_seconds() 与 test_started.expected_sec 仍在,
+        // 那是接口上的机器可读估值 (排障、接口调用方用), 与本文件无关。
+
         const orderedTests = computed(() => {
             const map = new Map(testList.value.map(t => [t.name, t]));
             return testOrder.value.map(name => map.get(name)).filter(Boolean);
@@ -199,6 +209,90 @@ createApp({
             // 切到向导视图
             currentTestIndex.value = 0;
             view.value = 'wizard';
+
+            // ---- 补一次状态同步 (关键, 别删) ----
+            //
+            // 为什么必须主动拉一次, 不能光靠 WS:
+            //   `POST /api/test/start` 里 runner.start() 是 `create_task` 之后
+            //   **立刻 return**, 测试任务下一轮事件循环就跑起来并广播
+            //   `test_started`。而上面那段建 resultList 的代码, 要等 fetch 的
+            //   响应**回到浏览器**才执行。
+            //   两条消息走的是**两条不同的 TCP 连接** (HTTP 响应 vs WebSocket),
+            //   谁先到没有任何保证 —— 于是 test_started 有可能先到, 那时
+            //   resultList 还是空的, findIndex 返回 -1, 事件被静默丢掉。
+            //
+            // 症状: 单项测试时唯一那条 test_started 丢了 → 屏幕不推进、pct 不
+            // 更新、计时条也不出现 (它们全都挂在 test_started 上)。全测时
+            // 只有第一项受影响, 后面几项事件都赶得上, 所以「全测才有进度条」。
+            //
+            // 这里主动查一次当前状态, 把窗口期里漏掉的事件补回来。
+            await syncStatus();
+        };
+
+        // 把后端的运行快照套到界面上。
+        // WS 的 `snapshot` 和启动后的补查都走这里 —— 同一套恢复逻辑, 不写两份。
+        const applySnapshot = (msg) => {
+            if (!msg) return;
+            if (msg.run_id) runId.value = msg.run_id;
+            if (msg.status === 'running') isRunning.value = true;
+
+            // 逐项结果。**不恢复 pct** —— 那是瞬时值, 下一条 progress 就覆盖了,
+            // 硬塞一个陈旧数字反而会让人以为卡在某个百分比上。
+            if (msg.results) {
+                for (const [name, r] of Object.entries(msg.results)) {
+                    const row = resultList.value.find(x => x.name === name);
+                    if (!row) continue;
+                    row.status = r.status;
+                    row.metrics = r.metrics || {};
+                    row.error = r.error;
+                    if (r.duration_sec !== undefined) row.duration_sec = r.duration_sec;
+                }
+            }
+
+            // 当前项 (§7.6 快照恢复)。**不能漏这一步** —— 单项测试时唯一那条
+            // test_started 往往早于启动接口的响应到达(两条 TCP 连接无顺序保证),
+            // 少了这里, 单项测试就没有当前项、没有进度条。
+            if (msg.status === 'running' && msg.current_test) {
+                const ri = resultList.value.findIndex(x => x.name === msg.current_test);
+                if (ri >= 0) {
+                    if (view.value === 'wizard') currentTestIndex.value = ri;
+                    resultList.value[ri].status = 'running';
+                }
+            }
+
+            if (msg.waiting_operator) {
+                const w = msg.waiting_operator;
+                if (w.name === 'tfcard') {
+                    tfPrompt.value = { visible: true, testName: w.name, reason: w.text };
+                } else if (w.name === 'ethernet') {
+                    ethPrompt.value = { visible: true, testName: w.name, reason: w.text };
+                }
+            }
+
+            // 整轮已经结束 → 直接出总结。
+            // run_finished 同样是 WS 推的, 和这条 HTTP 查询不在一条连接上,
+            // 短测试可能在上面那个窗口期里就把整轮跑完并把事件推完了 ——
+            // 那时 resultList 还没建好, 总结页就再也不会出现。
+            // resultList 为空时不跳: 那是「从没跑过 / 已重置」, 跳过去是空白页。
+            const ended = msg.status && msg.status !== 'idle' && msg.status !== 'running';
+            if (ended && resultList.value.length > 0) {
+                tfPrompt.value.visible = false;
+                ethPrompt.value.visible = false;
+                userStopped.value = false;
+                lastStatus.value = msg.status;
+                view.value = 'summary';
+                window._retesting = false;
+            }
+        };
+
+        const syncStatus = async () => {
+            try {
+                const r = await fetch('/api/test/status');
+                applySnapshot(await r.json());
+            } catch (e) {
+                // 拉不到就靠 WS 推 —— 这只是补漏, 失败不该打断启动流程
+                console.warn('同步测试状态失败, 交给 WS:', e);
+            }
         };
 
         const stopTest = async () => {
@@ -310,66 +404,41 @@ createApp({
 
         // ========== 交互 prompt (TF 卡 / 网口) ==========
         // 两者同构: 工人处理完物理动作后二选一 —— 重测该项 / 跳过该项。
-        // 统一走 promptRetest(testName), 避免两份重复的 fetch 逻辑。
-        const promptRetest = async (testName) => {
+        //
+        // ⚠️ 这里**不做任何界面跳转**, 只把决定告诉后端。
+        //    画面由后端下一条 `test_started` 决定:
+        //      · 选「已插好」→ 后端原地重跑同一项 → 又发一次同名 test_started
+        //        → 索引不变, 屏幕停在原地, 正是想要的
+        //      · 选「跳过」  → 后端立刻开下一项 → test_started(下一项)
+        //        → 屏幕跟着切过去
+        //    以前这里是 setTimeout(advanceTest, 500) 自己在前端推索引, 而后端
+        //    同时也在往下跑 —— 两套进度各走各的, 于是「跳过 TF 卡」看到的却是
+        //    USB 的界面 (HDMI 已经在前 5 秒里跑完了), 日志和画面对不上。
+        const answerOperator = async (decision) => {
             tfPrompt.value.visible = false;
             ethPrompt.value.visible = false;
-            if (!runId.value) return;
-            isRunning.value = true;
-            window._retesting = true;
-            const r = resultList.value.find(x => x.name === testName);
-            if (r) {
-                r.status = 'pending';
-                r.pct = 0;
-                r.metrics = {};
-                r.error = null;
-            }
             try {
-                const resp = await fetch('/api/test/retest', {
+                const resp = await fetch('/api/test/operator', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        run_id: runId.value,
-                        test_names: [testName],
-                    }),
+                    body: JSON.stringify({ decision: decision }),
                 });
                 const data = await resp.json();
                 if (!data.ok) {
-                    alert('重测失败: ' + data.error);
-                    isRunning.value = false;
-                    window._retesting = false;
+                    // 后端不在等待 (超时自动往下走了, 或页面刷新丢了一次点击)。
+                    // 这不是致命错误 —— 界面会在下一条 test_started 时自己对上,
+                    // 但要让工人知道刚才那一下没生效, 别以为按了没用。
+                    alert('后端提示: ' + data.error);
                 }
             } catch (e) {
                 alert('网络错误: ' + e.message);
-                isRunning.value = false;
-                window._retesting = false;
             }
         };
 
-        const promptSkip = () => {
-            tfPrompt.value.visible = false;
-            ethPrompt.value.visible = false;
-            setTimeout(() => advanceTest(), 500);
-        };
-
-        const tfInserted = () => promptRetest('tfcard');
-        const tfSkip = () => promptSkip();
-        const ethPlugged = () => promptRetest('ethernet');
-        const ethSkip = () => promptSkip();
-
-        // 自动跳到下一项 / 总结
-        const advanceTest = () => {
-            if (view.value !== 'wizard') return;
-            const next = currentTestIndex.value + 1;
-            if (next < resultList.value.length) {
-                currentTestIndex.value = next;
-            } else {
-                // 全部跑完 → 总结
-                view.value = 'summary';
-                isRunning.value = false;
-                userStopped.value = false;
-            }
-        };
+        const tfInserted = () => answerOperator('retest');
+        const tfSkip = () => answerOperator('skip');
+        const ethPlugged = () => answerOperator('retest');
+        const ethSkip = () => answerOperator('skip');
 
         // ========== 历史 ==========
         const loadHistory = async () => {
@@ -412,7 +481,15 @@ createApp({
         const handleEvent = async (msg) => {
             switch (msg.type) {
                 case 'snapshot':
-                    if (msg.status === 'running') isRunning.value = true;
+                    // 刷新/重连后把「正在等操作员」这件事重新显示出来。
+                    // 不恢复的话: 后端还在等 (最多 300s), 工人刷新一下页面,
+                    // 界面上却什么提示都没有, 只能干等 —— 最后超时自动往下走,
+                    // 工人还以为测试挂了。
+                    //
+                    // 逻辑与启动后的补查 (syncStatus) 完全共用 applySnapshot ——
+                    // 两处各写一份的年代, 刷新恢复只补了一半: 逐项结果没恢复,
+                    // 于是工人刷新一次, 前面跑完的几项全变成「等待」。
+                    applySnapshot(msg);
                     break;
                 case 'run_started':
                     // mini-run 时 runId 仍指向父 run
@@ -421,9 +498,21 @@ createApp({
                         : msg.run_id;
                     break;
                 case 'test_started': {
+                    // **画面只由这一条事件推动。**
+                    // 后端说「现在开始跑 X」, 界面就显示 X —— 不再用
+                    // `当前索引 + 1` 自己猜下一项是谁。原来那种前端自增的写法,
+                    // 只要有一处没对齐 (提示框、停止、超时), 画面就会跑到后端
+                    // 前面去, 而日志仍在写真正在跑的那一项。
+                    // §7.8 的原地重测会再发一次**同名**事件, 索引不变, 屏幕
+                    // 自然停在原地。
+                    const idx = resultList.value.findIndex(x => x.name === msg.name);
+                    if (idx >= 0 && view.value === 'wizard') {
+                        currentTestIndex.value = idx;
+                    }
                     const r = resultList.value.find(x => x.name === msg.name);
                     if (r) {
                         r.status = 'running';
+                        r.pct = 0;
                         r.interval_pending = false;
                         r.interval_remaining = 0;
                     }
@@ -439,41 +528,45 @@ createApp({
                             r.duration_sec = msg.result.duration_sec;
                         }
                     }
-                    // TF 卡 prompt (skipped + no_mount) — 不阻塞流程
-                    if (
-                        msg.name === 'tfcard' &&
-                        msg.result.status === 'skipped' &&
-                        msg.result.metrics &&
-                        msg.result.metrics.no_mount === true &&
-                        !window._retesting
-                    ) {
-                        tfPrompt.value = {
-                            visible: true,
-                            testName: 'tfcard',
-                            reason: msg.result.error || '未检测到 TF 卡挂载点',
-                        };
+                    // **这里不跳转, 也不弹框。**
+                    // 结果怎么呈现 (进下一项 / 停下来问人) 由后端随后发的事件
+                    // 决定: 要停就发 `waiting_operator`, 要继续就发下一条的
+                    // `test_started`。前端在这里自作主张跳一次, 就会和后端的
+                    // 进度形成两套独立推进 —— 那正是「画面是 USB、日志在写
+                    // HDMI」的根源。
+                    break;
+                }
+                case 'waiting_operator': {
+                    // §7.8 后端**真的停住了**。弹框只是把这件既成事实告诉工人。
+                    const why = msg.text || '需要人工介入';
+                    if (msg.name === 'tfcard') {
+                        tfPrompt.value = { visible: true, testName: msg.name, reason: why };
+                    } else if (msg.name === 'ethernet') {
+                        ethPrompt.value = { visible: true, testName: msg.name, reason: why };
                     }
-                    // §6.6 网口未插网线 prompt (skipped + unplugged) — 不阻塞流程
-                    if (
-                        msg.name === 'ethernet' &&
-                        msg.result.status === 'skipped' &&
-                        msg.result.metrics &&
-                        msg.result.metrics.skipped_reason === 'unplugged' &&
-                        !window._retesting
-                    ) {
-                        ethPrompt.value = {
-                            visible: true,
-                            testName: 'ethernet',
-                            reason: msg.result.error || '未插网线',
-                        };
+                    // 别的项将来也可能声明要等操作员 —— 一律记进日志, 别静默吞掉
+                    if (msg.name !== 'tfcard' && msg.name !== 'ethernet') {
+                        logs.value.push(`[${msg.name}] ⏸ 等待人工处理: ${why}`);
                     }
-                    // 任何测试完成 → 自动跳下一项 (不阻塞在失败界面)
-                    if (view.value === 'wizard') {
-                        const delay = userStopped.value ? 200 : 1500;
-                        setTimeout(() => {
-                            if (view.value === 'wizard') advanceTest();
-                        }, delay);
+                    break;
+                }
+                case 'operator_wait_timeout': {
+                    tfPrompt.value.visible = false;
+                    ethPrompt.value.visible = false;
+                    logs.value.push(
+                        `[${msg.name}] ⚠ 等了 ${msg.timeout_sec}s 没人处理, 自动继续下一项`
+                    );
+                    break;
+                }
+                case 'test_retesting': {
+                    const r = resultList.value.find(x => x.name === msg.name);
+                    if (r) {
+                        r.status = 'running';
+                        r.pct = 0;
                     }
+                    logs.value.push(
+                        `[${msg.name}] ↻ 操作员已处理, 重测 (第 ${msg.attempt}/${msg.max_retest} 次)`
+                    );
                     break;
                 }
                 case 'progress': {
@@ -509,19 +602,25 @@ createApp({
                 }
                 case 'run_finished': {
                     isRunning.value = false;
-                    hasResult.value = true;
-                    if (msg.mode !== 'mini') {
-                        lastStatus.value = msg.status;
-                    }
-                    // 不管正常完成 / 用户中途停 / mini-run → 都直接进 summary
-                    view.value = 'summary';
-                    isRunning.value = false;
                     userStopped.value = false;
-                    if (window._retesting) {
-                        window._retesting = false;
-                        tfPrompt.value.visible = false;
-                        ethPrompt.value.visible = false;
-                    }
+                    tfPrompt.value.visible = false;
+                    ethPrompt.value.visible = false;
+
+                    // 这里**只出总结**。§7.8 的中途重测不走 mini-run 了 ——
+                    // 插卡重测是在主循环里原地重跑, 不会产生 run_finished,
+                    // 所以这个事件只可能意味着整轮真的全部跑完了。
+                    // §7.7「失败项重测」是另一种 mini-run, 发生在整轮之后,
+                    // 也该出总结。
+                    //
+                    // ⚠️ 这里原来还写着 `hasResult.value = true`, 而 hasResult
+                    //    **全文件根本没声明过** —— 一执行就 ReferenceError,
+                    //    下面两行 (lastStatus / view='summary') 永远轮不到。
+                    //    症状: 跑完了停在向导页, 永远不跳结果页; 而 WS 本身
+                    //    没断, 后面照常收消息, 所以别的地方看着都正常, 极难查。
+                    //    index.html 也从来没读过它, 属于纯死代码, 直接删。
+                    lastStatus.value = msg.status;
+                    view.value = 'summary';
+                    window._retesting = false;
                     break;
                 }
             }

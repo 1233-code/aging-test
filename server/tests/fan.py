@@ -173,7 +173,7 @@ class FanTest(TestCase):
             f"[风扇] 开始主动轮转 {cycles} 轮: 拉低→回读→拉高→回读\n"
             f"[风扇] ⚠️ 轮转期间风扇会真的启停, 请确认机箱内无异物。"
         )
-        await ctx.on_progress(5, "轮转中")
+        await ctx.on_progress(5, f"第 1/{cycles} 轮 · 准备轮转")
 
         steps: List[dict] = []
         mismatch: List[dict] = []
@@ -217,11 +217,21 @@ class FanTest(TestCase):
                         "gpio_value", back if back is not None else -1
                     )
                     await ctx.on_progress(
-                        int(5 + 85 * (len(steps) / (cycles * 2))),
-                        f"{len(steps)}/{cycles * 2} 步",
+                        # 百分比按**轮数**推进, 不按步数。配置页给工人调的是
+                        # 「轮转 cycles 轮」, 界面上就该看得见轮数在走;
+                        # 以前报的是 `len(steps)/(cycles*2)` —— cycles=2 时屏幕
+                        # 上显示「1/4 步」, 和工人刚填的「2 轮」对不上, 看着像卡住。
+                        # 轮内的相位 (拉低/拉高) 放进文案, 不占百分比。
+                        int(5 + 90 * ((i - 1) / cycles)),
+                        f"第 {i}/{cycles} 轮 · "
+                        f"{'拉低停转' if tag == 'inactive' else '拉高运转'}",
                     )
                 if cancelled:
                     break
+                # 本轮两相都完成了 → 进度按轮数往前推一格
+                await ctx.on_progress(
+                    int(5 + 90 * (i / cycles)), f"第 {i}/{cycles} 轮完成"
+                )
         finally:
             # 还原起始电平 —— 正常结束 / 取消 / 抛异常都走这里
             _write_level(path, initial)
@@ -289,6 +299,12 @@ class FanTest(TestCase):
                 f"{'读失败' if level is None else f'电平 {level}'}"
             )
             await ctx.on_metric("gpio_value", level if level is not None else -1)
+            # 只读模式同样按次数报进度。以前这个循环里一次 on_progress 都没有,
+            # 界面上从 0% 直接跳到 100% —— 采样几秒就完了倒无所谓, 但把
+            # cycles 调大 (老化加强) 时看着就是条死条。
+            await ctx.on_progress(
+                int(95 * (i / cycles)), f"第 {i}/{cycles} 次采样",
+            )
             if i < cycles and await self._sleep_cancellable(ctx, gap):
                 result.status = "stopped"
                 result.metrics["readings"] = readings

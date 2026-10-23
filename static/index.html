@@ -121,7 +121,11 @@
                         {{ statusText(currentTest.status) }}
                     </div>
 
-                    <!-- 进度条 (running 时) -->
+                    <!-- 进度条 (running 时) —— **全页面只有这一根条**。
+                         2026-10-23 删除了原先并列的「本项预计 / 已过 / 剩余」
+                         方块: 它算的是「过了多少秒 / 预计多少秒」, 而这根条画的是
+                         后端报的真实进度 pct, 两个百分比常常对不上(秒数是估算,
+                         pct 是实测), 工人只会怀疑工具坏了。要进度看这根。 -->
                     <div v-if="currentTest.status === 'running'" class="wizard-progress-line">
                         <div class="wizard-progress-line-bar">
                             <div class="progress-fill" :style="{ width: currentTest.pct + '%' }"></div>
@@ -213,8 +217,11 @@
                         :disabled="isRunning"
                     >🔂 重测失败项 ({{ failedCount }})</button>
                     <button class="btn-secondary" @click="goHistory">📋 历史记录</button>
-                    <!-- 跑完了 → 这里就是「我干完了」的地方, 放一个最顺手的关闭入口 -->
-                    <button class="btn-shutdown" @click="shutdownService" :disabled="isRunning">⏻ 关闭服务</button>
+                    <!-- 这里原来还有一个「⏻ 关闭服务」, 2026-10-23 移除。
+                         关闭服务**只在页面顶部有一个入口**(所有视图常驻)。
+                         这一排按钮是工人跑完一轮后顺势点下去的一串 —— 「重测失败项」
+                         「历史记录」「重新测试」都在这里, 而关服务是个不可逆动作,
+                         夹在中间极易误触(点完就退出服务, 页面当场失效)。 -->
                 </div>
             </section>
         </main>

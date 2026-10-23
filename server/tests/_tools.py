@@ -7,7 +7,111 @@ import os
 import shutil
 import signal
 import time
-from typing import List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
+
+
+# ── 带进度的子进程等待 ──
+
+async def run_proc_with_progress(
+    proc: asyncio.subprocess.Process,
+    duration_sec: float,
+    ctx=None,
+    on_tick: Optional[Callable[[float], Awaitable[None]]] = None,
+    tick_sec: float = 1.0,
+    hard_limit_sec: Optional[float] = None,
+) -> Tuple[int, str, bool]:
+    """按挂钟等子进程自然退出, 期间每 tick_sec 回调一次。返回 (rc, 输出, 是否被我们杀掉)。
+
+    **为什么不能用 `communicate()` 一把等到底** —— 那是一次阻塞到进程退出,
+    中间既不报进度也不查取消: 工人看着进度条不动, 点了「停止」也没反应,
+    要等到工具自己跑完。存储类测试动辄几分钟, 这个体验等于卡死。
+
+    **为什么不能靠 `readline()` 驱动循环** —— 只有 stdout 吐行时才会醒。
+    stress-ng 绝大部分时间不吐行, 于是进度条和温度采样跟着一起僵住
+    (CPU 项踩过这个坑: 进度条看上去不动, 其实 CPU 满载跑了三分钟)。
+
+    所以: stdout 用独立 task 抽干, 主循环只管计时和查取消。两边互不拖累。
+    """
+    lines: List[str] = []
+
+    async def drain():
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                lines.append(line.decode(errors="replace").rstrip())
+                if len(lines) > 400:          # 只留尾部, 免跑几小时把内存吃光
+                    del lines[:-400]
+        except Exception:
+            pass
+
+    drain_task = asyncio.create_task(drain())
+    wait_task = asyncio.create_task(proc.wait())
+
+    t0 = time.monotonic()
+    killed = False
+    while True:
+        done, _ = await asyncio.wait({wait_task}, timeout=tick_sec)
+        if done:
+            break
+        elapsed = time.monotonic() - t0
+
+        # 硬上限: 超了就我们自己杀 (正常情况下 with_sudo() 里的 `timeout`
+        # 会先到点, 走不到这里; 这道是给 `timeout` 自己都不在了的场合兜底)
+        if hard_limit_sec is not None and elapsed > hard_limit_sec:
+            killed = True
+            await kill_proc(proc, wait_sec=3.0, ctx=ctx)
+            break
+
+        if ctx is not None and await ctx.is_cancelled():
+            killed = True
+            await kill_proc(proc, wait_sec=3.0, ctx=ctx)
+            break
+
+        if on_tick:
+            await on_tick(elapsed)
+
+    # 收尾: 等 stdout 抽干, 但不无限等 —— 进程退了管道也该 EOF 了
+    try:
+        await asyncio.wait_for(drain_task, timeout=3.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        drain_task.cancel()
+    except Exception:
+        pass
+
+    rc = proc.returncode if proc.returncode is not None else -1
+    return rc, "\n".join(lines), killed
+
+
+def fio_runtime_args(duration_sec: float, size_mb: int) -> List[str]:
+    """让 fio **真的跑满** duration_sec —— 光给 --size 它跑完一遍就退了。
+
+    fio 默认按「把 --size 写/读一遍」结束, 不管花多久。eMMC/USB/TF 都很快,
+    一个 64-256MB 的文件几秒就完事 —— 于是 UI 上配的「时长」形同虚设,
+    工人看到的是「设了 60s 却十几秒就跑了」, 反而怀疑工具是不是有问题。
+
+    `--time_based` 把语义从「跑满 size」换成「跑满 runtime」, 此时 size 变成
+    工作集大小(反复覆写), 不再影响实际耗时。两个参数必须**一起**给 ——
+    只给 --runtime 而不加 --time_based 的话, fio 会无视 runtime 直接退出。
+    """
+    d = max(1, int(duration_sec))
+    return [
+        f"--runtime={d}",
+        f"--size={int(size_mb)}M",
+        "--time_based=1",
+    ]
+
+
+def fio_timeout_sec(duration_sec: float) -> int:
+    """fio 的挂钟兜底上限(秒)。
+
+    runtime 到点 fio 自己会退; 但坏块 / 驱动异常时它可能根本退不出来,
+    那种情况只能靠同为 root 的 `timeout` 到点杀 (我们是普通用户, 发不了
+    信号给 root 进程, 见 with_sudo 的说明)。留足余量, 别把正常跑完的
+    测试当成卡死杀掉 —— 那个误判会让一个好端端的盘被判 failed。
+    """
+    return max(30, int(duration_sec)) + 120
 
 
 # ── 进程超时管理 (避免 rc=-15 误判) ──

@@ -5,7 +5,9 @@ import time
 from typing import Optional
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable
+from ._tools import (
+    find_tool, with_sudo, sudo_hint_if_unavailable, run_proc_with_progress,
+)
 
 
 @register
@@ -13,6 +15,11 @@ class CPUTest(TestCase):
     name = "cpu"
     display_name = "CPU 压力"
     description = "使用 stress-ng 对所有 CPU 核心施加负载,监测温度和性能"
+
+    def expected_seconds(self, test_config: dict) -> Optional[float]:
+        times = max(1, int(test_config.get("times", 1)))
+        duration = max(5, int(test_config.get("duration_sec", 60)))
+        return times * duration
 
     async def run(self, ctx: TestContext) -> TestResult:
         result = TestResult()
@@ -70,26 +77,17 @@ class CPUTest(TestCase):
                 )
 
                 peak_temp = 0
-                lines_buf = []
-                while True:
-                    if await ctx.is_cancelled():
-                        # 不用裸 terminate/kill —— 子进程是 sudo 起的 root
-                        # 进程, 普通用户对它发信号必然 EPERM。见 kill_proc。
-                        await kill_proc(proc, wait_sec=3.0, ctx=ctx)
-                        result.status = "stopped"
-                        all_passed = False
-                        break
+                temp = None
 
-                    line = await proc.stdout.readline()
-                    if not line:
-                        break
-                    text = line.decode(errors="replace").rstrip()
-                    lines_buf.append(text)
-                    if len(lines_buf) > 200:
-                        lines_buf = lines_buf[-200:]
-                    await ctx.on_log(f"  {text}")
+                async def tick(e: float, i=i):
+                    """按挂钟驱动进度与温度采样 —— **不看 stress-ng 吐不吐行**。
 
-                    # 读温度
+                    原来这个循环靠 `readline()` 唤醒, 而 stress-ng 加上
+                    --metrics-brief 之后大部分时间**不吐行**: 于是进度条僵住、
+                    温度也停止采样, 工人看着像卡死, 实际 CPU 已经满载跑了一分钟。
+                    进度和温度必须由计时器驱动, 与 stdout 解耦。
+                    """
+                    nonlocal peak_temp, temp
                     temp = await _read_cpu_temp()
                     if temp is not None:
                         if temp > peak_temp:
@@ -97,18 +95,26 @@ class CPUTest(TestCase):
                         await ctx.on_metric("cpu_temp_c", temp)
                         if temp > max_temp:
                             await ctx.on_log(f"[CPU] ⚠️ 温度过高: {temp}°C > {max_temp}°C")
+                    pct = min(duration, e) / duration
+                    await ctx.on_progress(
+                        int((i + pct) / times * 100),
+                        f"运行中 {e:.0f}s / {duration}s, 温度 {temp if temp is not None else '?'}°C",
+                    )
 
-                    # 进度: 按时间比例
-                    elapsed = time.time() - t0
-                    pct = min(duration, elapsed) / duration
-                    overall = (i + pct) / times * 100
-                    await ctx.on_progress(int(overall), f"运行中 {elapsed:.0f}s / {duration}s, 温度 {temp or '?'}°C")
-
-                rc = await proc.wait() if proc.returncode is None else proc.returncode
+                rc, text, killed = await run_proc_with_progress(
+                    proc, duration, ctx=ctx, on_tick=tick,
+                    hard_limit_sec=duration + 30,
+                )
                 elapsed = time.time() - t0
-                result.log = "\n".join(lines_buf)
+                result.log = text
+                for line in text.splitlines():
+                    await ctx.on_log(f"  {line}")
 
-                if result.status == "stopped":
+                if killed or result.status == "stopped":
+                    # 不用裸 terminate/kill —— 子进程是 sudo 起的 root 进程,
+                    # 普通用户对它发信号必然 EPERM。见 kill_proc。
+                    result.status = "stopped"
+                    all_passed = False
                     break
 
                 if rc != 0:

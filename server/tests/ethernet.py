@@ -409,3 +409,16 @@ class EthTest(TestCase):
             await ctx.on_log(f"[网口] ❌ {result.error}")
         await ctx.on_progress(100, "完成")
         return result
+
+    def operator_prompt(self, result: TestResult):
+        """链路 DOWN → 停下来等工人插网线 (§7.8)。
+
+        **只对 unplugged 停**。另外两个 skipped_reason 不停:
+          · no_ip     —— 工位没 DHCP, 插一百根网线也没用, 停下来只是白等
+          · no_egress —— 上游网络坏了, 那是工位的问题, 应该直接跳过往下走
+        只有 unplugged 是「把网线插上就能继续」的物理动作, 值得等工人。
+        """
+        m = result.metrics or {}
+        if result.status == "skipped" and m.get("skipped_reason") == "unplugged":
+            return {"text": "未插网线。请插上网线后选「已插好重测」, 或选「跳过」。"}
+        return None

@@ -1,12 +1,34 @@
 """GPU 渲染压测 - OpenGL ES 2 全屏渲染 (§6.3)
 
-工具: glmark2-es2 --fullscreen (走 Wayland 全屏输出, 不需 X11)
+工具: glmark2 变体 --fullscreen —— **按当前图形会话自动选**(见下)
 
 设计要点 (严格按 §6.3):
   - **前置条件缺任一 → 本项 error 并明确报错, 不做静默降级**
     ① HDMI 显示器已连接  /sys/class/drm/*HDMI*/status == connected
-    ② Wayland 会话已启动  WAYLAND_DISPLAY 非空 + compositor 进程在
+    ② 图形会话可用       按所选变体: Wayland 要 WAYLAND_DISPLAY, X11 要 DISPLAY
     ③ DRM 节点存在        /dev/dri/card* + /dev/dri/renderD*
+
+## ⚠️ 为什么改成了「按会话自动选变体」
+
+glmark2 有多个变体, **各要不同的图形会话**:
+
+| 变体 | 提供包 | 需要的会话 | 库依赖 |
+|---|---|---|---|
+| `glmark2-es2-wayland` | `glmark2-es2-wayland` | `WAYLAND_DISPLAY` | libwayland-* |
+| `glmark2-es2` | `glmark2-es2` | `DISPLAY` | **libX11** |
+
+2026-10-22 实测发现的矛盾: §6.3 原文写「工具用 `glmark2-es2`」**同时**要求
+「必须有 Wayland 会话」—— 但这两个是**互相排斥**的: `glmark2-es2` 是 X11 变体,
+根本不用 Wayland。本机 `XDG_SESSION_TYPE=x11`、无 Wayland, 于是 GPU 项在
+GPU 完全正常的板子上(run 41 / run 48)被自己的前置条件挡死, 一轮都没跑。
+
+另有一处文档错误: 原文称 `glmark2-es2-wayland` 包「提供 `glmark2-es2` 可执行」——
+**不对**, 该包提供的是 `/usr/bin/glmark2-es2-wayland`, 另一个文件
+(md5 不同)。实测本机 `/usr/bin/glmark2-es2` 时间戳 2026-10-16、不属于任何
+dpkg 包, 是手工放进去的, 重刷镜像即丢。
+
+故改为: **探测实际会话 → 选对应变体 → 前置条件跟着该变体的真实需求走**。
+开发板与产线机器会话类型不一致也不会挂。可用 `gpu.variant` 强制指定。
     产线常态接 HDMI, 因此不进入"未接显示器 → skipped"分支; 第 ① 条不满足
     属工位配置问题, 报 error 而非 skipped, 否则等于 GPU 静默漏测。
   - **通过判定** —— 每轮都完整跑完: exit code == 0 且输出以 `glmark2 Score: <数字>` 收尾
@@ -39,6 +61,54 @@ _HEARTBEAT_SEC = 1.5
 
 # 前置检查通过率 (进度条起点)
 _PRECHECK_DONE_PCT = 5
+
+# ── glmark2 变体表 ────────────────────────────────────────────────
+# 变体名: (二进制名, 该变体依赖的会话环境变量, 该变量的中文名)
+# 理由见模块顶部「为什么改成了按会话自动选变体」
+_VARIANTS = {
+    "wayland": ("glmark2-es2-wayland", "WAYLAND_DISPLAY", "Wayland 会话"),
+    "x11":     ("glmark2-es2",         "DISPLAY",         "X11 会话"),
+}
+
+
+def _pick_variant(pref: str = "auto") -> Tuple[Optional[str], Optional[str], str]:
+    """按当前图形会话选 glmark2 变体。
+
+    返回 (变体名, 二进制绝对路径 or None, 选它的理由)。变体名为 None 表示
+    连二进制都没找到。
+
+    auto 的判据: **谁的会话环境变量在, 且对应二进制装了, 就用谁**; 两个会话
+    都在时优先 wayland(§6.3 的原始设计意图)。会话变量一个都没有时, 退而按
+    「装了哪个二进制」选 —— 这样前置条件能报出具体缺什么, 而不是笼统地说
+    「未找到工具」。
+    """
+    pref = (pref or "auto").strip().lower()
+    if pref not in ("auto", "wayland", "x11"):
+        pref = "auto"
+
+    if pref != "auto":
+        binname, envvar, label = _VARIANTS[pref]
+        path = find_tool(binname)
+        reason = f"配置 gpu.variant={pref} 强制指定"
+        if path:
+            reason += f", 按 {label} ({envvar}) 检查前置"
+        return pref, path, reason
+
+    for name, (binname, envvar, label) in _VARIANTS.items():
+        val = os.environ.get(envvar, "").strip()
+        path = find_tool(binname)
+        if val and path:
+            return name, path, f"{label}在 ({envvar}={val})"
+
+    for name, (binname, _envvar, label) in _VARIANTS.items():
+        path = find_tool(binname)
+        if path:
+            return name, path, (
+                f"未检测到任何图形会话变量, 按已装的 {binname} 选 {label} —— "
+                f"前置条件会指出具体缺哪个"
+            )
+
+    return None, None, "glmark2-es2 与 glmark2-es2-wayland 都没找到"
 
 
 def _precheck_display() -> Tuple[bool, str]:
@@ -138,12 +208,58 @@ def _score_drift(detail: List[dict]) -> Optional[str]:
     )
 
 
-# (metric key, 中文名, 检查函数) —— 顺序即报错时的展示顺序
-_PRECHECKS = (
-    ("precheck_display", "HDMI 显示器", _precheck_display),
-    ("precheck_wayland", "Wayland 会话", _precheck_wayland),
-    ("precheck_dri", "DRM 节点", _precheck_dri),
-)
+def _precheck_x11() -> Tuple[bool, str]:
+    """前置 ② (x11 变体): X11 会话可用。
+
+    对应 `glmark2-es2` —— 该二进制 `ldd` 出来链的是 libX11, 不用 Wayland。
+    DISPLAY 形如 `:0.0` / `localhost:1.0`, 取显示号拼 socket 路径。
+    """
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display:
+        return False, (
+            "DISPLAY 为空 —— 没有 X11 会话, glmark2-es2 拿不到 GL 上下文。"
+            "若这台机器跑的是 Wayland 会话, 应改用 glmark2-es2-wayland"
+            "(在 config.yaml 设 gpu.variant: wayland)"
+        )
+
+    disp_no = display.split(":", 1)[1].split(".", 1)[0] if ":" in display else "0"
+    sock = f"/tmp/.X11-unix/X{disp_no}"
+    detail = f"X11 会话在: DISPLAY={display}"
+    if os.path.exists(sock):
+        detail += f" (socket {sock})"
+
+    xauth = os.environ.get("XAUTHORITY", "").strip()
+    if not xauth:
+        # 没设不一定坏 —— X server 未开访问控制时不需要 cookie
+        return True, detail + ", ⚠ XAUTHORITY 未设置(X server 若开访问控制会认证失败)"
+    if not os.path.exists(xauth):
+        return False, (
+            f"DISPLAY={display} 但 XAUTHORITY={xauth} 不存在 —— 提权后的进程"
+            f"认证不过 X server, glmark2 会连不上。确认服务启动用户对该文件有读权限。"
+        )
+    return True, detail + f", XAUTHORITY={xauth}"
+
+
+def _precheck_session(variant: str) -> Tuple[bool, str]:
+    """前置 ②: 所选变体所需的图形会话可用。"""
+    if variant == "x11":
+        return _precheck_x11()
+    return _precheck_wayland()
+
+
+def _build_prechecks(variant: str) -> Tuple[Tuple[str, str, object], ...]:
+    """按所选变体组装前置检查表 —— 顺序即报错时的展示顺序。
+
+    ② 的标签和检查函数都跟着变体走: wayland 查 `WAYLAND_DISPLAY`,
+    x11 查 `DISPLAY`。metric key 统一叫 `precheck_session`。
+    """
+    _binname, envvar, label = _VARIANTS[variant]
+    return (
+        ("precheck_display", "HDMI 显示器", _precheck_display),
+        ("precheck_session", f"{label} ({envvar})",
+         lambda: _precheck_session(variant)),
+        ("precheck_dri", "DRM 节点", _precheck_dri),
+    )
 
 
 @register
@@ -212,16 +328,24 @@ class GPUTest(TestCase):
         timeout_sec = int(t_cfg.get("timeout_sec", _DEFAULT_TIMEOUT_SEC))
         rounds = max(1, int(t_cfg.get("rounds", 1)))   # §6.3: 默认 1 轮 = 原单轮行为
 
-        # ── 工具查找 (§11.1: 禁 which, 用 find_tool) ──
-        glmark_bin = find_tool("glmark2-es2")
+        # ── 变体选择 (§11.1: 禁 which, 用 find_tool) ──
+        gpu_cfg = ctx.config.get("gpu", {}) or {}
+        variant, glmark_bin, why = _pick_variant(
+            t_cfg.get("variant", gpu_cfg.get("variant", "auto"))
+        )
         if not glmark_bin:
             result.status = "error"
             result.error = (
-                "未找到 glmark2-es2. 解决: sudo apt install glmark2-es2-wayland "
-                "(Wayland 后端必备; 见 docs/需求设计.md §11.7)"
+                f"未找到 glmark2 (原因: {why}). 解决: "
+                "sudo apt install glmark2-es2 glmark2-es2-wayland "
+                "(两个变体都装上, 由本测试按当前会话自动选; "
+                "见 docs/需求设计.md §11.7)"
             )
             await ctx.on_log(f"[GPU] ✗ {result.error}")
             return result
+        result.metrics["glmark_variant"] = variant
+        result.metrics["glmark_bin"] = glmark_bin
+        await ctx.on_log(f"[GPU] 变体: {variant} —— {why}")
         await ctx.on_log(f"[GPU] 工具: {glmark_bin}")
 
         if not sudo_hint_if_unavailable(result, "GPU 渲染"):
@@ -231,7 +355,7 @@ class GPUTest(TestCase):
         # ── 前置检查 (§6.3: 缺任一 → error, 不静默降级) ──
         await ctx.on_log("[GPU] 前置检查...")
         failed: List[str] = []
-        for key, label, checker in _PRECHECKS:
+        for key, label, checker in _build_prechecks(variant):
             ok, detail = checker()
             result.metrics[key] = ok
             await ctx.on_log(f"[GPU]   {'✓' if ok else '✗'} {label}: {detail}")

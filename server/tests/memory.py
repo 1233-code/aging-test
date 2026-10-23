@@ -3,6 +3,7 @@ import asyncio
 import os
 import time
 import re
+from typing import Optional
 
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import find_tool, run_cmd, is_root, run_proc_with_wallclock, with_sudo, kill_proc, sudo_hint_if_unavailable
@@ -14,12 +15,32 @@ class MemoryTest(TestCase):
     display_name = "内存"
     description = "使用 memtester 进行内存读写校验"
 
+    def expected_seconds(self, test_config: dict) -> Optional[float]:
+        """内存这一项**故意返回 None** —— 不在界面上显示计时条 (§7.5)。
+
+        memtester 是「跑完 N 遍就自己退出」的, 实际耗时 = 遍数 × 工作集 ÷ 机器
+        内存带宽, **事先算不出来** (换一块内存带宽不同的板子, 差几倍都可能)。
+        以前这里照着 `duration_sec` 报一个固定秒数, 结果界面写着「预计 60s ·
+        剩余 48s」, 它 20 秒就跑完了 —— 这正是 §7.5 说的「宁可不给, 也不能给
+        一个编出来的数字」。
+
+        `timeout_sec` 是**超时上限**, 不是目标时长: memtester 自己先跑完就
+        退出, 根本轮不到它超时。所以它不是「本项要跑多久」, 不该显示给工人。
+
+        工人在界面上看的是 memtester **自己吐出来的进度**(各项测试的百分比),
+        那是真实进度; 跑完也有 `elapsed_sec` 入库。
+        """
+        return None
+
     async def run(self, ctx: TestContext) -> TestResult:
         result = TestResult()
         t_cfg = ctx.test_config
         times = max(1, int(t_cfg.get("times", 1)))
         size_mb = max(64, int(t_cfg.get("size_mb", 1024)))
-        duration = max(10, int(t_cfg.get("duration_sec", 60)))
+        # ⚠️ 这是**超时上限**, 不是本项的目标时长 —— memtester 跑完就退出。
+        # 配置里刻意用 `timeout_sec` 而不是 `duration_sec`: 后者会被 §7.2
+        # 当成「时长」渲染成输入框, 让工人以为它能控制跑多久。
+        timeout_sec = max(10, int(t_cfg.get("timeout_sec", 60)))
 
         # 预检工具
         tool = find_tool("memtester")
@@ -54,7 +75,7 @@ class MemoryTest(TestCase):
             # (os.kill 对 root 进程必然 EPERM)。所以挂钟收尾交给 root 领地内部的
             # `timeout`: 它和 memtester 同为 root, 到点自己杀自己的子进程,
             # 服务全程一个信号都不用发。见 _tools.with_sudo 的「为什么要 timeout」。
-            cmd = with_sudo([tool, f"{size_mb}M", "1"], timeout_sec=duration)
+            cmd = with_sudo([tool, f"{size_mb}M", "1"], timeout_sec=timeout_sec)
             await ctx.on_log(f"[内存] 执行: {' '.join(cmd)}")
 
             t0 = time.time()
@@ -63,7 +84,7 @@ class MemoryTest(TestCase):
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
                 )
 
-                # memtester 没有自己的 --timeout, 由上面的 `timeout <duration>` 兜底。
+                # memtester 没有自己的 --timeout, 由上面的 `timeout <timeout_sec>` 兜底。
                 # 这个 readline 循环只负责**读输出**, 退出以读到 EOF 为准。
                 lines_buf = []
                 hit_wallclock = False
@@ -72,7 +93,7 @@ class MemoryTest(TestCase):
                         if not await kill_proc(proc, ctx=ctx):
                             await ctx.on_log(
                                 f"[内存] 子进程 {proc.pid} 仍在跑 —— 已交由 `timeout` "
-                                f"在 {duration}s 处收尾, 本次不等它"
+                                f"在 {timeout_sec}s 处收尾, 本次不等它"
                             )
                         result.status = "stopped"
                         all_passed = False
@@ -83,9 +104,9 @@ class MemoryTest(TestCase):
                     except asyncio.TimeoutError:
                         # 只提示一次, **既不 break 也不 terminate** —— `timeout` 才是
                         # 挂钟的唯一权威, 它收尾后进程退出, 这里自然读到 EOF。
-                        if not hit_wallclock and time.time() - t0 > duration * 0.95:
+                        if not hit_wallclock and time.time() - t0 > timeout_sec * 0.95:
                             hit_wallclock = True
-                            await ctx.on_log(f"[内存] ⏰ 挂钟 {duration}s 快到 —— 由 `timeout` 收尾")
+                            await ctx.on_log(f"[内存] ⏰ 挂钟 {timeout_sec}s 快到 —— 由 `timeout` 收尾")
                         continue
 
                     if not line:
@@ -125,7 +146,7 @@ class MemoryTest(TestCase):
                     # `timeout` 到点收尾时退出码是 124 (GNU coreutils 约定),
                     # 说明挂钟跑满了, 是**预期**行为, 不算 fail。
                     timed_out = (rc == 124)
-                    ran_full = timed_out or elapsed >= duration * 0.9
+                    ran_full = timed_out or elapsed >= timeout_sec * 0.9
                     if ran_full:
                         why = "`timeout` 到点收尾" if timed_out else "挂钟已跑满"
                         await ctx.on_log(f"[内存] 跑满挂钟 {elapsed:.0f}s ({why}, rc={rc})")
