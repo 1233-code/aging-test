@@ -21,8 +21,24 @@ createApp({
         const logEl = ref(null);
         const history = ref([]);
         const historyDetail = ref(null);
+        // §8.2 PDF 重导状态。导出是异步的, 没有这两个 ref 就只能给个
+        // 「点了没反应」的黑洞按钮 —— 工人不知道是没点上还是正在跑。
+        const exportingId = ref(null);
+        const exportError = ref('');
+        // 本轮收尾导出的结果。run_finished 之后才到, 所以单列一组状态,
+        // 不跟 isRunning / lastStatus 混用 —— 混用会让人以为报告导出不过
+        // 就是测试没过。
+        const reportPath = ref('');
+        const reportError = ref('');
+        // ⚠️ **不能用 `runId` 拼下载链接** —— `runId` 在 mini-run(重测失败项)
+        // 时是**故意指向父轮**的(见 run_started 处理), 而刚导出的 PDF 属于
+        // mini-run 自己那一份。不另记一份 id 的话, 重测完点「打开 PDF 报告」
+        // 会下到父轮(更早那轮)的报告 —— 一份内容对不上的纸质件进了归档。
+        const reportRunId = ref(null);
         const runId = ref(null);
         const depsInfo = ref(null);  // /api/deps/check 结果
+        // §2.2 被测设备 SN, 由 /api/config 一起下发; 取不到是 'unknown'
+        const sn = ref('');
 
         // 向导专用
         const currentTestIndex = ref(0);
@@ -40,6 +56,23 @@ createApp({
         const hasAnyEnabled = computed(() =>
             Object.values(tests).some(t => t.enabled)
         );
+
+        // ── SN 展示 (§7.2) ──
+        // **整串原样显示, 不截断。** 原来截成前 8 位 + 省略号, 靠 title 悬停
+        // 才看得到全串 —— 那是产线反馈「往左边挪一点, 看清全貌」后改的: SN 是
+        // 工人要**照着念**去核对机器的编号, 藏在悬停提示里的那一半没有任何用处。
+        // 挪到标题旁边单独占一段就放得下了(见 index.html 的 .header-left)。
+        // 真遇上超长 SN(某些板子塞了完整序列号) 由 CSS 的 ellipsis 兜底, 不在
+        // 这里按长度截 —— JS 截断是无声的, 截到第几位没人说得清。
+        const snUnknown = computed(() => !sn.value || sn.value === 'unknown');
+        const snDisplay = computed(() => snUnknown.value ? 'unknown' : sn.value);
+        const snTitle = computed(() => {
+            if (snUnknown.value) {
+                return '未能从 /proc/cmdline 读到设备 SN —— 本轮报告将记为 unknown, '
+                     + '出货前请人工核对设备';
+            }
+            return `被测设备 SN: ${sn.value}`;
+        });
 
         const failedItemNames = computed(() =>
             resultList.value
@@ -124,6 +157,7 @@ createApp({
             const r = await fetch('/api/config');
             const data = await r.json();
             config.value = data;
+            sn.value = data.sn || 'unknown';
             testList.value = data.tests;
             testOrder.value = data.recommended_order && data.recommended_order.length
                 ? [...data.recommended_order]
@@ -450,6 +484,40 @@ createApp({
             historyDetail.value = await r.json();
         };
 
+        // §8.2 手动重导 PDF。**只在这一轮上补导**, 不重跑测试 —— 自动导出失败
+        // (缺 chromium / 字体装晚了 / 当时磁盘满) 时, 工人装完依赖就能补上,
+        // 不用把整轮老化重新来一遍。
+        const exportPdf = async (id) => {
+            if (exportingId.value !== null) return;      // 别让连点排出 N 个 chromium
+            exportingId.value = id;
+            exportError.value = '';
+            try {
+                const r = await fetch(`/api/history/${id}/pdf`, { method: 'POST' });
+                const body = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                    // 后端 500 的 detail 里带着"PDF 里没有中文字形"这类真正有用的
+                    // 原因, 原样透出来 —— 换成一句笼统的"导出失败"等于把刚查了
+                    // 半天的诊断信息又丢了。
+                    exportError.value = body.detail || `导出失败 (HTTP ${r.status})`;
+                    return;
+                }
+                // 汇总页那个按钮是靠 reportPath 决定显示「打开 PDF 报告」还是
+                // 「导出 PDF 报告」的。不在这里回填, 手动补导成功了按钮还是老样子
+                // —— 工人点了没反应, 只能靠猜。id 对不上(在历史页给别的轮次补导)
+                // 就别动汇总页的状态。
+                if (id === runId.value || id === reportRunId.value) {
+                    reportPath.value = body.path || '';
+                    reportRunId.value = id;
+                }
+                await loadHistoryDetail(id);
+                await loadHistory();
+            } catch (e) {
+                exportError.value = `导出请求没发出去: ${e.message}`;
+            } finally {
+                exportingId.value = null;
+            }
+        };
+
         // ========== WebSocket ==========
         const connectWS = () => {
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -496,6 +564,13 @@ createApp({
                     runId.value = msg.mode === 'mini' && msg.parent_run_id
                         ? msg.parent_run_id
                         : msg.run_id;
+                    // ⚠️ **每开一轮必须清掉上一轮的报告状态** —— 漏清的话,
+                    // 连着跑两轮时, 第二轮的汇总页会挂着第一轮的
+                    // 「打开 PDF 报告」按钮, 而那按钮下的是上一轮的报告。
+                    // 导出是收尾才做的, 新一轮刚开始必然还没有报告。
+                    reportPath.value = '';
+                    reportRunId.value = null;
+                    reportError.value = '';
                     break;
                 case 'test_started': {
                     // **画面只由这一条事件推动。**
@@ -623,6 +698,27 @@ createApp({
                     window._retesting = false;
                     break;
                 }
+                // §8.2 收尾导出。run_finished 之后**还会**来这两个事件之一 ——
+                // 导出是 finish_run 之后才做的, 慢一拍。所以 UI 不能在 run_finished
+                // 就把报告状态定死, 得留着口子等它。
+                case 'report_ready': {
+                    reportPath.value = msg.path;
+                    // 记**这份 PDF 自己的** run id, 不是 runId.value ——
+                    // mini-run 时后者指向父轮(见上面 reportRunId 的注释)。
+                    reportRunId.value = msg.run_id ?? runId.value;
+                    reportError.value = '';
+                    break;
+                }
+                case 'report_failed': {
+                    reportPath.value = '';
+                    reportRunId.value = null;
+                    // ⚠️ **绝不改成"本轮测试失败"** —— §8.2 硬规则。测试结果早
+                    // 就写完库了, 这里只是附加产物没导出来。汇总页照常显示通过/
+                    // 失败数, 按钮排里那个按钮保持「导出 PDF 报告」, 底下补一条
+                    // 说明原因 —— 让工人知道是没生成, 而不是设备不合格。
+                    reportError.value = msg.reason || '未知原因';
+                    break;
+                }
             }
         };
 
@@ -661,9 +757,11 @@ createApp({
             view, config, testList, tests, testOrder,
             isRunning, resultList, logs, logEl,
             history, historyDetail, runId,
+            exportingId, exportError, reportPath, reportError, reportRunId,
             tfPrompt, ethPrompt, currentTestIndex, lastStatus,
             depsInfo, shuttingDown,
             // computed
+            snUnknown, snDisplay, snTitle,
             hasAnyEnabled, hasFailedItems, failedCount,
             passedCount, errorCount, skippedCount,
             currentTest, previousTest, overallProgress,
@@ -674,7 +772,7 @@ createApp({
             goConfig, goHistory, retestFailed,
             tfInserted, tfSkip, ethPlugged, ethSkip,
             dragStart, dragOver, dropAt, resetOrder,
-            loadConfig, loadDeps, loadHistory, loadHistoryDetail,
+            loadConfig, loadDeps, loadHistory, loadHistoryDetail, exportPdf,
         };
     }
 }).mount('#app');

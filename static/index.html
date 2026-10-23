@@ -10,7 +10,22 @@
 <body>
     <div id="app">
         <header>
-            <h1>🏭 工厂老化测试工具</h1>
+            <!-- SN 放在标题右边、按钮组左边 (三段式布局)。放 .header-right 里
+                 是因为想「跟按钮排在一起」, 结果它跟「历史记录/关闭服务」抢
+                 横向空间, 只能截断成 31175c3d… —— 而 SN 是工人要**照着念**
+                 的编号, 截断的那一段正是最容易念错的地方。挪出来单独占一段,
+                 整串 18 位一眼看全。 -->
+            <div class="header-left">
+                <h1>🏭 工厂老化测试工具</h1>
+                <!-- §2.2 / §7.2: SN 常驻顶部。读不到时显示 unknown 并转黄, 提醒
+                     工人核对设备 —— 这一轮的报告里会记 unknown, 事后追不回来。 -->
+                <span
+                    v-if="config"
+                    class="sn-tag"
+                    :class="{ 'sn-unknown': snUnknown }"
+                    :title="snTitle"
+                >SN: {{ snDisplay }}</span>
+            </div>
             <div class="header-right">
                 <span class="device-tag" v-if="config">设备配置: {{ Object.keys(config.interfaces || {}).length }} 接口</span>
                 <button class="btn-text" v-if="view === 'main'" @click="goHistory">历史记录</button>
@@ -216,12 +231,42 @@
                         @click="retestFailed"
                         :disabled="isRunning"
                     >🔂 重测失败项 ({{ failedCount }})</button>
+
+                    <!-- §8.2 报告入口。跟「重新测试」「历史记录」并排放在**同一排**
+                         —— 工人跑完一轮后顺势点下去的就是这一排, 报告也在这里,
+                         不用另找一个位置。没有报告就摆「导出 PDF 报告」按钮, 而不是
+                         摆一条只有文字的提示: 提示看得见但点不动, 而这一轮缺的正是
+                         那份能拿去归档的东西。 -->
+                    <a
+                        v-if="reportPath"
+                        class="btn-secondary"
+                        :href="'/api/history/' + reportRunId + '/pdf'"
+                        target="_blank"
+                        rel="noopener"
+                    >📄 打开 PDF 报告</a>
+                    <button
+                        v-else
+                        class="btn-secondary"
+                        @click="exportPdf(reportRunId || runId)"
+                        :disabled="exportingId !== null"
+                    >{{ exportingId !== null ? '导出中…' : '📄 导出 PDF 报告' }}</button>
+
                     <button class="btn-secondary" @click="goHistory">📋 历史记录</button>
                     <!-- 这里原来还有一个「⏻ 关闭服务」, 2026-10-23 移除。
                          关闭服务**只在页面顶部有一个入口**(所有视图常驻)。
                          这一排按钮是工人跑完一轮后顺势点下去的一串 —— 「重测失败项」
                          「历史记录」「重新测试」都在这里, 而关服务是个不可逆动作,
                          夹在中间极易误触(点完就退出服务, 页面当场失效)。 -->
+                </div>
+
+                <!-- 导出失败的原因紧贴在按钮排**下面** —— 它解释的正是上面那个
+                     按钮为什么还没变成「打开 PDF 报告」。隔远了就成了两块不相干的
+                     信息。用橙条不用红条: §8.2 规定导出失败不阻断测试判定,
+                     红色会被工人当成「设备不合格」。 -->
+                <div v-if="reportError" class="report-inline-note">
+                    ⚠️ PDF 报告没导出成 —— <b>测试结果已正常保存, 本轮判定不受影响</b>。
+                    原因: <span class="report-reason">{{ reportError }}</span>
+                    <span class="report-note">处理完后点上面那个「导出 PDF 报告」补上即可, 不用重跑整轮老化。</span>
                 </div>
             </section>
         </main>
@@ -234,27 +279,66 @@
                     <thead>
                         <tr>
                             <th>#</th>
+                            <th>SN</th>
                             <th>开始时间</th>
                             <th>耗时</th>
                             <th>状态</th>
                             <th>通过/失败</th>
+                            <th>PDF</th>
                         </tr>
                     </thead>
                     <tbody>
                         <tr v-for="h in history" :key="h.id" @click="loadHistoryDetail(h.id)">
                             <td>{{ h.id }}</td>
+                            <td :class="['sn-cell', { 'sn-unknown': !h.sn }]"
+                                :title="h.sn || '这一轮没记到 SN —— 归档前请人工核对设备'">
+                                {{ h.sn || 'unknown' }}
+                            </td>
                             <td>{{ formatTime(h.started_at) }}</td>
                             <td>{{ formatDuration(h.started_at, h.finished_at) }}</td>
                             <td :class="'status-' + h.status">{{ statusText(h.status) }}</td>
                             <td v-if="h.summary">{{ h.summary.passed }} / {{ h.summary.total }}</td>
                             <td v-else>-</td>
+                            <!-- 导出状态只用一个记号表示, 不做成整列按钮: 这一列
+                                 唯一的动作是「看/重导」, 逐行放按钮会让人误以为
+                                 每行都要点什么。详情页里才是操作区。 -->
+                            <td :title="h.pdf_path ? '已生成 PDF 报告' : '尚未生成 PDF 报告'">
+                                {{ h.pdf_path ? '📄' : '—' }}
+                            </td>
                         </tr>
                     </tbody>
                 </table>
                 <p v-else class="empty">暂无历史记录</p>
 
                 <div v-if="historyDetail" class="history-detail">
-                    <h3>报告 #{{ historyDetail.id }}</h3>
+                    <h3>
+                        报告 #{{ historyDetail.id }}
+                        <span v-if="historyDetail.sn" class="sn-tag">{{ historyDetail.sn }}</span>
+                        <span v-else class="sn-tag sn-unknown"
+                              title="未能从 /proc/cmdline 读到设备 SN, 归档前请人工核对">
+                            SN unknown
+                        </span>
+                    </h3>
+
+                    <!-- §8.2 PDF 操作区。pdf_path 空 = 这一轮没导出过(自动导出
+                         失败, 或这轮是老库记录), 给「重新导出」而不是给一个
+                         点了没反应的下载链接。 -->
+                    <div class="pdf-actions">
+                        <template v-if="historyDetail.pdf_path">
+                            <a class="btn-secondary" :href="'/api/history/' + historyDetail.id + '/pdf'"
+                               target="_blank" rel="noopener">📄 打开 PDF</a>
+                            <span class="pdf-note">已导出</span>
+                        </template>
+                        <template v-else>
+                            <button class="btn-secondary" @click="exportPdf(historyDetail.id)"
+                                    :disabled="exportingId === historyDetail.id">
+                                {{ exportingId === historyDetail.id ? '导出中…' : '📄 导出 PDF' }}
+                            </button>
+                            <span class="pdf-note">这一轮还没有 PDF 报告</span>
+                        </template>
+                    </div>
+                    <div class="pdf-error" v-if="exportError">{{ exportError }}</div>
+
                     <div class="results-list">
                         <div class="result-item" v-for="r in historyDetail.results" :key="r.test_name" :class="r.status">
                             <div class="result-head">

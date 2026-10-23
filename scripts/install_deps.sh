@@ -80,6 +80,12 @@ CRITICAL_PKGS=(
     "x11-xserver-utils"
     "libgpiod-tools"
     "libgpiod2-tools"
+    # §8.2 PDF 报告导出。**两个都是硬依赖**: chromium 走 --headless
+    # --print-to-pdf 出报告(§11.7 已从"任一浏览器"收紧为 chromium 必装);
+    # 字体是 PDF 里中文能不能显示出来的前提 —— 缺了不会报错, 只会静默导出一份
+    # 全空白的中文报告(详见 docs §8.2.1)。
+    "chromium-browser"
+    "fonts-wqy-zenhei"
 )
 
 # 基础包
@@ -97,6 +103,8 @@ OPTIONAL_PKGS=(
     "network-manager"
 )
 
+# 用途说明。装的时候一并打出来 —— 只看到一串包名, 产线对着「这个包干什么」
+# 猜不出是哪条测试项的依赖, 出问题也没法判断该不该装。
 declare -A CATEGORY=(
     [stress-ng]="CPU 压力"
     [glmark2-es2]="GPU 渲染 (X11 变体, 需 DISPLAY)"
@@ -111,21 +119,34 @@ declare -A CATEGORY=(
     [x11-xserver-utils]="HDMI 读当前实际输出 (xrandr)"
     [libgpiod-tools]="GPIO 工具 v1 (gpioget, gpioinfo)"
     [libgpiod2-tools]="GPIO 工具 v2 (Ubuntu 20.04 universe)"
+    [chromium-browser]="PDF 报告导出 + UI 打开 (§4.4 / §8.2)"
+    [fonts-wqy-zenhei]="中文报告字体 (PDF 用; 缺了报告全是空白)"
 )
+
+# 「这个包装了没有」要问 dpkg, **不能问 command -v** ——
+# 包名和可执行文件名常常不是一回事:
+#   fonts-wqy-zenhei / libgpiod-tools / x11-xserver-utils / iputils-ping
+#   这四个都**没有**同名可执行文件(命令分别叫 fc-match / gpioget / xrandr / ping),
+#   用 command -v 判断会把「早装好了」误报成「没装」, 于是每次都重跑一遍 apt。
+#   误报的只是那一行 "[已装]" 和一点时间, 不至于装错 —— 但它会让人以为
+#   「检测不准」, 下次就不信这个脚本的输出了。
+pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
+}
 
 # 装关键包 - 真正检查 apt 返回码
 echo ""
 echo "── 装关键包 ──"
 FAIL_CRIT=()
 for pkg in "${CRITICAL_PKGS[@]}"; do
-    if command -v "${pkg%%:*}" > /dev/null 2>&1; then
-        echo "  ✓ $pkg [已装]"
+    if pkg_installed "$pkg"; then
+        echo "  ✓ $pkg [已装] ${CATEGORY[$pkg]:-}"
         continue
     fi
     if apt-get install -y "$pkg" > /tmp/apt-install.log 2>&1; then
-        echo "  ✓ $pkg"
+        echo "  ✓ $pkg ${CATEGORY[$pkg]:-}"
     else
-        echo "  ✗ $pkg 装失败"
+        echo "  ✗ $pkg 装失败 ${CATEGORY[$pkg]:-}"
         tail -2 /tmp/apt-install.log | sed 's/^/      /'
         FAIL_CRIT+=("$pkg")
     fi
@@ -135,7 +156,7 @@ done
 echo ""
 echo "── 装基础包 ──"
 for pkg in "${COMMON_PKGS[@]}"; do
-    if command -v "${pkg%%:*}" > /dev/null 2>&1; then
+    if pkg_installed "$pkg"; then
         echo "  ✓ $pkg [已装]"
         continue
     fi

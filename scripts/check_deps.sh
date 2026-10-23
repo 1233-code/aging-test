@@ -30,6 +30,7 @@ declare -A CRITICAL=(
     ["lsusb"]="USB 枚举 (usbutils)"
     ["lsblk"]="块设备枚举 (util-linux)"
     ["xrandr"]="HDMI 读当前实际输出 (x11-xserver-utils)"
+    ["chromium-browser"]="PDF 报告导出 + UI 打开 (§4.4 / §8.2)"
 )
 
 # ───────────────────────── ② 包类·备份路径 ─────────────────────────
@@ -146,6 +147,31 @@ if [ -r "$LIFE_TIME" ]; then
     sc_warn "eMMC 健康节点 life_time" ok
 else
     sc_warn "eMMC 健康节点 life_time" err "不存在, eMMC 项的寿命检查判 error (§6.11)"
+fi
+
+# ⚠️ CJK 字体 —— §8.2.1。**查的是「字体真有这个字形」, 不是「装没装中文字体包」**
+#
+# 为什么必须查: 本板 `fc-match sans-serif` 解析到 **DejaVu Sans**, 它**一个
+# CJK 字形都没有**。浏览器渲染时不会报错、不会换字体, 只会把这些字画成空白,
+# 然后**照样 rc=0 输出一份合法的 PDF** —— 产线会把一份全空白的中文报告当合格
+# 品归档。用 `:charset=5de5`(工) 让 fontconfig 回答「哪个字体真的有这个字」。
+CJK_FONT="$(fc-list ':charset=5de5' family 2>/dev/null | head -1 | cut -d, -f1)"
+if [ -n "$CJK_FONT" ]; then
+    sc_block "有含中文字形的字体" ok
+    printf "      字体 = %s\n" "$CJK_FONT"
+else
+    sc_block "有含中文字形的字体" err "没有任何字体含 U+5DE5(工); PDF 报告会静默变成空白 (§8.2.1)。装: sudo apt install fonts-wqy-zenhei"
+fi
+
+# chromium headless 真能跑 —— 光看命令在不在不够
+if command -v chromium-browser > /dev/null 2>&1; then
+    if timeout 30 chromium-browser --headless --disable-gpu --version > /dev/null 2>&1; then
+        sc_block "chromium headless 可用" ok
+    else
+        sc_block "chromium headless 可用" err "命令在但 --headless 起不来 (§8.2 PDF 导出会失败)"
+    fi
+else
+    sc_block "chromium headless 可用" err "未找到 chromium-browser (§8.2 PDF 导出依赖它)"
 fi
 
 # SN 可读 —— §2.2, 非阻断但必须提示核对

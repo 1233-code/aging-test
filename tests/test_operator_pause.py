@@ -20,11 +20,16 @@ EVENTS = []
 
 
 class FakeDb:
+    # ⚠️ **签名必须跟 server/db.py 保持一致** —— runner 收尾会调
+    # `create_run(config, meta)` 传 SN/工位/批次(§2.2/§8.2), 这里少写一个
+    # `meta=None` 的话, 平时测不到(本测试直接调 `_run_tests`, 绕过了 `start()`),
+    # 等哪天有人补了 `start()` 的用例就炸 TypeError —— 而且报的是
+    # "假实现签名不对", 很容易被误读成 runner 的 bug。
     @staticmethod
-    async def create_run(config): return 1
+    async def create_run(config, meta=None): return 1
 
     @staticmethod
-    async def create_mini_run(pid, config): return 99
+    async def create_mini_run(pid, config, meta=None): return 99
 
     @staticmethod
     async def get_run(rid): return None
@@ -35,8 +40,37 @@ class FakeDb:
     @staticmethod
     async def finish_run(*a, **k): pass
 
+    @staticmethod
+    async def set_pdf_path(*a, **k): pass
+
+
+class FakeReport:
+    """§8.2 报告导出必须在这里挡掉。
+
+    runner 的收尾路径(`_run_tests_body` 末尾)会 `await self._export_pdf(...)`,
+    而它调的是真的 `server.report` —— 那会去读真 config.yaml, 然后**把一份 PDF
+    写进生产归档目录 `reports/pdf/`**。本测试每跑一个用例就是一轮"完整运行",
+    于是每跑一次往归档目录里丢一份 `unknown_*.pdf`。
+
+    测试往生产归档目录里写产物, 和把测试数据写进生产库是同一类错误: 归档目录
+    是给产线做纸质归档用的, 混进 `unknown_` 的假报告, 事后没人分得清。
+    """
+    calls = 0
+
+    @classmethod
+    async def export_pdf(cls, run, results):
+        cls.calls += 1
+        return "/fake/report.pdf"
+
+    @staticmethod
+    def find_chromium(): return "/fake/chromium"
+
+    @staticmethod
+    def output_dir(): return None
+
 
 R.Database = FakeDb
+R.report = FakeReport
 R.Config.get = staticmethod(lambda *a, **k: {})
 R.INTERVAL_BETWEEN_TESTS_SEC = 0     # 缩短静默期, 让测试只聚焦「停住」
 

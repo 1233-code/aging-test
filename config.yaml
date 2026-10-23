@@ -184,10 +184,16 @@ defaults:
     duration_sec: 30
     min_read_mbps: 80
 
-# 报告
+# 报告 (§8.2)
 report:
-  output_dir: "reports"
+  output_dir: "reports"     # PDF 落在 <此目录>/pdf/, 文件名 {SN}_{YYYYmmdd_HHMMSS}.pdf
   title: "工厂老化测试报告"
+  # 工位号 / 批次号: 写死在配置文件里, 每台产线机器改一次即可, 不用工人手输。
+  # 留空字符串 = 不显示(报告里显示成 "—"), **别留 None**, 那是 YAML 空值。
+  # 工位号同时会作为 operator 落进 DB, 供后续追溯; SN 是逐台从 /proc/cmdline
+  # 读的 (§2.2), 不在这里配。
+  operator: ""
+  batch: ""
 
 # 日志
 logging:

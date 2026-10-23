@@ -25,7 +25,7 @@
 | 3 | WiFi 验证 (扫描+切换) | `iw` / `ip` / `rfkill` | ✅ |
 | 4 | USB 枚举+读写 | `lsusb` + `fio` (写30s + 读30s) | ✅ |
 | 5 | 网口 链路+ping | `ethtool` + `ping` | ✅ |
-| 6 | HDMI 输出 | `modetest` | ✅ |
+| 6 | HDMI 输出 | `xrandr` (读当前实际输出) | ✅ |
 | 7 | 风扇 GPIO | `/proc/rp_gpio/pi5` (echo 拉高/拉低轮转 2 轮) | ✅ |
 | 8 | TF 卡 (auto + 提示) | `fio` | ✅ |
 | 9 | 内存 压力 | `memtester` | ✅ |
@@ -41,7 +41,9 @@
 sudo bash scripts/install_deps.sh
 ```
 
-这会安装 `glmark2-es2-wayland`, `stress-ng`, `fio`, `memtester`, `ethtool`, `iputils-ping`, `busybox` (`udhcpc`), `libdrm-tests` (`modetest`), `iw`, `rfkill`, `iproute2`, `usbutils` (`lsusb`), `util-linux` (`lsblk`), `libgpiod-tools`, `python3-libgpiod` (备路径) 等 (与 docs/需求设计.md §11.7 一致)。
+关键工具: `stress-ng` (CPU), `glmark2-es2` / `glmark2-es2-wayland` (GPU), `fio` (存储), `memtester` (内存), `ethtool`, `iputils-ping` (`ping`), `busybox` (`udhcpc`), `iw`, `rfkill` (WiFi), `iproute2`, `usbutils` (`lsusb`), `util-linux` (`lsblk`), `x11-xserver-utils` (`xrandr`, HDMI 读当前实际输出), `chromium-browser` (PDF 报告导出 + 自动打开界面), `fonts-wqy-zenhei` (中文报告字体 —— **缺了 PDF 报告会静默变成全空白**, 见 docs §8.2.1), `libgpiod-tools` / `libgpiod2-tools` (风扇备份路径, 缺不阻断) 等 (与 docs/需求设计.md §11.7 一致)。
+
+> **不再需要 `libdrm-tools` / `modetest`** —— HDMI 模式切换已整块移除(改用 sysfs + xrandr 读当前状态), 详见 docs §6.7.1。
 
 ### 2. 安装桌面图标 (可选)
 

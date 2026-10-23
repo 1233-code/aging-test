@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{{ title }} — {{ run.sn or 'unknown' }}</title>
+<style>
+/*
+ * ⚠️ **font-family 必须显式写中文字体, 不能只写 sans-serif。**
+ *
+ * 实测(2026-10-23, 本机 aarch64/Ubuntu 20.04):
+ *   `fc-match sans-serif`         → DejaVu Sans
+ *   `fc-match sans-serif:lang=zh` → DejaVu Sans   ← 加 :lang=zh 也救不了
+ * 而 DejaVu Sans **一个 CJK 字形都没有**(fc-list ':charset=5de5' 查不到)。
+ * 浏览器遇到缺字形既不报错也不换字体, 直接画成空白, **然后照样 rc=0 输出一份
+ * 合法的 PDF** —— 产线会把全空白的中文报告当合格品归档。
+ *
+ * 这不是假设: `server/report.py` 的 `verify_cjk()` 就是照着这个失败样本写的,
+ * 每导出一份都会回头验 ToUnicode 里有没有 CJK 码位, 为 0 直接判导出失败
+ * (§8.2「不阻断结果 + 提示手动重导」)。
+ *
+ * 字体名写 WQY 全名 + 兜底族名, 是为了换机器上字体名不同还能落到某个 CJK 字体。
+ */
+@font-face { font-family: "ReportCJK"; src: local("WenQuanYi Zen Hei"); }
+* { box-sizing: border-box; }
+body {
+    font-family: "ReportCJK", "WenQuanYi Zen Hei", "Noto Sans CJK SC", sans-serif;
+    font-size: 11pt; line-height: 1.5; color: #212121; margin: 0;
+}
+h1 { font-size: 17pt; margin: 0 0 2mm; }
+h2 {
+    font-size: 12pt; margin: 6mm 0 2mm; padding-bottom: 1mm;
+    border-bottom: 1.5px solid #455a64;
+}
+h3 { font-size: 11pt; margin: 0 0 1.5mm; }
+.meta { color: #546e7a; font-size: 9.5pt; margin-bottom: 4mm; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td {
+    border: 0.4pt solid #b0bec5; padding: 1.6mm 2mm;
+    vertical-align: top; font-size: 9.5pt;
+}
+th { background: #eceff1; text-align: left; font-weight: 600; }
+
+/* ── 状态色块 ── */
+.st {
+    display: inline-block; min-width: 15mm; padding: 0.4mm 2mm;
+    border-radius: 2px; font-size: 9pt; font-weight: 600;
+    text-align: center; color: #fff;
+}
+.st-passed    { background: #2e7d32; }
+.st-failed    { background: #c62828; }
+.st-error     { background: #ef6c00; }
+.st-skipped   { background: #78909c; }
+.st-stopped   { background: #546e7a; }
+.st-pending,
+.st-running   { background: #90a4ae; }
+
+.kv td:first-child { width: 26mm; background: #f5f7f8; font-weight: 600; }
+
+/* §9.2: total=0 时必须显式披露 —— 否则「0 项全过」会被当成合格 */
+.warn-box {
+    border: 1.2pt solid #ef6c00; background: #fff8e1;
+    padding: 2.5mm 3mm; margin: 3mm 0; border-radius: 2px;
+}
+.warn-box .t { font-weight: 700; color: #e65100; }
+.notice {
+    border-left: 2.5pt solid #f9a825; background: #fffde7;
+    padding: 2mm 3mm; margin: 3mm 0;
+}
+
+.case {
+    border: 0.4pt solid #b0bec5; border-radius: 2px;
+    padding: 2.5mm 3mm; margin-bottom: 3mm;
+    break-inside: avoid;          /* 一项别跨两页 —— 撕页时项和状态会走散 */
+}
+.case-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 1.5mm;
+}
+.case-name { font-weight: 700; font-size: 11pt; }
+.case-meta { color: #607d8b; font-size: 9pt; }
+
+/* §8.2 日志附录: 独立分页 */
+.log-appendix { break-before: page; }
+pre.log {
+    font-family: "DejaVu Sans Mono", monospace; font-size: 7.6pt;
+    line-height: 1.32; white-space: pre-wrap; word-break: break-all;
+    background: #fafafa; border: 0.4pt solid #cfd8dc;
+    padding: 2.5mm; margin: 0; max-height: 235mm; overflow: hidden;
+}
+.footer-note { margin-top: 4mm; color: #78909c; font-size: 8.5pt; }
+</style>
+</head>
+<body>
+
+<h1>{{ title }}</h1>
+<div class="meta">
+    生成时间 {{ generated_at }}　·　本报告由工厂老化测试工具自动导出, 不经人工编辑
+</div>
+
+{# ───────────── 报告头 (§8.2) ───────────── #}
+<table class="kv">
+    <tr><td>被测设备 SN</td><td>{{ run.sn or 'unknown' }}</td></tr>
+    {# 工位号/批次号没填就都写「未填写」—— 同一张表里两个占位符不一样
+       (一个 unknown 一个 —) 看着像两种状态, 其实都是「没填」。SN 那行例外:
+       它的 'unknown' 是有语义的哨兵值(见下面的黄条告警), 不能换成中文。 #}
+    <tr><td>工位号</td><td>{{ run.operator or '未填写' }}</td></tr>
+    <tr><td>批次号</td><td>{{ run.batch or '未填写' }}</td></tr>
+    <tr><td>开始时间</td><td>{{ started_at }}</td></tr>
+    <tr><td>结束时间</td><td>{{ finished_at }}</td></tr>
+    <tr><td>总耗时</td><td>{{ total_duration }}</td></tr>
+    <tr><td>整体结论</td><td><span class="st st-{{ run.status }}">{{ run.status }}</span></td></tr>
+    <tr><td>Run ID</td><td>{{ run.id }}{% if run.mini_of %}（第 {{ run.mini_of }} 次重测）{% endif %}</td></tr>
+</table>
+
+{# §2.2: SN 读不到必须在 PDF 里也提示, 不能只靠 UI 顶上那一行黄字 #}
+{% if not run.sn or run.sn == 'unknown' %}
+<div class="notice">
+    <b>⚠ 未读到设备 SN</b> —— 本报告无法自动对应到具体机器。
+    请人工核对设备序列号后归档。
+</div>
+{% endif %}
+
+{# ───────────── 汇总段 (§8.2) ───────────── #}
+<h2>汇总</h2>
+
+{% if summary.total == 0 %}
+<div class="warn-box">
+    <div class="t">⚠ 本次未实际执行任何测试项</div>
+    勾选数为 0 或全部未跑到。**本报告不构成合格判定**（§9.2: total=0 不得判 passed）。
+</div>
+{% endif %}
+
+<table>
+    <tr>
+        <th>通过 passed</th><th>失败 failed</th><th>错误 error</th>
+        <th>未测 skipped</th><th>合计 total</th>
+    </tr>
+    <tr>
+        <td>{{ summary.passed }}</td>
+        <td>{{ summary.failed }}</td>
+        <td>{{ summary.error }}</td>
+        <td>{{ summary.skipped }}</td>
+        <td>{{ summary.total }}</td>
+    </tr>
+</table>
+
+{# §8.2 / §9.3: 未测项必须逐一列出, 且不计入通过率 #}
+{% if skipped_cases %}
+<h3>未测项明细（不计入通过率, 需人工确认是否放行）</h3>
+<table>
+    <thead><tr><th style="width:34mm">测试项</th><th>跳过原因</th></tr></thead>
+    <tbody>
+    {% for c in skipped_cases %}
+        <tr><td>{{ c.display_name }}</td><td>{{ c.error or '（未记录原因）' }}</td></tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{# ───────────── 逐项段 (§8.2) ───────────── #}
+<h2>逐项结果</h2>
+{% for c in cases %}
+<div class="case">
+    <div class="case-head">
+        <span class="case-name">{{ loop.index }}. {{ c.display_name }}</span>
+        <span>
+            <span class="st st-{{ c.status }}">{{ c.status }}</span>
+            <span class="case-meta">{{ c.duration }}</span>
+        </span>
+    </div>
+
+    {% if c.metrics %}
+    <table>
+        <thead><tr><th style="width:46mm">指标</th><th>值</th></tr></thead>
+        <tbody>
+        {% for k, v in c.metrics %}
+            <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    {# §8.2: failed / error 必须给完整原因, 不能只有状态色块 #}
+    {% if c.status in ('failed', 'error') %}
+    <div class="warn-box">
+        <div class="t">{{ '失败原因' if c.status == 'failed' else '错误原因' }}</div>
+        {{ c.error or '（未记录原因 —— 属实现缺陷: failed/error 必须写 error 字段）' }}
+    </div>
+    {% endif %}
+
+    {% if c.stderr_tail %}
+    <h3>stderr 末若干行</h3>
+    <pre class="log">{{ c.stderr_tail }}</pre>
+    {% endif %}
+</div>
+{% endfor %}
+
+{% if run.error %}
+<div class="warn-box">
+    <div class="t">系统级错误</div>{{ run.error }}
+</div>
+{% endif %}
+
+{# ───────────── 配置快照 (§8.2 报告头要求) ───────────── #}
+<h2>本次配置快照</h2>
+<table class="kv">
+{% for k, v in config_items %}
+    <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+{% endfor %}
+</table>
+
+{# ───────────── 日志附录: 独立分页 (§8.2) ───────────── #}
+<div class="log-appendix">
+    <h2>日志附录</h2>
+    <pre class="log">{{ full_log }}</pre>
+</div>
+
+<div class="footer-note">
+    文件名 {{ filename }}　·　SN {{ run.sn or 'unknown' }}　·　Run ID {{ run.id }}
+</div>
+
+</body>
+</html>

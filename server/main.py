@@ -14,6 +14,8 @@ from pydantic import BaseModel
 
 from .config import Config
 from . import db
+from . import identity
+from . import report
 from .runner import runner
 from .tests.registry import get_all_tests
 
@@ -27,7 +29,12 @@ PROJECT_ROOT = Config.project_root()
 async def startup():
     Config.load()
     await db.Database.init()
+    # §4.4: 启动时读一次 SN 常驻内存, UI 顶部整个会话都显示它。读不到不阻断,
+    # 记 unknown 转黄提示 (§2.2) —— 停机出货的后果远大于一次读不到。
+    sn = identity.init()
     print(f"[server] 项目根目录: {PROJECT_ROOT}")
+    print(f"[server] 被测设备 SN: {sn}" + ("  ⚠ 读不到, 报告中将记 unknown"
+                                        if sn == identity.UNKNOWN else ""))
     asyncio.create_task(_idle_watchdog())
 
 
@@ -101,7 +108,7 @@ async def deps_check():
         "ip": "通用 (iproute2)",
         "lsusb": "USB 枚举 (usbutils)",
         "lsblk": "块设备枚举 (util-linux)",
-        "modetest": "HDMI 检测 (libdrm-tests)",
+        "xrandr": "HDMI 读当前实际输出 (x11-xserver-utils)",
     }
     items = []
     for cmd, label in REQUIRED.items():
@@ -115,7 +122,7 @@ async def deps_check():
     all_ok = all(x["ok"] for x in items)
     CRITICAL_BINS = (
         "stress-ng", "glmark2-es2", "fio", "memtester", "ethtool",
-        "ping", "udhcpc", "iw", "rfkill", "modetest",
+        "ping", "udhcpc", "iw", "rfkill", "xrandr",
     )
     critical_missing = [
         x["name"] for x in items
@@ -140,6 +147,9 @@ async def get_config():
         "tests": get_all_tests(),
         "interfaces": Config.get("interfaces", {}),
         "recommended_order": RECOMMENDED_ORDER,
+        # §2.2 / §7.2: SN 常驻显示在页面顶部。跟着 /api/config 一起下发而不是
+        # 单开一个接口 —— 页面本来就要拉它, 多一次请求没有收益。
+        "sn": identity.get_sn(),
     }
 
 
@@ -370,6 +380,70 @@ async def history_detail(run_id: int):
     if not data:
         raise HTTPException(404, "记录不存在")
     return data
+
+
+@app.get("/api/history/{run_id}/pdf")
+async def history_pdf(run_id: int):
+    """下载/预览已导出的 PDF。"""
+    data = await db.Database.get_run(run_id)
+    if not data:
+        raise HTTPException(404, "记录不存在")
+    path = data.get("pdf_path")
+    if not path:
+        raise HTTPException(404, "该轮次还没导出 PDF, 请点「重新导出」")
+    p = Path(path)
+    if not p.is_absolute():
+        p = Config.project_root() / p
+    # 库里的路径理论上只会是本工具写的, 但万一被手改过 —— 别让它变成一个
+    # 能读 /etc/passwd 的任意文件下载口。
+    #
+    # 边界取 **report.output_dir()** —— 只有报告目录及其子目录可下载:
+    #   · 默认 output_dir="reports" → 解析后是 <项目根>/reports/pdf, 落在项目根
+    #     之内, 所以行为不变, 但比"项目根之内"**更严**(仓库里其他文件不会被
+    #     这个端点读出去);
+    #   · 产线把 output_dir 指到 U 盘/网络盘(绝对路径)归档时, 那个目录本身
+    #     就是合法落盘位置, 用项目根当边界反而会把刚导出的 PDF 全 403 掉。
+    # commonpath 两边都 resolve 过, 所以 <root>/../etc 那种绕不过去。
+    #
+    # 用 os.path.commonpath 而不是 Path.is_relative_to: 后者是 3.9+ 才有的,
+    # 本板是 Python 3.8.10。
+    root = str(report.output_dir().resolve())
+    try:
+        inside = os.path.commonpath([str(p.resolve()), root]) == root
+    except ValueError:      # 跨不动路径时 commonpath 直接抛
+        inside = False
+    if not inside:
+        raise HTTPException(403, "PDF 路径不在报告目录内")
+    if not p.exists():
+        raise HTTPException(404, "PDF 文件已不在磁盘上, 请重新导出")
+    return FileResponse(str(p), media_type="application/pdf",
+                        filename=p.name)
+
+
+@app.post("/api/history/{run_id}/pdf")
+async def history_reexport_pdf(run_id: int):
+    """§8.2 手动重导 PDF。
+
+    自动导出失败时(缺 chromium / 字体装晚了 / 当时磁盘满), 工人装完依赖就能
+    在这一轮上补导, 不用重跑整轮老化。
+
+    **会覆盖同轮次的旧 pdf_path** —— 但文件名叫的是同一台机器 + 收尾时间戳,
+    同一轮重导出来的是同名文件, 内容一致, 不会在 reports/pdf/ 里堆一串同轮
+    的重复件。
+    """
+    data = await db.Database.get_run(run_id)
+    if not data:
+        raise HTTPException(404, "记录不存在")
+    # 老库里没有 sn 列(迁移前的记录) → 回读当前设备 SN, 至少别写成 null
+    if not data.get("sn"):
+        data["sn"] = identity.get_sn()
+    results = data.pop("results", [])
+    try:
+        path = await report.export_pdf(data, results)
+    except report.ReportError as e:
+        raise HTTPException(500, f"导出失败: {e}")
+    await db.Database.set_pdf_path(run_id, path)
+    return {"ok": True, "path": path}
 
 
 # ==================== WebSocket ====================

@@ -38,7 +38,9 @@ apt-get install -y \
     iw rfkill wireless-tools wpasupplicant \
     network-manager \
     libgpiod-tools \
-    libdrm-tests \
+    x11-xserver-utils \
+    chromium-browser \
+    fonts-wqy-zenhei \
     alsa-utils \
     pciutils \
     curl \

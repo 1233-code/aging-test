@@ -19,13 +19,43 @@ header {
     margin-bottom: 24px;
 }
 header h1 { font-size: 22px; }
-.header-right { display: flex; align-items: center; gap: 16px; }
+/* 三段式: 标题 + SN | ......gap...... | 按钮组。
+   SN 单独占左半边才有地方放整串 18 位 —— 挤在按钮组里就只能截断。 */
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;      /* 允许收缩, 否则 SN 一长就把右侧按钮顶出屏幕 */
+}
+.header-right { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
 .device-tag {
     background: #e3f2fd;
     color: #1976d2;
     padding: 4px 10px;
     border-radius: 4px;
     font-size: 12px;
+}
+/* §2.2 / §7.2: SN 常驻顶部, 整串显示不截断。等宽字体 —— 它是 18 位十六进制,
+   用比例字体会糊成一团分不清 0/O、1/l, 产线上照着念编号容易念错。
+   超长 SN(某些板子塞完整序列号)由这里的 ellipsis 兜底, 鼠标悬停仍有全串。 */
+.sn-tag {
+    background: #eceff1;
+    color: #37474f;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: ui-monospace, "DejaVu Sans Mono", "Courier New", monospace;
+    white-space: nowrap;
+    max-width: 42ch;       /* 约 40 位, 本板 18 位远够; 真超了才省略 */
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+/* 读不到 SN 时转黄 (§7.2「显示 SN: unknown 并转黄」) —— 不能只是换个文案
+   就放过, 这一轮的追溯链就断在这儿, 得让人一眼看见去核对设备。 */
+.sn-tag.sn-unknown {
+    background: #fff8e1;
+    color: #ef6c00;
+    font-weight: 600;
 }
 
 section {
@@ -380,6 +410,26 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .status-error { color: #ef6c00; font-weight: 500; }
 .status-running { color: #1976d2; font-weight: 500; }
 
+/* ---- §2.2 SN 列 / §8.2 PDF 操作 ---- */
+/* SN 走等宽字体: 序列号里的 0/O、1/l 得分清, 用比例字体会看错一个字符就把
+   报告归档到另一台机器上。宽度限死 + 省略号, 完整值在 title 里。 */
+.history-table .sn-cell {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; max-width: 22ch;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.history-table .sn-cell.sn-unknown { color: #ef6c00; font-weight: 600; }
+
+.history-detail h3 { display: flex; align-items: center; gap: 10px; }
+
+.pdf-actions { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
+.pdf-note { color: #999; font-size: 13px; }
+.pdf-error {
+    margin: 6px 0; padding: 8px 12px; border-radius: 4px;
+    background: #fff8e1; border: 1px solid #ef6c00;
+    color: #e65100; font-size: 13px;
+}
+
 .history-detail { margin-top: 24px; padding-top: 16px; border-top: 2px solid #e1e4e8; }
 
 /* ============== Wizard (一测试一屏) ============== */
@@ -693,6 +743,18 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     flex-wrap: wrap;
     padding-top: 16px;
     border-top: 1px solid #eef0f4;
+    align-items: center;
+}
+/* 「打开 PDF 报告」是个 <a>, 要跟旁边真按钮看起来一模一样 ——
+   .btn-secondary 只给了背景/边框/内边距, <a> 自带下划线且默认不是手型,
+   不补这几条它会跟三个按钮明显不像一排。 */
+a.btn-secondary {
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    cursor: pointer;
+    font-size: inherit;
+    line-height: normal;
 }
 
 /* ============== 依赖检查 banner ============== */
@@ -771,3 +833,19 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     line-height: 1.8;
     color: #888;
 }
+
+/* 导出失败的说明条 —— 紧贴在汇总页按钮排下面(解释的就是那个按钮为什么
+   还是「导出」而不是「打开」)。橙条不用红条: §8.2 规定导出失败不阻断测试
+   判定, 红色会被工人当成「设备不合格」。 */
+.report-inline-note {
+    margin-top: 14px; padding: 10px 14px; border-radius: 6px;
+    background: #fff8e1; border: 1px solid #ef6c00; color: #e65100;
+    font-size: 13px; line-height: 1.7; text-align: left;
+}
+.report-inline-note .report-reason {
+    display: inline-block; margin: 0 4px; padding: 1px 6px; border-radius: 3px;
+    background: #fff; color: #424242;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    word-break: break-all;
+}
+.report-inline-note .report-note { display: block; margin-top: 4px; opacity: .85; }

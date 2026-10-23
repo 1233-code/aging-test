@@ -9,6 +9,13 @@ from .tests.base import TestCase, TestContext, TestResult, TEST_REGISTRY
 from .tests.registry import get_all_tests
 from .db import Database
 from .config import Config
+from . import identity, report
+
+
+def _report_cfg() -> dict:
+    # `or {}` 不是多余的: config.yaml 里写 `report:`(下面全注释掉)时 yaml 解析出
+    # 的是 None 而不是 {}, 而 Config.get 的默认值只在 key **不存在**时才生效。
+    return Config.get("report") or {}
 
 
 # §7.6 推荐执行顺序 - 4 阶段逐级加载,避免热累积污染轻量项
@@ -64,6 +71,18 @@ class TestRunner:
         # Mini-run 模式
         self.mode: str = "full"               # 'full' | 'mini'
         self.parent_run_id: Optional[int] = None  # mini-run 模式下指向父 run id
+
+        # §2.2 / §8.2 报告身份。SN 从 /proc/cmdline 读一次就固定下来 —— 不能在
+        # 收尾时再读, 那时万一有人重启了机器, 报告会挂到错误的 SN 上, 而这种
+        # 错配在纸质归档里是查不出来的。
+        self.sn: str = identity.UNKNOWN
+        self.operator: Optional[str] = None
+        self.batch: Optional[str] = None
+        # 本轮导出的 PDF 路径 (None = 没导出/导出失败, 见 _export_pdf)
+        self.pdf_path: Optional[str] = None
+        # 本轮 config 快照 / 系统级错误 —— 报告的配置快照段和「系统级错误」块要用
+        self.run_config: Optional[dict] = None
+        self.run_error: Optional[str] = None
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -140,9 +159,17 @@ class TestRunner:
         self.status = "running"
         self.mode = "full"
         self.parent_run_id = None
+        # 每轮重新读一次 SN —— 产线上一台机器可能连着测很多轮, 上一轮的 SN
+        # 不能想当然沿用。读不到就是 unknown, 报告里会打黄条提醒人工核对。
+        self.sn = identity.get_sn()
+        self.operator = _report_cfg().get("operator") or None
+        self.batch = _report_cfg().get("batch") or None
+        self.run_config = config
+        self.run_error = None
+        self.pdf_path = None
 
         # 创建 DB 记录
-        self.run_id = await Database.create_run(config)
+        self.run_id = await Database.create_run(config, self._run_meta())
         await self._broadcast({"type": "run_started", "run_id": self.run_id})
 
         self._task = asyncio.create_task(self._run_all(config))
@@ -192,7 +219,18 @@ class TestRunner:
         }
         config.update(Config.all())
 
-        self.run_id = await Database.create_mini_run(parent_run_id, config)
+        # 重测轮的 SN **沿用父轮记录的**, 不重新读 /proc/cmdline —— 父轮才是
+        # "当时测的是哪台机器"的权威记录。父轮没有(老库/当时没读到)才回读。
+        self.sn = parent.get("sn") or identity.get_sn()
+        self.operator = (parent.get("operator")
+                         or _report_cfg().get("operator") or None)
+        self.batch = (parent.get("batch")
+                      or _report_cfg().get("batch") or None)
+        self.run_config = config
+        self.run_error = None
+        self.pdf_path = None
+
+        self.run_id = await Database.create_mini_run(parent_run_id, config, self._run_meta())
         await self._broadcast({
             "type": "run_started",
             "run_id": self.run_id,
@@ -475,6 +513,7 @@ class TestRunner:
             self.status = "error"
             self.finished_at = time.time()
             self.current_test = None
+            self.run_error = repr(e)
             try:
                 await Database.finish_run(
                     self.run_id, "error", {"reason": repr(e)}
@@ -589,6 +628,10 @@ class TestRunner:
         }
         await Database.finish_run(self.run_id, self.status, summary)
 
+        # §8.2 收尾导出。**放在 finish_run 之后**: 万一导出卡住/失败, 库里
+        # 这一轮已经是完整的 finished 状态, 历史页随时能看, 不受影响。
+        await self._export_pdf(summary)
+
         await self._broadcast({
             "type": "run_finished",
             "status": self.status,
@@ -601,6 +644,76 @@ class TestRunner:
         if self.mode == "mini":
             self.mode = "full"
             self.parent_run_id = None
+
+    def _run_meta(self) -> dict:
+        """create_run / create_mini_run 共用的身份字段。"""
+        return {"sn": self.sn, "operator": self.operator, "batch": self.batch}
+
+    def _report_dict(self, summary: dict) -> dict:
+        """喂给 report.export_pdf 的 run 结构 —— 字段名和 db.get_run 对齐。"""
+        return {
+            "id": self.run_id,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "status": self.status,
+            "sn": self.sn,
+            "operator": self.operator,
+            "batch": self.batch,
+            "mini_of": self.parent_run_id,
+            "error": self.run_error,
+            "summary": summary,
+            "config": self.run_config,
+        }
+
+    def _results_as_dicts(self) -> list:
+        return [
+            {
+                "test_name": name,
+                "status": r.status,
+                "duration_sec": r.duration_sec,
+                "metrics": r.metrics,
+                "log": r.log,
+                "error": r.error,
+            }
+            for name, r in self.results.items()
+        ]
+
+    async def _export_pdf(self, summary: dict):
+        """§8.2 收尾自动导出 PDF。
+
+        **本方法不抛异常** —— §8.2 硬规则: 报告导出失败**不阻断**测试结果。
+        结果早在 `_run_tests_body` 里就写完库了, 报告只是附加产物; 失败就
+        记日志 + 推一条 warning, 让工人知道"这轮没生成报告", 历史页还能
+        手动重导。绝不能因为导出失败就把已跑完的一轮标成 error。
+        """
+        try:
+            path = await report.export_pdf(
+                self._report_dict(summary), self._results_as_dicts()
+            )
+        except Exception as e:
+            # 兜 Exception 而不是只 catch report.ReportError: 渲染模板时的
+            # KeyError / 磁盘满 / 权限问题同样不该掀翻收尾流程。
+            self.pdf_path = None
+            print(f"[runner] ⚠ PDF 导出失败 (不影响测试结果): {e}", flush=True)
+            await self._broadcast({
+                "type": "report_failed",
+                "reason": str(e),
+                "run_id": self.run_id,
+            })
+            return
+        self.pdf_path = path
+        try:
+            await Database.set_pdf_path(self.run_id, path)
+        except Exception as e:
+            # 报告文件已经在磁盘上了, 只是没记进 DB。**这不算导出失败** ——
+            # 别去删已经生成的文件, 论文档靠文件系统还能找到。
+            print(f"[runner] ⚠ PDF 已生成但回写 DB 失败: {e}  ({path})", flush=True)
+        print(f"[runner] PDF 报告: {path}", flush=True)
+        await self._broadcast({
+            "type": "report_ready",
+            "path": path,
+            "run_id": self.run_id,
+        })
 
     async def _on_progress(self, name: str, pct: float, msg: str):
         await self._broadcast({"type": "progress", "name": name, "pct": pct, "msg": msg})
