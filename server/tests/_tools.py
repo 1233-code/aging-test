@@ -10,6 +10,71 @@ import time
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 
+# ── 终端还原: 把子进程"原地重绘"的输出还原成屏幕上的样子 ──
+
+class TtyDemangler:
+    """把子进程用退格符/回车做的**原地重绘**还原成屏幕上最终的样子。
+
+    有些工具为了在终端上显示进度, **不换行**, 而是用退格符(\\b)把刚写的
+    几个字擦掉重画。memtester 4.x 就是这样:
+
+        Stuck Address       : <b>setting   0<b>testing   0<b>setting   1...
+
+    "Random Value" 那一项画的是一个 -\\|/ 的转轮, 每转一格就用 3 个退格符
+    擦掉上一格。后果: **一行**原始输出里能塞进几万字符 (1024MB 那次光这一
+    项就 50KB+), 整轮下来十几 MB。
+
+    直接存进日志, 报告里就是好几页的 "-\\|/" —— 一个信息都没有, 却把真
+    正要看的部分挤到后面去 (产线反馈: 「好几页都是这个」)。
+
+    还原规则就是终端自己的规矩: 退格符擦掉前一个字符, 回车清空整行, 换行
+    收尾。还原后 memtester 的每个测试项变成干净的一行:
+
+        Stuck Address       : ok
+        Random Value        : ok
+
+    被擦掉的是**重绘的中间态**(同一件事被反复显示), 不是内容 —— 每个测试
+    项的最终结论一个字都不会少。
+
+    ⚠️ 喂进来的原始文本**不能**先 rstrip(): Python 认为 \\b 是空白字符,
+    rstrip 会把行尾的退格符吃掉, 还原出来就不对了。
+    """
+
+    def __init__(self):
+        self._cur: List[str] = []      # 当前行还没定稿的可见字符
+        self._done: List[str] = []     # 已经定稿的行
+
+    def feed(self, text: str) -> List[str]:
+        """喂一段原始文本, 返回**已经定稿**的行 (没换行的尾巴先留着)。"""
+        for ch in text:
+            if ch == "\b":
+                if self._cur:
+                    self._cur.pop()
+            elif ch == "\r":
+                self._cur = []
+            elif ch == "\n":
+                self._done.append("".join(self._cur))
+                self._cur = []
+            else:
+                self._cur.append(ch)
+        done, self._done = self._done, []
+        return done
+
+    def flush(self) -> List[str]:
+        """进程被掐掉、最后一段没有换行时, 把尾巴也交出来。"""
+        if self._cur:
+            self._done.append("".join(self._cur))
+            self._cur = []
+        done, self._done = self._done, []
+        return done
+
+
+def demangle_tty(text: str) -> str:
+    """一次性还原一整段输出 (给测试用)。"""
+    d = TtyDemangler()
+    return "\n".join(d.feed(text) + d.flush())
+
+
 # ── 带进度的子进程等待 ──
 
 async def run_proc_with_progress(
@@ -41,8 +106,16 @@ async def run_proc_with_progress(
                 if not line:
                     break
                 lines.append(line.decode(errors="replace").rstrip())
-                if len(lines) > 400:          # 只留尾部, 免跑几小时把内存吃光
-                    del lines[:-400]
+                # 只留尾部 —— 但**上限给得很大**。
+                #
+                # 原来这里是 400 行, 而这份输出是要**原样进报告**的(CPU 项把
+                # 它逐行推给 on_log, runner 留档 → 报告的日志附录)。截到 400
+                # 行, 报告里的 CPU 日志就只有尾巴那一段 —— 看着像日志, 实际
+                # 缺了头, 比没有更糟。
+                # 400 行也不够挡住"跑几小时把内存吃光": 一行几十字节, 十万行
+                # 也就几 MB, 而 storage 类测试都有 timeout 兜底。
+                if len(lines) > 50000:
+                    del lines[:-50000]
         except Exception:
             pass
 
@@ -266,6 +339,13 @@ async def kill_proc(proc: Optional[asyncio.subprocess.Process],
       - 普通子进程但没在 wait_sec 内退出 → 调用方继续等或告警
 
     绝不抛异常: 收尾失败不该把一个跑满挂钟、本该 passed 的项打成 error。
+
+    ℹ️ **提权的例外在 GPU 项那边, 不在这里** —— glmark2 是全屏渲染, 那个 root
+    进程会一直占着屏幕, 光靠 `timeout` 到点收尾意味着「按停止」之后窗口还留着
+    (工人只能按 Esc 手动关)。GPU 项因此有自己的一条**提权**收尾路径
+    (`sudo -n kill -<pgid>`, 以 root 身份整组收掉), 见
+    `server/tests/gpu.py` 的「提权收尾」一节 —— 那是**用户点名授权**的
+    单点例外, 范围仅限 GPU 项自己起的那一组。**这个通用函数保持不提权。**
     """
     if proc is None:
         return True

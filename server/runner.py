@@ -29,8 +29,13 @@ RECOMMENDED_ORDER: List[str] = [
     # ④ 重载收尾 (产热最高,放最后)
     "gpu", "cpu",
 ]
-# §7.6 静默期硬规则 - 每项结束后留 N 秒, 可设但默认 5
-INTERVAL_BETWEEN_TESTS_SEC: int = 5
+# §7.6 静默期硬规则 - 每项结束后留 N 秒, 再开下一项。
+#
+# 2026-10-26: 5s → 3s(产线: 「五秒有点长了」)。这一段是**纯等待**, 不产出
+# 任何测试结论, 它的唯一作用是让 CPU / 温度 / 调度器复位一下 —— 3 秒够
+# 复位, 不够"让工人读完上一项结果"(要读结果有的是地方: 总结页、报告)。
+# 10 项 9 个间隔 = 整轮省 18 秒。
+INTERVAL_BETWEEN_TESTS_SEC: int = 3
 
 # §7.8 等操作员: 卡槽空 / 网线没插 这类「料没到位」的结果, 整轮要**真停住**。
 # 超时后自动往下走 —— 操作员可能去拿卡了、页面可能被他关掉, 不设上限的话
@@ -39,6 +44,14 @@ OPERATOR_WAIT_DEFAULT_SEC: int = 300
 # 同一个位置最多让工人重测几次 —— 插了三次都没认出来, 多半是卡本身的问题,
 # 再点一百次也只是在耗老化时长。
 OPERATOR_MAX_RETEST: int = 3
+
+# 单项日志的行数上限。
+#
+# ⚠️ 这是**兜底**, 不是"截断策略" —— 正常跑一轮的日志是几百行, 远够不着。
+# 它存在只为挡住一种情况: 某个测试进了死循环疯狂打日志, 把内存吃光 / 把
+# PDF 撑成几百兆。真要撞上了, 报告会**明写**「日志过长, 只保留了末尾 N 行」,
+# 绝不悄悄少一段 —— 少了一段还看不出来, 那比超长糟糕得多。
+LOG_MAX_LINES: int = 10000
 
 
 class TestRunner:
@@ -49,6 +62,23 @@ class TestRunner:
         self.cancelled = False
         self.current_test: Optional[str] = None
         self.results: Dict[str, TestResult] = {}
+        # 每一项的**完整**日志 (行列表) —— 报告「日志附录」的数据源。
+        #
+        # 为什么在这儿抓, 而不是让各项自己写 result.log: 抓点只有一个 ——
+        # _on_log() 是各项推日志的**唯一出口**, 每一行都从这里过。而各项
+        # 自己写的那份是**残缺**的: 十项里七项压根不写(实测产线那份报告里
+        # USB 那一项的日志附录是"(无日志)"), 写了的那几项还是截断过的
+        # 末尾 N 行(GPU 20 行 / 内存 200 行 / CPU 400 行)。
+        #
+        # 残缺的日志比没有日志**更糟** —— 读的人会以为那就是全部, 于是照着
+        # 一份缺了头的日志去判断机器有没有问题。
+        self._logs: Dict[str, List[str]] = {}
+        # 被上限截断过的项 —— 截断了就**必须说出来**, 不许悄悄少一段。
+        self._log_truncated: Dict[str, int] = {}
+        # mini-run 写父轮时, 父轮那一项**原本**的日志 (第一次写之前抓下来)。
+        # 有了它, 重试时每次重写「基准 + 全部尝试」而不是一次次往后接 ——
+        # 不然头一次尝试的日志会在父轮里出现两遍。
+        self._parent_log_base: Dict[str, str] = {}
         self.subscribers: List[asyncio.Queue] = []
         self.started_at: float = 0
         self.finished_at: float = 0
@@ -83,6 +113,13 @@ class TestRunner:
         # 本轮 config 快照 / 系统级错误 —— 报告的配置快照段和「系统级错误」块要用
         self.run_config: Optional[dict] = None
         self.run_error: Optional[str] = None
+        # §7.6 本轮的测试队列 (执行顺序, 含**还没跑到**的那些)。
+        #
+        # 为什么光有 results 不够: results 只装**已经跑出结果**的项。页面刷新
+        # 或 WS 重连时, 靠 results 重建列表, 前面还没跑的项会整个消失 ——
+        # 进度条的分母不对, 总结页也少几行。队列是「这一轮要跑哪些、按什么
+        # 顺序」, 是这一轮**开始时**就定下来的, 不随跑到哪儿而变。
+        self.test_queue: List[str] = []
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -115,6 +152,20 @@ class TestRunner:
             "finished_at": self.finished_at,
             "mode": self.mode,
             "parent_run_id": self.parent_run_id,
+            # §7.6 本轮的测试队列(执行顺序, 含还没跑到的)。前端靠它重建
+            # 完整的逐项列表 —— 只靠 results 的话, 还没跑的项会整个消失。
+            "test_queue": list(self.test_queue),
+            # §8.2 这一轮有没有导出过 PDF。前端靠它决定按钮排里显示
+            # 「打开 PDF 报告」还是「导出 PDF 报告」(§8.2 规定二选一,
+            # 不同时出现)。重连后靠这个恢复, 否则重连完按钮会退化成
+            # 「导出」, 工人以为这轮没出过报告。
+            "pdf_path": self.pdf_path,
+            # 这一轮记的 SN。⚠️ **不是**当前板子的 SN —— 重连时前端要显示的
+            # 是「这一轮测的是哪台机器」, 那是这一轮开始时记下的值。
+            "sn": self.sn,
+            # 整轮异常终止的原因 (status=error 时有)。总结页要显示它 ——
+            # 光看「0 通过 / 0 失败 / 0 跳过」没人知道出了什么事。
+            "error": self.run_error,
             # §7.8: 页面刷新/重连后靠这一项把弹框重新显示出来。
             # 不带它的话, 工人刷一下页面, 后端还在等, 界面上却什么提示都没有,
             # 只能干看着「运行中」等到超时。
@@ -153,6 +204,9 @@ class TestRunner:
 
         self.cancelled = False
         self.results = {}
+        self._logs = {}          # 新的一轮, 日志留档从头开始
+        self._log_truncated = {}
+        self._parent_log_base = {}
         self.current_test = None
         self.started_at = time.time()
         self.finished_at = 0
@@ -162,11 +216,24 @@ class TestRunner:
         # 每轮重新读一次 SN —— 产线上一台机器可能连着测很多轮, 上一轮的 SN
         # 不能想当然沿用。读不到就是 unknown, 报告里会打黄条提醒人工核对。
         self.sn = identity.get_sn()
-        self.operator = _report_cfg().get("operator") or None
-        self.batch = _report_cfg().get("batch") or None
+        # §8.2 测试人员 / 批次: **本轮 config 里的优先**(前端每轮手填的姓名),
+        # 没有才回落到全局 config.yaml 的 report 段。
+        #
+        # ⚠️ 不能只读 _report_cfg() —— 那是**全局 yaml**, 拿不到本轮手输的值。
+        # 只读全局的话, 工人明明填了姓名, 报告里还是「未填写」, 而且日志上
+        # 一点异常都没有(静默走默认值那条路)。
+        _rep = config.get("report") or {}
+        self.operator = _rep.get("operator") or _report_cfg().get("operator") or None
+        self.batch = _rep.get("batch") or _report_cfg().get("batch") or None
         self.run_config = config
         self.run_error = None
         self.pdf_path = None
+        # §7.6 队列**在开跑前**就定下来 —— 页面刷新/重连时靠它知道这一轮
+        # 一共要跑几项、什么顺序(§7.6「运行态必须能靠快照恢复」)。
+        self.test_queue = [
+            n for n, _ in self._build_test_list(
+                config.get("tests") or {}, config.get("order"))
+        ]
 
         # 创建 DB 记录
         self.run_id = await Database.create_run(config, self._run_meta())
@@ -206,6 +273,9 @@ class TestRunner:
 
         self.cancelled = False
         self.results = {}
+        self._logs = {}          # 新的一轮, 日志留档从头开始
+        self._log_truncated = {}
+        self._parent_log_base = {}
         self.current_test = None
         self.started_at = time.time()
         self.finished_at = 0
@@ -218,10 +288,17 @@ class TestRunner:
             "project_root": parent_config.get("project_root", ""),
         }
         config.update(Config.all())
+        # ⚠️ 顺序要紧: 全局 config 要是也有 `tests:` 段, 上面这行 update 会把
+        # 父轮那几项冲掉 —— mini-run 就变成「把整套再跑一遍」, §7.7 mini-run
+        # 的意义全没了(而且是**静默**的: 界面上只显示重测了 2 项, 机器上却
+        # 跑了 12 项)。所以 tests 必须在 update **之后**再定死。
+        config["tests"] = retest_tests_config
 
         # 重测轮的 SN **沿用父轮记录的**, 不重新读 /proc/cmdline —— 父轮才是
         # "当时测的是哪台机器"的权威记录。父轮没有(老库/当时没读到)才回读。
         self.sn = parent.get("sn") or identity.get_sn()
+        # 测试人员同理**沿用父轮**: 重测的是同一轮里的失败项, 还是同一个
+        # 人在测 —— 换成人反而会让「这一轮谁负责」对不上(父轮是这一轮)。
         self.operator = (parent.get("operator")
                          or _report_cfg().get("operator") or None)
         self.batch = (parent.get("batch")
@@ -242,6 +319,8 @@ class TestRunner:
         enabled_tests = self._build_test_list(
             config["tests"], explicit_order=config.get("order")
         )
+        # §7.6 队列照样记下来 —— mini-run 重连后也得能重建出「只重测了哪几项」。
+        self.test_queue = [n for n, _ in enabled_tests]
         self._task = asyncio.create_task(self._run_tests(enabled_tests, config, write_to_parent=True))
         return {
             "ok": True,
@@ -306,12 +385,17 @@ class TestRunner:
         cls: Type[TestCase],
         config: dict,
         write_to_parent: bool,
+        attempt: int = 1,
     ) -> Tuple[TestResult, Optional[TestCase]]:
         """跑**一遍** name 这一项, 返回 (结果, 实例)。
 
         拆出来是因为 §7.8 要能原地重跑同一项 —— 「插上卡了, 再试一次」
         走的是同一个实例的第二次 run(), 而不是开一个 mini-run。
         返回实例是因为只有它才知道这个结果要不要问操作员。
+
+        attempt: 第几次尝试 (§7.8 的重试)。**不是 1 就往已有日志后面接** ——
+        头一次为什么不行(卡槽空的 / 网线没插), 恰恰是复盘时最要看的东西,
+        只留最后一次就等于把前几次的证据扔了。
         """
         self.current_test = name
         # 实例先建出来: 要问它「本项预计多少秒」(见 TestCase.expected_seconds)。
@@ -357,6 +441,12 @@ class TestRunner:
             on_metric=lambda k, v, n=name: self._on_metric(n, k, v),
         )
 
+        # §7.8 的重试: 头一次的日志**接在后面**, 不是冲掉 —— 头一次为什么
+        # 不行(卡槽空的 / 网线没插), 恰恰是复盘时最要看的东西。
+        # (缓冲本身在 _run_tests_body 里, 进入这一轮 attempt 循环前清空。)
+        if attempt > 1 and self._logs.get(name):
+            self._logs[name].append(f"───── 第 {attempt} 次尝试 ─────")
+
         try:
             self._current_instance = instance   # 供 stop() 拿到真实实例去 kill 子进程
             self.results[name] = TestResult(status="running")
@@ -369,6 +459,21 @@ class TestRunner:
             self.results[name] = result
         finally:
             self._current_instance = None
+
+        # 日志以**runner 留档的这份**为准。
+        #
+        # 各项自己写的 result.log 是残缺的(七项不写, 写了的是截断过的末尾
+        # N 行), 而 runner 留档的是**每一行**经过 on_log 的原文 —— 跟工人
+        # 屏幕上一模一样。报告要能当证据用, 就得是这份。
+        captured = self._logs.get(name) or []
+        if captured:
+            result.log = "\n".join(captured)
+        # 截断过就在指标里留个痕 —— 报告会把这句话印在那一项的日志后面。
+        # 悄悄少一段 = 报告看起来是全的, 实际不是, 那比超长糟糕得多。
+        if self._log_truncated.get(name):
+            result.metrics["log_truncated"] = "是"
+            result.metrics["log_kept_lines"] = LOG_MAX_LINES
+            result.metrics["log_dropped_lines"] = self._log_truncated[name]
 
         common_fields = {
             "status": result.status,
@@ -387,7 +492,31 @@ class TestRunner:
             await Database.upsert_result(self.run_id, name, **common_fields)
             # mini-run 模式下就地更新 parent run 的对应行
             if write_to_parent and self.parent_run_id:
-                await Database.upsert_result(self.parent_run_id, name, **common_fields)
+                # 父轮那一行是**追加**重测日志, 不是覆盖 —— 覆盖掉的话, 父轮
+                # 报告里这一项的原始日志就没了, 父轮那份报告的日志也是残缺的
+                # (父轮同样要能当证据用)。
+                #
+                # ⚠️ 追加的是「**基准** + 本项到目前为止的**全部**尝试」, 每次
+                #    重写一遍, 不是一次次往后接。§7.8 重试时本项的日志会变长,
+                #    一次次接的话头一次尝试的日志会在父轮里出现两遍。
+                if name not in self._parent_log_base:
+                    try:
+                        self._parent_log_base[name] = (
+                            (await Database.get_result_log(self.parent_run_id, name)) or ""
+                        )
+                    except Exception:
+                        traceback.print_exc()
+                        self._parent_log_base[name] = ""
+                base = self._parent_log_base[name]
+                if base:
+                    parent_log = (base + "\n"
+                                  + f"───── 以下是第 {self.run_id} 轮重测的日志 ─────\n"
+                                  + result.log)
+                else:
+                    parent_log = result.log
+                await Database.upsert_result(
+                    self.parent_run_id, name, **{**common_fields, "log": parent_log}
+                )
         except Exception as e:
             traceback.print_exc()
             await self._broadcast({
@@ -419,7 +548,7 @@ class TestRunner:
         返回: "retest" / "skip" / "stop" / "timeout"。
 
         这是整个多项目流程里唯一一处「后端主动等」。之前没有它, 后端
-        test_finished → 静默 5s → 下一项 test_started 一路跑到底, 工人
+        test_finished → 静默 3s → 下一项 test_started 一路跑到底, 工人
         还在弹框前犹豫, 后面两项已经跑完了 —— 于是屏幕停在 USB 上, 而
         HDMI 的结果早就写进库了, 日志和画面自然对不上。
 
@@ -526,6 +655,10 @@ class TestRunner:
                 "summary": {"reason": repr(e)},
                 "mode": self.mode,
                 "parent_run_id": self.parent_run_id,
+                # 总结页要显示「哪台机器、什么时候、出的什么事」(§7.2/§7.6)
+                "sn": self.sn,
+                "finished_at": self.finished_at,
+                "error": self.run_error,
             })
 
     async def _run_tests_body(self, enabled_tests, config: dict, write_to_parent: bool):
@@ -536,7 +669,16 @@ class TestRunner:
                 self.run_id, "error",
                 {"reason": "未选择任何测试"}
             )
-            await self._broadcast({"type": "run_finished", "status": "error"})
+            await self._broadcast({
+                "type": "run_finished",
+                "status": "error",
+                "summary": {"reason": "未选择任何测试"},
+                "mode": self.mode,
+                "parent_run_id": self.parent_run_id,
+                "sn": self.sn,
+                "finished_at": self.finished_at,
+                "error": "未选择任何测试",
+            })
             return
 
         await self._broadcast({
@@ -564,9 +706,13 @@ class TestRunner:
             # ── §7.8: 本项可能被要求重测若干次 (插卡 / 插网线) ──
             attempt = 1
             final_status = "pending"
+            # 本项的日志留档从零开始 —— 几次尝试的日志会连着留 (见 _run_one),
+            # 但**不能**把上一项的日志带过来。
+            self._logs[name] = []
+            self._log_truncated.pop(name, None)
             while True:
                 result, instance = await self._run_one(
-                    name, cls, config, write_to_parent
+                    name, cls, config, write_to_parent, attempt=attempt
                 )
                 final_status = result.status
 
@@ -638,6 +784,12 @@ class TestRunner:
             "summary": summary,
             "mode": self.mode,
             "parent_run_id": self.parent_run_id,
+            # 总结页顶部要印「哪台机器、什么时候跑的」(§7.2)。快照恢复出来
+            # 的总结页尤其需要这个 —— 那个总结页可能是**上一轮**的结果, 不标
+            # 出来工人会以为刚刚又测了一遍。
+            "sn": self.sn,
+            "finished_at": self.finished_at,
+            "error": self.run_error,
         })
 
         # 重置 mini-run 标志
@@ -719,6 +871,14 @@ class TestRunner:
         await self._broadcast({"type": "progress", "name": name, "pct": pct, "msg": msg})
 
     async def _on_log(self, name: str, line: str):
+        # **完整留档** —— 报告的「日志附录」要的就是这个 (§8.2: 全量测试日志)。
+        # 界面上看到的每一行, 报告里都得有 —— 屏幕上是全的、纸面上是半截的,
+        # 那纸面这份就不能当证据用。
+        buf = self._logs.setdefault(name, [])
+        if len(buf) >= LOG_MAX_LINES:
+            del buf[0]                       # 挤掉最早的一行, 保住最新的
+            self._log_truncated[name] = self._log_truncated.get(name, 0) + 1
+        buf.append(line)
         await self._broadcast({"type": "log", "name": name, "line": line})
 
     async def _on_metric(self, name: str, key: str, value):

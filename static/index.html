@@ -82,10 +82,15 @@
                             <span v-if="'duration_sec' in tests[t.name]">
                                 时长: <input type="number" v-model.number="tests[t.name].duration_sec" min="5" max="86400" class="num-input"> s
                             </span>
-                            <!-- §6.3 GPU: 轮次可调 (默认 1 = 原单轮行为), 不给时长 -->
+                            <!-- §6.3 GPU: 轮次可调 (默认 1 = 原单轮行为) -->
                             <span v-if="'rounds' in tests[t.name]">
                                 轮次: <input type="number" v-model.number="tests[t.name].rounds" min="1" max="20" class="num-input">
-                                <span class="hint-tag">单轮时长由驱动决定, 不可调</span>
+                                <span class="hint-tag">每轮独立跑一遍, 能看分数衰减</span>
+                            </span>
+                            <!-- §6.3 GPU: 每场景渲染多久 (方案A: 场景集不变, 只压时长) -->
+                            <span v-if="'scene_sec' in tests[t.name]">
+                                每场景: <input type="number" v-model.number="tests[t.name].scene_sec" min="0.5" max="60" step="0.5" class="num-input"> s
+                                <span class="hint-tag">33 个场景 × 这个值 = 一轮时长</span>
                             </span>
                             <!-- §6.8 风扇: 轮转次数可调 (默认 2), 不给时长 -->
                             <span v-if="'cycles' in tests[t.name]">
@@ -102,6 +107,14 @@
                             </span>
                         </div>
                     </div>
+                </div>
+
+                <!-- §8.2 本轮测试人员姓名: 每轮手输 (同一工位会轮班) -->
+                <div class="tester-row">
+                    <label for="tester-name">本轮测试人员</label>
+                    <input id="tester-name" type="text" v-model="testerName"
+                           placeholder="填姓名, 报告上打印这一栏" autocomplete="off">
+                    <span class="hint-tag">打印到报告的「测试人员」栏</span>
                 </div>
 
                 <div class="actions">
@@ -153,7 +166,7 @@
                     <div v-if="currentTest.metrics && Object.keys(currentTest.metrics).length" class="wizard-metrics">
                         <div v-for="(v, k) in currentTest.metrics" :key="k" class="wizard-metric-chip">
                             <span class="metric-label">{{ k }}</span>
-                            <span class="metric-value">{{ typeof v === 'number' ? v.toFixed(1) : v }}</span>
+                            <span class="metric-value">{{ fmtMetricValue(v) }}</span>
                         </div>
                     </div>
 
@@ -185,14 +198,28 @@
             <section class="summary-panel">
                 <div class="summary-header">
                     <div :class="['summary-emoji', lastStatus]">
-                        {{ lastStatus === 'passed' ? '✅' : '❌' }}
+                        {{ summaryEmoji }}
                     </div>
                     <h1 class="summary-title">
                         {{ passedCount }} 通过 / {{ failedCount + errorCount }} 失败 / {{ skippedCount }} 跳过
                     </h1>
                     <div :class="['summary-status', lastStatus]">
-                        {{ lastStatus === 'passed' ? '整体通过' : (lastStatus === 'failed' ? '存在失败项' : '已完成 (部分跳过)') }}
+                        {{ summaryStatusText }}
                     </div>
+                    <!-- §7.2 标明「这一轮是哪台机器、什么时候跑的」。
+                         快照恢复出来的总结页尤其需要: 那个总结页可能是**上一轮**
+                         的结果, 不标出来工人会以为刚刚又测了一遍。 -->
+                    <div class="summary-run-meta" v-if="runSn || runFinishedAt">
+                        SN: {{ runSn || 'unknown' }}<span v-if="runFinishedAt"> · {{ formatTime(runFinishedAt) }}</span>
+                    </div>
+                </div>
+
+                <!-- §7.6 整轮异常终止时的原因。status=error 时各项计数全是 0,
+                     光看「0 通过 / 0 失败 / 0 跳过」根本不知道出了什么事 ——
+                     必须把后端记下的异常原文摆出来, 否则工人只能干瞪眼。 -->
+                <div v-if="runError" class="env-banner warn">
+                    ⚠️ <b>本轮异常终止</b> —— {{ runError }}
+                    <span class="env-note">这一轮的测试项没有跑完, 结果不作数, 请检查后重跑</span>
                 </div>
 
                 <div class="summary-list">
@@ -203,7 +230,7 @@
                             <div v-if="r.metrics && Object.keys(r.metrics).length" class="summary-row-metrics">
                                 <span v-for="(v, k) in r.metrics" :key="k" class="summary-metric">
                                     <span class="summary-metric-k">{{ k }}</span>
-                                    <span class="summary-metric-v">{{ typeof v === 'number' ? v.toFixed(1) : v }}</span>
+                                    <span class="summary-metric-v">{{ fmtMetricValue(v) }}</span>
                                 </span>
                             </div>
                             <!-- §6.6 / §6.4: 环境问题显式披露 —— 不能让「跳过」看起来像「通过」 -->
@@ -288,68 +315,93 @@
                         </tr>
                     </thead>
                     <tbody>
-                        <tr v-for="h in history" :key="h.id" @click="loadHistoryDetail(h.id)">
-                            <td>{{ h.id }}</td>
-                            <td :class="['sn-cell', { 'sn-unknown': !h.sn }]"
-                                :title="h.sn || '这一轮没记到 SN —— 归档前请人工核对设备'">
-                                {{ h.sn || 'unknown' }}
-                            </td>
-                            <td>{{ formatTime(h.started_at) }}</td>
-                            <td>{{ formatDuration(h.started_at, h.finished_at) }}</td>
-                            <td :class="'status-' + h.status">{{ statusText(h.status) }}</td>
-                            <td v-if="h.summary">{{ h.summary.passed }} / {{ h.summary.total }}</td>
-                            <td v-else>-</td>
-                            <!-- 导出状态只用一个记号表示, 不做成整列按钮: 这一列
-                                 唯一的动作是「看/重导」, 逐行放按钮会让人误以为
-                                 每行都要点什么。详情页里才是操作区。 -->
-                            <td :title="h.pdf_path ? '已生成 PDF 报告' : '尚未生成 PDF 报告'">
-                                {{ h.pdf_path ? '📄' : '—' }}
-                            </td>
-                        </tr>
+                        <!-- 一条 run 展开后, 详情**就地插在它下面** —— 不是拉到
+                             页面最底下。记录一多, 详情挂在最下面的话: 点第 3 条
+                             得往下滚半屏才看得见, 而且滚下去之后**分不清哪块
+                             详情是刚点的** —— 上一条还开着, 看着就是两段详情。
+                             展开就地贴着, 视线不用离开刚才点的那个编号。 -->
+                        <template v-for="h in history" :key="h.id">
+                            <tr class="history-row" :class="{ 'is-open': expandedId === h.id }"
+                                @click="toggleHistoryDetail(h.id)">
+                                <td class="history-id">
+                                    <span class="history-mark">{{ expandedId === h.id ? '▾' : '▸' }}</span>{{ h.id }}
+                                </td>
+                                <td :class="['sn-cell', { 'sn-unknown': !h.sn }]"
+                                    :title="h.sn || '这一轮没记到 SN —— 归档前请人工核对设备'">
+                                    {{ h.sn || 'unknown' }}
+                                </td>
+                                <td>{{ formatTime(h.started_at) }}</td>
+                                <td>{{ formatDuration(h.started_at, h.finished_at) }}</td>
+                                <td :class="'status-' + h.status">{{ statusText(h.status) }}</td>
+                                <td v-if="h.summary">{{ h.summary.passed }} / {{ h.summary.total }}</td>
+                                <td v-else>-</td>
+                                <!-- 导出状态只用一个记号表示, 不做成整列按钮: 这一列
+                                     唯一的动作是「看/重导」, 逐行放按钮会让人误以为
+                                     每行都要点什么。详情页里才是操作区。 -->
+                                <td :title="h.pdf_path ? '已生成 PDF 报告' : '尚未生成 PDF 报告'">
+                                    {{ h.pdf_path ? '📄' : '—' }}
+                                </td>
+                            </tr>
+                            <!-- 展开行: 一整行合并成一个单元格, 里面放详情。
+                                 @click.stop —— 详情里有「导出 PDF」按钮, 点了
+                                 不能连带把这一行收起来。 -->
+                            <tr v-if="expandedId === h.id" class="history-expand-row">
+                                <td colspan="7">
+                                    <div class="history-detail"
+                                         v-if="historyDetail && historyDetail.id === h.id"
+                                         @click.stop>
+                                        <h3>
+                                            报告 #{{ historyDetail.id }}
+                                            <span v-if="historyDetail.sn" class="sn-tag">{{ historyDetail.sn }}</span>
+                                            <span v-else class="sn-tag sn-unknown"
+                                                  title="未能从 /proc/cmdline 读到设备 SN, 归档前请人工核对">
+                                                SN unknown
+                                            </span>
+                                            <!-- §8.2 这一轮是谁测的。报告纸上印着, 屏幕上也得看得见 ——
+                                                 归档的人核对的是「人对不对得上」, 只看 SN 认不出人。 -->
+                                            <span class="operator-tag"
+                                                  :title="historyDetail.operator ? '这一轮记录的测试人员' : '这一轮没记测试人员姓名'">
+                                                测试人员: {{ historyDetail.operator || '未填写' }}
+                                            </span>
+                                        </h3>
+
+                                        <!-- §8.2 PDF 操作区。pdf_path 空 = 这一轮没导出过(自动导出
+                                             失败, 或这轮是老库记录), 给「重新导出」而不是给一个
+                                             点了没反应的下载链接。 -->
+                                        <div class="pdf-actions">
+                                            <template v-if="historyDetail.pdf_path">
+                                                <a class="btn-secondary" :href="'/api/history/' + historyDetail.id + '/pdf'"
+                                                   target="_blank" rel="noopener">📄 打开 PDF</a>
+                                                <span class="pdf-note">已导出</span>
+                                            </template>
+                                            <template v-else>
+                                                <button class="btn-secondary" @click="exportPdf(historyDetail.id)"
+                                                        :disabled="exportingId === historyDetail.id">
+                                                    {{ exportingId === historyDetail.id ? '导出中…' : '📄 导出 PDF' }}
+                                                </button>
+                                                <span class="pdf-note">这一轮还没有 PDF 报告</span>
+                                            </template>
+                                        </div>
+                                        <div class="pdf-error" v-if="exportError">{{ exportError }}</div>
+
+                                        <div class="results-list">
+                                            <div class="result-item" v-for="r in historyDetail.results" :key="r.test_name" :class="r.status">
+                                                <div class="result-head">
+                                                    <span class="result-name">{{ displayNameOf(r.test_name) }}</span>
+                                                    <span class="result-status">{{ statusText(r.status) }}</span>
+                                                    <span class="result-time">{{ r.duration_sec ? r.duration_sec.toFixed(1) + 's' : '' }}</span>
+                                                </div>
+                                                <div class="result-error" v-if="r.error">{{ r.error }}</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div v-else class="history-detail-loading">正在加载这一轮的结果…</div>
+                                </td>
+                            </tr>
+                        </template>
                     </tbody>
                 </table>
                 <p v-else class="empty">暂无历史记录</p>
-
-                <div v-if="historyDetail" class="history-detail">
-                    <h3>
-                        报告 #{{ historyDetail.id }}
-                        <span v-if="historyDetail.sn" class="sn-tag">{{ historyDetail.sn }}</span>
-                        <span v-else class="sn-tag sn-unknown"
-                              title="未能从 /proc/cmdline 读到设备 SN, 归档前请人工核对">
-                            SN unknown
-                        </span>
-                    </h3>
-
-                    <!-- §8.2 PDF 操作区。pdf_path 空 = 这一轮没导出过(自动导出
-                         失败, 或这轮是老库记录), 给「重新导出」而不是给一个
-                         点了没反应的下载链接。 -->
-                    <div class="pdf-actions">
-                        <template v-if="historyDetail.pdf_path">
-                            <a class="btn-secondary" :href="'/api/history/' + historyDetail.id + '/pdf'"
-                               target="_blank" rel="noopener">📄 打开 PDF</a>
-                            <span class="pdf-note">已导出</span>
-                        </template>
-                        <template v-else>
-                            <button class="btn-secondary" @click="exportPdf(historyDetail.id)"
-                                    :disabled="exportingId === historyDetail.id">
-                                {{ exportingId === historyDetail.id ? '导出中…' : '📄 导出 PDF' }}
-                            </button>
-                            <span class="pdf-note">这一轮还没有 PDF 报告</span>
-                        </template>
-                    </div>
-                    <div class="pdf-error" v-if="exportError">{{ exportError }}</div>
-
-                    <div class="results-list">
-                        <div class="result-item" v-for="r in historyDetail.results" :key="r.test_name" :class="r.status">
-                            <div class="result-head">
-                                <span class="result-name">{{ displayNameOf(r.test_name) }}</span>
-                                <span class="result-status">{{ statusText(r.status) }}</span>
-                                <span class="result-time">{{ r.duration_sec ? r.duration_sec.toFixed(1) + 's' : '' }}</span>
-                            </div>
-                            <div class="result-error" v-if="r.error">{{ r.error }}</div>
-                        </div>
-                    </div>
-                </div>
             </section>
         </main>
 

@@ -21,6 +21,12 @@ createApp({
         const logEl = ref(null);
         const history = ref([]);
         const historyDetail = ref(null);
+        // 历史页当前**就地展开**的那一条(存 run id, 不是下标 —— 下标会随
+        // 列表刷新而错位, 刷新完就张冠李戴了)。null = 全部收起。
+        //
+        // 同时只展开一条: 展开两处的话, 视线要在两个地方来回跳, 而且分不清
+        // 哪块详情是刚点的 —— 那个更糟。
+        const expandedId = ref(null);
         // §8.2 PDF 重导状态。导出是异步的, 没有这两个 ref 就只能给个
         // 「点了没反应」的黑洞按钮 —— 工人不知道是没点上还是正在跑。
         const exportingId = ref(null);
@@ -39,6 +45,10 @@ createApp({
         const depsInfo = ref(null);  // /api/deps/check 结果
         // §2.2 被测设备 SN, 由 /api/config 一起下发; 取不到是 'unknown'
         const sn = ref('');
+        // §8.2 本轮测试人员**姓名** —— 每轮手输, 因为同一工位会轮班, 报告上
+        // 得写当班的人。初始值是 config.yaml 的 report.operator (后端预填),
+        // 工人不改就直接用。空着也能跑 —— 报告里显示「未填写」, 但**不拦停**。
+        const testerName = ref('');
 
         // 向导专用
         const currentTestIndex = ref(0);
@@ -46,6 +56,14 @@ createApp({
 
         // 保留兼容 (summary 用)
         const lastStatus = ref('');
+        // §7.2 总结页要标出「这一轮测的是哪台机器、什么时候跑的」——
+        // 快照恢复出来的总结页尤其需要: 它可能是**上一轮**的结果, 不标出来
+        // 工人会以为刚刚又测了一遍。
+        const runSn = ref('');
+        const runFinishedAt = ref(0);
+        // §7.6 整轮异常终止的原因(status=error)。没有它, 总结页上只有
+        // 「0 通过 / 0 失败 / 0 跳过」, 工人根本看不出出了什么事。
+        const runError = ref('');
 
         // TF 卡 prompt
         const tfPrompt = ref({ visible: false, testName: '', reason: '' });
@@ -56,6 +74,23 @@ createApp({
         const hasAnyEnabled = computed(() =>
             Object.values(tests).some(t => t.enabled)
         );
+
+        // 总结页顶部的结论词。
+        //
+        // ⚠️ 以前只有 passed / failed 两个分支, 剩下的**一律**显示
+        //    「已完成 (部分跳过)」—— 停止(stopped)和异常(error)也这么说。
+        //    「异常终止」被说成「部分跳过」, 工人会以为只是跳过了几项,
+        //    拿着一个根本没跑完的结果去出货。两种状态必须分开说。
+        const SUMMARY_EMOJI = { passed: '✅', failed: '❌', stopped: '🛑', error: '⚠️' };
+        const SUMMARY_STATUS_TEXT = {
+            passed: '整体通过',
+            failed: '存在失败项',
+            stopped: '已停止',
+            error: '本轮出错',
+        };
+        const summaryEmoji = computed(() => SUMMARY_EMOJI[lastStatus.value] || '❌');
+        const summaryStatusText = computed(
+            () => SUMMARY_STATUS_TEXT[lastStatus.value] || '已完成');
 
         // ── SN 展示 (§7.2) ──
         // **整串原样显示, 不截断。** 原来截成前 8 位 + 省略号, 靠 title 悬停
@@ -158,6 +193,12 @@ createApp({
             const data = await r.json();
             config.value = data;
             sn.value = data.sn || 'unknown';
+            // §8.2 预填本轮测试人员: 后端把 config.yaml 的 report.operator
+            // 一并发下来当默认值。工人可以直接改 (轮班换人), 改了才发。
+            //
+            // ⚠️ loadConfig() 只在挂载时调一次, goConfig() **不重载** ——
+            //    所以这里预填的值不会把工人已经改好的名字冲掉。
+            testerName.value = (data.report && data.report.operator) || '';
             testList.value = data.tests;
             testOrder.value = data.recommended_order && data.recommended_order.length
                 ? [...data.recommended_order]
@@ -209,7 +250,13 @@ createApp({
         };
 
         const startTest = async () => {
-            const req = { tests: { ...tests }, order: testOrder.value };
+            // §8.2 本轮测试人员姓名随请求带上; 空字符串 = 后端回落到
+            // config.yaml 的 report.operator, 再没有才在报告里写「未填写」。
+            const req = {
+                tests: { ...tests },
+                order: testOrder.value,
+                tester_name: String(testerName.value || '').trim(),
+            };
 
             const r = await fetch('/api/test/start', {
                 method: 'POST',
@@ -263,33 +310,105 @@ createApp({
             await syncStatus();
         };
 
+        // 按快照**重建**「这一轮有哪几项」的列表。
+        //
+        // 以前 applySnapshot 里是「往已有的 resultList 上贴」—— 可**刷新页面
+        // 或 WS 断线重连时 resultList 是空的**, 贴了个寂寞: 前面已经跑完的
+        // 几项一个都没恢复, 整页全是「等待」。注释里说的「刷新恢复只补了
+        // 一半」, 补的就是这一半 —— 恢复的**数据**有了, 缺的是**列表本身**。
+        //
+        // 现在改成以快照为准重建:
+        //   · 顺序取 msg.test_queue —— 这一轮**开跑时**定下的队列, 含还没跑
+        //     到的那些。只靠 results 的话, 还没跑的项会整个消失, 进度条的分母
+        //     也不对。
+        //   · 每一项的状态/指标/耗时取 msg.results[name]
+        //   · 快照里还没结果的 → pending
+        // 已经在列表里的项**就地更新**而不重建 —— 保住 pct / 间隔提示这些
+        // 快照里没有的瞬时值。
+        const rebuildResultList = (msg) => {
+            const results = msg.results || {};
+            const queue = (msg.test_queue && msg.test_queue.length)
+                ? msg.test_queue
+                : Object.keys(results);
+            if (!queue.length) return;
+
+            const byName = new Map(resultList.value.map(r => [r.name, r]));
+            const next = [];
+            for (const name of queue) {
+                const snap = results[name];
+                const cur = byName.get(name);
+                if (cur) {
+                    if (snap) {
+                        cur.status = snap.status || cur.status;
+                        cur.metrics = snap.metrics || cur.metrics;
+                        cur.error = snap.error ?? cur.error;
+                        if (snap.duration_sec !== undefined) {
+                            cur.duration_sec = snap.duration_sec;
+                        }
+                    }
+                    next.push(cur);
+                } else {
+                    next.push({
+                        name,
+                        display_name: displayNameOf(name),
+                        status: (snap && snap.status) || 'pending',
+                        pct: 0,
+                        metrics: (snap && snap.metrics) || {},
+                        error: (snap && snap.error) || null,
+                        duration_sec: snap ? snap.duration_sec : undefined,
+                    });
+                }
+            }
+            resultList.value = next;
+        };
+
         // 把后端的运行快照套到界面上。
         // WS 的 `snapshot` 和启动后的补查都走这里 —— 同一套恢复逻辑, 不写两份。
         const applySnapshot = (msg) => {
             if (!msg) return;
-            if (msg.run_id) runId.value = msg.run_id;
-            if (msg.status === 'running') isRunning.value = true;
-
-            // 逐项结果。**不恢复 pct** —— 那是瞬时值, 下一条 progress 就覆盖了,
-            // 硬塞一个陈旧数字反而会让人以为卡在某个百分比上。
-            if (msg.results) {
-                for (const [name, r] of Object.entries(msg.results)) {
-                    const row = resultList.value.find(x => x.name === name);
-                    if (!row) continue;
-                    row.status = r.status;
-                    row.metrics = r.metrics || {};
-                    row.error = r.error;
-                    if (r.duration_sec !== undefined) row.duration_sec = r.duration_sec;
-                }
+            // mini-run 时 runId 仍指向父轮 —— 跟 run_started 的约定一致。
+            // 以前这里是无条件 runId = msg.run_id, mini-run 时会跟那条约定
+            // 打架(一会儿指父轮一会儿指自己), 顺着改掉。
+            if (msg.run_id) {
+                runId.value = (msg.mode === 'mini' && msg.parent_run_id)
+                    ? msg.parent_run_id
+                    : msg.run_id;
             }
+            // isRunning 跟着快照走, **两个方向都要跟**。
+            //
+            // ⚠️ 以前只写 `if (status === 'running') isRunning = true` —— 只进
+            //    不出。isRunning 的另两个出口是 `run_finished` 事件和「返回配置」,
+            //    两条路**都要求 WS 活着**。于是 WS 一断, run_finished 收不到,
+            //    isRunning 就永远卡在 true: 「关闭服务」按钮灰着点不了, 页面也
+            //    不跳结果页 —— 同一个根因的两个症状。
+            //
+            //    快照说「已经跑完了」就必须能把它掰回来: 重连后服务端推的
+            //    snapshot 里 status 已经是 passed/failed/stopped, 照着走就行。
+            //    (status 只有 idle/running/passed/failed/stopped/error 六种)
+            if (msg.status) isRunning.value = (msg.status === 'running');
+            // 这一轮的身份 —— 总结页顶部要印 (§7.2)
+            if (msg.sn) runSn.value = msg.sn;
+            if (msg.finished_at) runFinishedAt.value = msg.finished_at;
+            // 整轮异常终止的原因 (status=error)。快照里没带就不动它 ——
+            // 跟 pdf_path 一个道理, 别拿一个空值把已有的原因冲掉。
+            if (msg.error) runError.value = msg.error;
+
+            // 逐项结果: **以快照为准重建**(见 rebuildResultList 的注释)。
+            // pct 不恢复 —— 那是瞬时值, 下一条 progress 就覆盖了, 硬塞一个
+            // 陈旧数字反而会让人以为卡在某个百分比上。
+            rebuildResultList(msg);
 
             // 当前项 (§7.6 快照恢复)。**不能漏这一步** —— 单项测试时唯一那条
             // test_started 往往早于启动接口的响应到达(两条 TCP 连接无顺序保证),
             // 少了这里, 单项测试就没有当前项、没有进度条。
+            //
+            // ⚠️ 这里**无条件**设索引(以前是 `if (view === 'wizard')` 才设):
+            //    刷新页面时页面在配置页上, 条件不成立 → 索引留在 0 → 就算
+            //    切到向导页, 显示的也是**第一项**而不是正在跑的那一项。
             if (msg.status === 'running' && msg.current_test) {
                 const ri = resultList.value.findIndex(x => x.name === msg.current_test);
                 if (ri >= 0) {
-                    if (view.value === 'wizard') currentTestIndex.value = ri;
+                    currentTestIndex.value = ri;
                     resultList.value[ri].status = 'running';
                 }
             }
@@ -303,19 +422,45 @@ createApp({
                 }
             }
 
+            // §8.2 报告状态。快照带 pdf_path —— 重连后才知道按钮该显示
+            // 「打开 PDF 报告」还是「导出 PDF 报告」(§8.2 规定二选一)。
+            //
+            // ⚠️ **只在有路径时写**, 不能因为快照没带就把已有的清掉: 导出是
+            //    run_finished **之后**才做的, 重连完全可能赶在导出完成之前,
+            //    那时快照里 pdf_path 还是 null, 而 report_ready 事件随后才来。
+            //    无脑清空会把刚出的报告按钮又变回「导出」。
+            if (msg.pdf_path) {
+                reportPath.value = msg.pdf_path;
+                reportRunId.value = msg.run_id ?? runId.value;
+            }
+
             // 整轮已经结束 → 直接出总结。
             // run_finished 同样是 WS 推的, 和这条 HTTP 查询不在一条连接上,
             // 短测试可能在上面那个窗口期里就把整轮跑完并把事件推完了 ——
             // 那时 resultList 还没建好, 总结页就再也不会出现。
-            // resultList 为空时不跳: 那是「从没跑过 / 已重置」, 跳过去是空白页。
+            //
+            // ⚠️ 以前这里还带一个 `resultList.length > 0` 的条件, 用来挡
+            //    「从没跑过」的空总结页。现在 resultList 由快照重建, 条件改成
+            //    「**这一轮真的存在**」(run_id 有值) —— 空的快照(从没跑过)
+            //    照样不跳, 但跑完的轮次**一定**能跳出总结页: 哪怕 WS 断过、
+            //    哪怕页面刷新过。
             const ended = msg.status && msg.status !== 'idle' && msg.status !== 'running';
-            if (ended && resultList.value.length > 0) {
-                tfPrompt.value.visible = false;
-                ethPrompt.value.visible = false;
-                userStopped.value = false;
-                lastStatus.value = msg.status;
-                view.value = 'summary';
-                window._retesting = false;
+            if (ended && msg.run_id) {
+                // 工人正在翻历史记录时**别把他拽走** —— 那是他在主动看别的东西。
+                if (view.value !== 'history') {
+                    tfPrompt.value.visible = false;
+                    ethPrompt.value.visible = false;
+                    userStopped.value = false;
+                    lastStatus.value = msg.status;
+                    view.value = 'summary';
+                    window._retesting = false;
+                }
+            } else if (msg.status === 'running' && view.value === 'main') {
+                // 跑着, 而页面还停在配置页 → 把在跑的这一轮摆出来。
+                // 工人刷新一下页面就以为「没在跑」是最糟的: 他会以为可以再点
+                // 一次开始, 然后被后端一句「已有测试在运行」顶回来, 而界面上
+                // 一个「在跑」的迹象都没有。§7.6「运行态必须能靠快照恢复」。
+                view.value = 'wizard';
             }
         };
 
@@ -374,10 +519,19 @@ createApp({
             tfPrompt.value.visible = false;
             ethPrompt.value.visible = false;
             lastStatus.value = '';
+            // 离开历史页时把展开的详情收掉 —— 回来时列表是新的, 留着旧的
+            // 展开位会让人以为那条记录还在原地。
+            expandedId.value = null;
+            historyDetail.value = null;
         };
-        const goHistory = () => {
+        const goHistory = async () => {
             view.value = 'history';
-            loadHistory();
+            expandedId.value = null;
+            historyDetail.value = null;
+            // 等列表真的拉回来再返回 —— 之前是「发射后不管」, 调用方没法知道
+            // 什么时候能看。测试里要「进历史页 → 立刻点某一行」, 不等的话
+            // 那时列表还是空的, 点的根本不是屏幕上那一行。
+            await loadHistory();
         };
 
         // ========== 失败重测 (§7.7) ==========
@@ -436,6 +590,35 @@ createApp({
         };
         const envReasonText = (code) => ENV_REASON_TEXT[code] || code;
 
+        // 指标值怎么显示在界面上。
+        //
+        // ⚠️ **列表型的指标不能把 JSON 糊在界面上** —— Vue 默认把数组渲染成
+        // `JSON.stringify(v, null, 2)`, 十几行缩进 JSON 挤在一个小方块里,
+        // 工人既看不清、也没法一眼比分数。`rounds_detail`(每轮一条明细)就是
+        // 这种形状: 这里压成**一行摘要**(几条 + 分数), 完整明细在报告(PDF)
+        // 里有一张每轮一行的子表(§8.2.2)。
+        //
+        // 只动**显示**, 不动数据 —— 少一个字段、或者把值算错, 那都是
+        // §9.3 点名的最危险失效模式(静默的「通过」)。
+        const fmtMetricValue = (v) => {
+            if (typeof v === 'number') return v.toFixed(1);
+            if (Array.isArray(v)) {
+                if (!v.length) return '0 条';
+                const rows = v.filter((x) => x && typeof x === 'object' && !Array.isArray(x));
+                if (rows.length !== v.length) return v.length + ' 项';
+                const scores = rows.map((x) => x.score)
+                    .filter((x) => typeof x === 'number');
+                const head = rows.length + ' 条';
+                if (!scores.length) return head;
+                return head + ' · 分数 ' + scores.map((s) => Math.round(s)).join(' / ');
+            }
+            if (v && typeof v === 'object') {
+                const kv = Object.entries(v).map(([k, x]) => k + '=' + x);
+                return kv.length ? kv.join(' ') : '{}';
+            }
+            return v;
+        };
+
         // ========== 交互 prompt (TF 卡 / 网口) ==========
         // 两者同构: 工人处理完物理动作后二选一 —— 重测该项 / 跳过该项。
         //
@@ -481,7 +664,24 @@ createApp({
         };
         const loadHistoryDetail = async (id) => {
             const r = await fetch('/api/history/' + id);
-            historyDetail.value = await r.json();
+            const data = await r.json();
+            // ⚠️ 竞态: 请求是异步的, 期间用户可能已经点了别的行。迟到的
+            //    响应不能盖掉当前展开的那一条 —— 否则展开的是 A 行, 显示的
+            //    却是 B 行的结果(而且**界面上完全看不出错**: 详情块跟着
+            //    展开的行走, 内容却是另一轮的)。
+            if (expandedId.value !== id) return;
+            historyDetail.value = data;
+        };
+        // 点一行 → 就地展开它的详情; 再点同一条 → 收起来。
+        const toggleHistoryDetail = async (id) => {
+            if (expandedId.value === id) {
+                expandedId.value = null;
+                historyDetail.value = null;
+                return;
+            }
+            expandedId.value = id;
+            historyDetail.value = null;      // 清掉上一条的内容, 别闪现
+            await loadHistoryDetail(id);
         };
 
         // §8.2 手动重导 PDF。**只在这一轮上补导**, 不重跑测试 —— 自动导出失败
@@ -694,6 +894,11 @@ createApp({
                     //    没断, 后面照常收消息, 所以别的地方看着都正常, 极难查。
                     //    index.html 也从来没读过它, 属于纯死代码, 直接删。
                     lastStatus.value = msg.status;
+                    // 这一轮的身份 —— 总结页顶部要印 (§7.2)
+                    if (msg.sn) runSn.value = msg.sn;
+                    if (msg.finished_at) runFinishedAt.value = msg.finished_at;
+                    // 整轮异常终止的原因 (§7.6)
+                    if (msg.error) runError.value = msg.error;
                     view.value = 'summary';
                     window._retesting = false;
                     break;
@@ -756,23 +961,31 @@ createApp({
             // state
             view, config, testList, tests, testOrder,
             isRunning, resultList, logs, logEl,
-            history, historyDetail, runId,
+            history, historyDetail, runId, expandedId,
             exportingId, exportError, reportPath, reportError, reportRunId,
             tfPrompt, ethPrompt, currentTestIndex, lastStatus,
             depsInfo, shuttingDown,
+            runSn, runFinishedAt, runError,
             // computed
             snUnknown, snDisplay, snTitle,
             hasAnyEnabled, hasFailedItems, failedCount,
             passedCount, errorCount, skippedCount,
             currentTest, previousTest, overallProgress,
             orderedTests, draggedIdx,
+            testerName,
+            summaryEmoji, summaryStatusText,
             // methods
             statusText, formatTime, formatDuration, displayNameOf, envReasonText,
+            fmtMetricValue,
             selectAll, startTest, stopTest, shutdownService,
-            goConfig, goHistory, retestFailed,
+            goConfig, goHistory, retestFailed, toggleHistoryDetail,
             tfInserted, tfSkip, ethPlugged, ethSkip,
             dragStart, dragOver, dropAt, resetOrder,
             loadConfig, loadDeps, loadHistory, loadHistoryDetail, exportPdf,
+            // 导出 applySnapshot 是为了**可测** —— §7.6 的「靠快照恢复」这条
+            // 规则要能自动验证, 就得能在测试里直接调它 (tests/test_frontend_snapshot.js)。
+            // 它不是给模板用的, 模板里读的都是上面那些 state。
+            applySnapshot,
         };
     }
 }).mount('#app');

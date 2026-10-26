@@ -142,29 +142,66 @@ def _fmt_dur(sec) -> str:
     return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
 
 
-def _stderr_tail(log: str, lines: int = 15) -> str:
-    """从该项日志里挑出末尾的报错行(§8.2: failed/error 附 stderr 末 N 行)。
-
-    挑「含典型报错关键词的行 + 兜底取末尾若干行」, 而不是把整段日志倒序 ——
-    倒序拿到的往往是无关的收尾输出, 报错本身埋在中段, 而那正是要给人看的。
-    """
-    if not log:
-        return ""
-    all_lines = [ln for ln in log.splitlines() if ln.strip()]
-    if not all_lines:
-        return ""
-    kw = re.compile(r"error|fail|denied|timeout|异常|失败|错误|拒绝", re.I)
-    picked = [ln for ln in all_lines if kw.search(ln)][-lines:]
-    if not picked:
-        picked = all_lines[-lines:]
-    return "\n".join(picked)
-
-
 def _report_cfg() -> dict:
     # 用 `or {}`: config.yaml 里写 `report:`(下面全注释掉)时 yaml 解析出的是
     # **None** 而不是 {}。`Config.get("report", {})` 的默认值只在 key 不存在时
     # 才生效, 那种情况下它会返回 None, 后面 .get() 直接炸。
     return Config.get("report") or {}
+
+
+# ── 指标值 → 报告能渲染的形态 ──
+#
+# 子表列名(只认这几个, 认不出的照原样印 —— 别把字段名猜错)
+_SUB_COL_LABELS = {
+    "round": "轮次", "score": "分数", "scenes": "场景数",
+    "scenes_expected": "应跑场景", "elapsed_sec": "耗时(s)",
+    "exit_code": "退出码", "status": "状态", "error": "说明",
+}
+# 一整列都是**这么长的字符串** → 它是原始输出, 不是量化结论 → 归日志附录
+_RAW_TEXT_MIN_LEN = 80
+
+
+def _metric_views(metrics: dict) -> list:
+    """把指标字典变成报告能渲染的形态(每项: 键 / 值 / 可选的子表)。
+
+    **为什么要有这一步**: 指标值里混着两种东西 ——
+      ① **量化结论**(分数、场景数、耗时、退出码) —— 该进指标表;
+      ② **原始输出**(一整段 glmark2 输出) —— 那是**日志**, 归日志附录。
+
+    以前 ② 被 repr 成**一个巨大的单元格**(一行几千字符, 比一页还高): 浏览器
+    只能把这行推到下一页, 于是指标表跟前面的行**断开**(§8.2.2); 而且它还是
+    **截断副本**(每轮只留末尾 20 行)—— 完整的那份本来就在日志附录里。
+    文档里早有规矩: 「报告里日志只有一处, 残缺副本比没有更糟」(§8.2)。
+
+    **改法**: 值是「一串字典」时, 渲染成**每条一行的子表**; 整列都是长文本的
+    (= 原始输出)那一列**不印** —— 读者要原始输出, 去日志附录, 那里一字不少。
+    """
+    views = []
+    for k, v in (metrics or {}).items():
+        view = {"key": k, "value": v, "sub_cols": None, "sub_rows": None}
+        if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+            cols = []
+            for d in v:
+                for ck in d:
+                    if ck not in cols:
+                        cols.append(ck)
+            raw = {c for c in cols
+                   if all(isinstance(d.get(c), str) and len(d.get(c)) > _RAW_TEXT_MIN_LEN
+                          for d in v)}
+            # 整列都是 None 的 → 那一列**没有任何信息**, 印出来是空列
+            empty = {c for c in cols if all(d.get(c) is None for d in v)}
+            cols = [c for c in cols if c not in raw and c not in empty]
+            if cols:
+                view["sub_cols"] = [_SUB_COL_LABELS.get(c, c) for c in cols]
+                view["sub_rows"] = [[d.get(c) for c in cols] for d in v]
+                view["value"] = "(见下表)"
+            else:
+                # 整张表**每一列**都是原始输出/空值 → 什么都不值得印,
+                # 只留一句指路(去日志附录)。别退回 repr —— 那正是把
+                # 「几千字符一个单元格」请回来的路。
+                view["value"] = "(原始输出见日志附录)"
+        views.append(view)
+    return views
 
 
 def render_html(run: dict, results: list, filename: str = "") -> str:
@@ -182,26 +219,68 @@ def render_html(run: dict, results: list, filename: str = "") -> str:
             "display_name": names.get(r.get("test_name"), r.get("test_name") or "?"),
             "status": r.get("status") or "pending",
             "duration": _fmt_dur(r.get("duration_sec")),
-            "metrics": list((r.get("metrics") or {}).items()),
+            "metrics": _metric_views(r.get("metrics") or {}),
             "error": r.get("error"),
-            "stderr_tail": _stderr_tail(r.get("log") or ""),
         })
     skipped_cases = [c for c in cases if c["status"] == "skipped"]
 
-    full_log = "\n".join(
-        f"===== {c['display_name']} [{c['status']}] =====\n" + (r.get("log") or "(无日志)")
-        for c, r in zip(cases, results)
-    ) or "(本次运行无逐项日志)"
+    # ── 日志附录: **每一项的完整日志** (§8.2「全量测试日志」) ──
+    #
+    # 为什么是"完整"而不是"摘一段": 报告是**纸面归档**, 事后拿它去复盘 /
+    # 申诉。摘一段的日志看着像日志, 读的人会以为那就是全部 —— 而缺了头的
+    # 日志比没有日志更坏(没有日志他知道没记录, 缺了头的日志他不知道)。
+    #
+    # 所以这里只认两种情况: 有日志就**全给**; 一行都没有就把原因写清楚
+    # ("本项被跳过, 未执行" / "本项没有产生任何日志") —— 绝不写"(无日志)"
+    # 这种分不清"没记"还是"没跑"的含糊话。
+    log_sections = []
+    for c, r in zip(cases, results):
+        log = (r.get("log") or "").strip()
+        if log:
+            body = log
+        elif c["status"] == "skipped":
+            body = "(本项被跳过, 未执行, 所以没有日志)"
+        else:
+            body = "(本项没有产生任何日志 —— 属异常: 跑过的项都该有日志)"
+        m = r.get("metrics") or {}
+        if m.get("log_truncated"):
+            body += (f"\n⚠ 本项日志过长, 只保留了末尾 {m.get('log_kept_lines')} 行"
+                     f"(前面 {m.get('log_dropped_lines')} 行已丢弃)")
+        log_sections.append(f"===== {c['display_name']} [{c['status']}] =====\n{body}")
+    full_log = "\n\n".join(log_sections) or "(本次运行无逐项日志)"
 
     cfg = run.get("config") or {}
     test_cfgs = (cfg.get("tests") if isinstance(cfg, dict) else None) or {}
+    # 「本次配置快照」只列**本轮勾选了的**项目。
+    #
+    # 为什么: config["tests"] 装的是**整份配置**(勾选 + 没勾选都在里面), 直接
+    # 整个列出来的话, 一轮只跑了 USB 的报告上会并排摆着 cpu / gpu / wifi /
+    # emmc …… 十项配置 —— 纸面上读起来像"这轮测了十项", 而实际只测了一项。
+    # 报告是给产线**归档**用的, 它得能回答"这一轮到底测了什么、用的什么参数",
+    # 没勾的项目摆在那里只会让人误读。
+    #
+    # 判据: `enabled` 为真(= 本轮勾了)。**外加一条兜底**: 实际跑出结果的项
+    # 也要列出来 —— 老库的 run 配置里可能压根没有 `enabled` 这个键(那时按
+    # `_build_test_list` 的 `cfg.get("enabled", False)` 判定, 没键 = 没勾),
+    # 只按 enabled 过滤会让老报告的配置快照整个空掉。
+    ran_names = {r.get("test_name") for r in results if r.get("test_name")}
     config_items = []
     for tname, tv in test_cfgs.items():
-        if isinstance(tv, dict):
-            config_items.append((names.get(tname, tname),
-                                 ", ".join(f"{k}={v}" for k, v in tv.items())))
+        if not isinstance(tv, dict):
+            continue
+        if not (tv.get("enabled") or tname in ran_names):
+            continue
+        # `enabled=True` 不用再列 —— 出现在这张表里本身就是"勾了"的证据。
+        shown = {k: v for k, v in tv.items() if k != "enabled"}
+        config_items.append((names.get(tname, tname),
+                             ", ".join(f"{k}={v}" for k, v in shown.items())))
     if not config_items:
-        config_items = [("(未记录配置快照)", "")]
+        # ⚠️ 两种"空"要分清楚: 压根没记配置 vs 记了但**一项都没勾** ——
+        # 后者是"没选任何测试", 不是"快照丢了", 写同一个占位符会误导人。
+        config_items = [
+            ("(本次未勾选任何测试项)", "") if test_cfgs
+            else ("(未记录配置快照)", "")
+        ]
 
     started, finished = run.get("started_at"), run.get("finished_at")
     total_dur = (float(finished) - float(started)

@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS runs (
     mini_of INTEGER,            -- mini-run 模式: 指向父 run id (NULL = full run)
     error TEXT,                 -- 系统级错误(若有)
     sn TEXT,                    -- §2.2 被测设备 SN, 也用于 PDF 文件名
-    operator TEXT,              -- 工位号
+    operator TEXT,              -- 测试人员姓名(§8.2 报告头「测试人员」行)
     batch TEXT,                 -- 批次号
     pdf_path TEXT               -- §8.2 导出后的 PDF 路径(NULL = 还没导出/导出失败)
 );
@@ -261,6 +261,21 @@ class Database:
                 for r in results
             ]
             return run
+
+    @staticmethod
+    async def get_result_log(run_id: int, test_name: str) -> Optional[str]:
+        """取某一项已落库的日志。
+
+        mini-run 往父轮那一行**追加**重测日志时要用 —— 直接覆盖的话, 父轮
+        报告里这一项的原始日志就没了(父轮那份报告也得是全的)。
+        """
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT log FROM results WHERE run_id=? AND test_name=?",
+                (run_id, test_name)
+            )
+            row = await cur.fetchone()
+            return row[0] if row else None
 
     @staticmethod
     async def find_incomplete_results(run_id: int, statuses: list) -> list:

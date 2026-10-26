@@ -58,6 +58,18 @@ header h1 { font-size: 22px; }
     font-weight: 600;
 }
 
+/* §8.2 历史详情里的「测试人员」。用比例字体(不是等宽)—— 那是个人名,
+   等宽字体会把中文姓名拆得很难看; 空白也要留出, 免得标签和名字粘一起。 */
+.operator-tag {
+    background: #e3f2fd;
+    color: #1565c0;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
 section {
     background: #fff;
     border-radius: 8px;
@@ -200,6 +212,37 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     border-radius: 3px;
     font-size: 12px;
     border: 1px solid #bbdefb;
+}
+
+/* §8.2 本轮测试人员 —— 放在「开始测试」按钮上方一行, 别塞进按钮行:
+   产线工人是「先看这一行, 再按开始」, 挤在按钮里容易被当成按钮的一部分。 */
+.tester-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 16px;
+    font-size: 14px;
+    color: #333;
+    flex-wrap: wrap;
+}
+.tester-row label { font-weight: 500; }
+.tester-row input[type="text"] {
+    width: 200px;
+    padding: 8px 10px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+}
+.tester-row input[type="text"]:focus {
+    outline: none;
+    border-color: #1976d2;
+}
+/* 提示文字压成灰的小字 —— 那一行的主角是「标签 + 输入框」, 提示是配角。
+   ⚠️ 只作用在 .tester-row 里: 别的 .hint-tag 没样式(老代码就这样),
+   别在这儿顺手给它们加规则 —— 那是另一件事, 会动到别的测试项的排版。 */
+.tester-row .hint-tag {
+    font-size: 12px;
+    color: #888;
 }
 
 .actions {
@@ -402,8 +445,20 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     border-bottom: 1px solid #eee;
 }
 .history-table th { background: #fafbfc; font-weight: 500; color: #555; }
-.history-table tbody tr { cursor: pointer; }
-.history-table tbody tr:hover { background: #f5f7fa; }
+/* 只有**数据行**才是可点的。展开行里装着详情和「导出 PDF」按钮 —— 整行
+   cursor:pointer 会让人以为那里也能点(其实点了没反应), 悬停变灰还会把
+   展开行染成一条灰带, 看着像另一条记录。 */
+.history-table tbody tr.history-row { cursor: pointer; }
+.history-table tbody tr.history-row:hover { background: #f5f7fa; }
+/* 展开中的那行: 底色深一点, 一眼能看出「就是这条开着」 */
+.history-table tbody tr.history-row.is-open { background: #eef3f8; }
+.history-table tbody tr.history-row.is-open:hover { background: #e7eef6; }
+/* 展开行: 七个单元格合并成一个, 里面放详情。padding 设 0 —— 间距由里面的
+   .history-detail 负责, 不然两行之间会夹一圈没来由的空隙。 */
+.history-table tbody tr.history-expand-row > td {
+    padding: 0; background: #fafbfc;
+    border-bottom: 1px solid #eee;
+}
 .status-passed { color: #2e7d32; font-weight: 500; }
 .status-failed { color: #c62828; font-weight: 500; }
 .status-stopped { color: #607d8b; font-weight: 500; }
@@ -422,6 +477,14 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .history-detail h3 { display: flex; align-items: center; gap: 10px; }
 
+/* 展开标记(▸/▾): 放在编号前面, 是「这一行可以展开」的提示 */
+.history-id { white-space: nowrap; }
+.history-mark {
+    display: inline-block; width: 1.1em;
+    color: #90a4ae; font-size: 11px; vertical-align: middle;
+}
+.history-row.is-open .history-mark { color: #1976d2; }
+
 .pdf-actions { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
 .pdf-note { color: #999; font-size: 13px; }
 .pdf-error {
@@ -430,7 +493,11 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     color: #e65100; font-size: 13px;
 }
 
-.history-detail { margin-top: 24px; padding-top: 16px; border-top: 2px solid #e1e4e8; }
+/* 详情现在是**就地插在某一行下面**的 —— 不再是挂在页面最底下。所以:
+   去掉原来那条分隔线(上面就是那一行, 底边已经有了), 改成一块浅底色的
+   凹进去的面板, 视觉上明确「这一块属于上面那一条」。 */
+.history-detail { padding: 14px 16px 16px 16px; }
+.history-detail-loading { padding: 14px 16px; color: #999; font-size: 13px; }
 
 /* ============== Wizard (一测试一屏) ============== */
 .wizard-panel {
@@ -641,6 +708,8 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .summary-emoji.passed { color: #2e7d32; }
 .summary-emoji.failed { color: #c62828; }
+.summary-emoji.stopped { color: #ef6c00; }
+.summary-emoji.error { color: #c62828; }
 .summary-title {
     font-size: 24px;
     font-weight: 600;
@@ -655,6 +724,17 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .summary-status.passed { background: #e8f5e9; color: #2e7d32; }
 .summary-status.failed { background: #ffebee; color: #c62828; }
+.summary-status.stopped { background: #fff8e1; color: #ef6c00; }
+.summary-status.error { background: #ffebee; color: #c62828; }
+
+/* §7.2 这一轮是哪台机器、什么时候跑的。灰底小字 —— 它是**身份标注**,
+   不是结论; 结论由上面那个大 emoji 和状态胶囊说。 */
+.summary-run-meta {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #78909c;
+    font-family: ui-monospace, "DejaVu Sans Mono", "Courier New", monospace;
+}
 
 .summary-list {
     display: flex;

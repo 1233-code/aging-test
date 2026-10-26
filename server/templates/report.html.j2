@@ -33,6 +33,9 @@ h2 {
 }
 h3 { font-size: 11pt; margin: 0 0 1.5mm; }
 .meta { color: #546e7a; font-size: 9.5pt; margin-bottom: 4mm; }
+.snapshot-note { color: #546e7a; font-size: 8.5pt; margin: 0 0 1.5mm; }
+/* 逐项段里那句「完整日志见文末」—— 灰字小字, 别抢失败原因的风头 */
+.log-pointer { color: #90a4ae; font-size: 8pt; margin: 1.5mm 0 0; }
 
 table { width: 100%; border-collapse: collapse; }
 th, td {
@@ -71,14 +74,85 @@ th { background: #eceff1; text-align: left; font-weight: 600; }
 .case {
     border: 0.4pt solid #b0bec5; border-radius: 2px;
     padding: 2.5mm 3mm; margin-bottom: 3mm;
-    break-inside: avoid;          /* 一项别跨两页 —— 撕页时项和状态会走散 */
+    /* ⚠️ 2026-10-26 从 `avoid` 改成 `auto` —— 之前是「一项别跨两页」。
+     *
+     * 那条规则的原意是「撕页时项和状态会走散」, 但它的**代价更大**:
+     * 只要这一项(比如 GPU 那张塞满 rounds_detail 的指标表)放不下当前页的
+     * 剩余空间, 整块就被推到下一页 —— 当前页底部空掉一大截(实测空 1/3 页),
+     * 而且整份报告多一页。**该项本身**跨页才是正常的: 长表接着上一项排,
+     * 排不下就顺延, 拆到下一页去。
+     *
+     * 「项和状态会走散」那个担心另有解法 —— 把项名+状态放进**表头组**
+     * (下面 .case-metrics), 表被拆页时表头跟着重复, 续页顶上照样有项名。 */
+    break-inside: auto;
 }
 .case-head {
     display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 1.5mm;
+    break-after: avoid;          /* 标题/状态色块 不跟内容分到两页 */
 }
 .case-name { font-weight: 700; font-size: 11pt; }
 .case-meta { color: #607d8b; font-size: 9pt; }
+
+/* ── 指标表: 表头组在**每一页**都重复 (§8.2 排版) ──
+ *
+ * `<thead>` 是分页媒体里**唯一**能被浏览器重复的内容(chromium 逐页重画
+ * 整个 thead)。所以想「续页也知道这是哪一项」, 项名+状态就得放进 thead ——
+ * 放在 thead 外面的话, 它只出现一次, 表一拆页就丢了。
+ *
+ * thead 第 1 行 = 项名 + 状态 + 耗时(兼作这一项的标题)
+ * thead 第 2 行 = 列名(指标 | 值)
+ *
+ * 代价: 有指标的项, 标题从「表格上方的独立块」变成了「表格第一行」。
+ * 换来的是: 每一页(第 1 页和所有续页)顶上都有「2. GPU 渲染 [passed]」,
+ * 纸面读者撕页后不会认不出是哪一项 —— 这才是原来那条 `break-inside: avoid`
+ * 真正想解决的问题。
+ *
+ * ⚠️ 为什么表头里不写「（续）」: 浏览器**没有**「仅在续页出现」的机制 ——
+ * thead 在首页和续页画的是**同一份**内容, 写死「（续）」会在第 1 页也
+ * 出现「（续）」, 自相矛盾。所以这一行只写**恒真的信息**(项名/状态/耗时):
+ * 首页它就是标题, 续页它就是续表抬头。 */
+.case-metrics thead { display: table-header-group; }
+.case-metrics thead .case-title-cell {
+    background: #fff; text-align: left; font-weight: 400;
+    padding: 2mm 2mm 1.5mm 2mm;
+}
+.case-metrics thead .case-title-cell .case-head { margin-bottom: 0; }
+
+/* 一行 = 一个数据, 别撕成两半。
+ * ⚠️ 巨大的行(比如 GPU 的 rounds_detail, 单个单元格几千字符)超过一页时
+ *   浏览器**只能**把它切开 —— 这条规则对它无效, 但对普通行有效。 */
+table tr { break-inside: avoid; }
+
+/* ── 指标表里的**子表**(值是「一串字典」时, 每条一行) ──
+ *
+ * 为什么要有子表: 以前这种值被 repr 成**一个巨大的单元格**(整段 glmark2
+ * 输出, 一行几千字符, 比一页还高) —— 浏览器只能把这行推到下一页, 表格跟
+ * 前面的行**断开**; 而且它是**截断副本**, 完整的那份在日志附录里。
+ * 拆成「每条一行」之后, 每行都不高, 表格接着前面的行往下排。
+ * 原始输出那种长文本列不在这儿印 —— 读者去日志附录看, 那里一字不少。 */
+.metric-sub-label { color: #78909c; font-size: 8.5pt; margin-bottom: 1mm; }
+.metric-sub { margin: 0; }
+.metric-sub th, .metric-sub td {
+    padding: 1mm 1.5mm; font-size: 8.5pt; border-width: 0.4pt;
+}
+.metric-sub th { background: #f5f7f8; font-weight: 600; }
+
+/* ── 失败原因: **放在表里**(最后一行), 不放在表外 ──
+ *
+ * 放外面(表格之后跟一个 .warn-box 块)会有个坏落位: 指标表刚好在第 1 页
+ * 排完、失败框放不下 → 框被推到第 2 页, 而那页顶上**既没有项名也没有状态**
+ * —— 纸面读者看到一页孤零零的「失败原因: ...」, 根本认不出是哪一项失败。
+ * (2026-10-26 实测: 48 种内容长度组合里 3 种能复现。)
+ *
+ * 放进表里就是表的最后一行, 跟着表头组一起重复 —— 续页上必带项名+状态。 */
+.case-fail td { border: 0; padding: 0; }
+.fail-reason {
+    border: 1.2pt solid #ef6c00; background: #fff8e1;
+    padding: 2.5mm 3mm; margin: 2mm;
+    break-inside: avoid;          /* 原因短的话别撕成两半 */
+}
+.fail-reason .t { font-weight: 700; color: #e65100; }
 
 /* §8.2 日志附录: 独立分页 */
 .log-appendix { break-before: page; }
@@ -86,7 +160,15 @@ pre.log {
     font-family: "DejaVu Sans Mono", monospace; font-size: 7.6pt;
     line-height: 1.32; white-space: pre-wrap; word-break: break-all;
     background: #fafafa; border: 0.4pt solid #cfd8dc;
-    padding: 2.5mm; margin: 0; max-height: 235mm; overflow: hidden;
+    padding: 2.5mm; margin: 0;
+    /* ⚠️ 这里**不能**有 max-height / overflow: hidden。
+       原来写的是 `max-height: 235mm; overflow: hidden` —— 那是"塞进一页"
+       的取巧写法, 代价是: 日志超过一页, 超出部分被**静默剪掉**, 而报告上
+       一点看不出来。被剪掉的恰恰是**尾巴** —— 报错、失败原因都在尾巴上。
+       剪掉的日志比半截日志更坏: 半截至少还看得出是半截, 剪掉的看起来是
+       完整的。
+       现在改成让 <pre> 自然长高, 由 chromium 自己分页 —— 长就多几页,
+       一行都不少。 */
 }
 .footer-note { margin-top: 4mm; color: #78909c; font-size: 8.5pt; }
 </style>
@@ -101,10 +183,12 @@ pre.log {
 {# ───────────── 报告头 (§8.2) ───────────── #}
 <table class="kv">
     <tr><td>被测设备 SN</td><td>{{ run.sn or 'unknown' }}</td></tr>
-    {# 工位号/批次号没填就都写「未填写」—— 同一张表里两个占位符不一样
-       (一个 unknown 一个 —) 看着像两种状态, 其实都是「没填」。SN 那行例外:
-       它的 'unknown' 是有语义的哨兵值(见下面的黄条告警), 不能换成中文。 #}
-    <tr><td>工位号</td><td>{{ run.operator or '未填写' }}</td></tr>
+    {# 测试人员/批次号没填都写「未填写」—— 这两行曾经一个写 unknown 一个写 —,
+       同一张表里两个占位符不一样、看着像两种状态, 其实都是「没填」。SN 那行
+       例外: 它的 'unknown' 是有语义的哨兵值(见下面的黄条告警), 不能换成中文。
+       ⚠️ 本行填的是**测试人员姓名**, 不是工号 —— 产线核对人靠的是名字,
+       工号是人事系统的编号, 纸质报告上没人认。 #}
+    <tr><td>测试人员</td><td>{{ run.operator or '未填写' }}</td></tr>
     <tr><td>批次号</td><td>{{ run.batch or '未填写' }}</td></tr>
     <tr><td>开始时间</td><td>{{ started_at }}</td></tr>
     <tr><td>结束时间</td><td>{{ finished_at }}</td></tr>
@@ -162,6 +246,70 @@ pre.log {
 <h2>逐项结果</h2>
 {% for c in cases %}
 <div class="case">
+    {% if c.metrics %}
+    {# ── 有指标 → 标题进表头组 ──
+       表头组会被浏览器**逐页重复**, 所以这一项被拆到下一页时, 下一页顶上
+       会再出现一次「项名 + 状态 + 耗时」—— 撕页后仍认得出是哪一项。 #}
+    <table class="case-metrics">
+        <thead>
+            <tr>
+                <th colspan="2" class="case-title-cell">
+                    <div class="case-head">
+                        <span class="case-name">{{ loop.index }}. {{ c.display_name }}</span>
+                        <span>
+                            <span class="st st-{{ c.status }}">{{ c.status }}</span>
+                            <span class="case-meta">{{ c.duration }}</span>
+                        </span>
+                    </div>
+                </th>
+            </tr>
+            <tr><th style="width:46mm">指标</th><th>值</th></tr>
+        </thead>
+        <tbody>
+        {% for m in c.metrics %}
+            <tr>
+                <td>{{ m.key }}</td>
+                <td>
+                {% if m.sub_cols %}
+                    {# 值是「一串字典」→ 渲染成**每条一行**的子表(§8.2 排版)。
+                       原始输出那种长文本列不在这儿印 —— 完整的那份在日志附录。 #}
+                    <div class="metric-sub-label">{{ m.value }}</div>
+                    <table class="metric-sub">
+                        <thead>
+                            <tr>{% for col in m.sub_cols %}<th>{{ col }}</th>{% endfor %}</tr>
+                        </thead>
+                        <tbody>
+                        {% for row in m.sub_rows %}
+                            {# None 印成空 —— 印成 "None" 像是出了什么故障 #}
+                            <tr>{% for cell in row %}<td>{{ cell if cell is not none else '' }}</td>{% endfor %}</tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    {{ m.value }}
+                {% endif %}
+                </td>
+            </tr>
+        {% endfor %}
+        {# §8.2: failed / error 必须给完整原因, 不能只有状态色块。
+           原因**放在表的最后一行** —— 放表外的话它可能被单独推到下一页,
+           那页顶上没有项名, 读者认不出是哪一项失败(见 CSS 里 .fail-reason)。 #}
+        {% if c.status in ('failed', 'error') %}
+        <tr class="case-fail">
+            <td colspan="2">
+                <div class="fail-reason">
+                    <div class="t">{{ '失败原因' if c.status == 'failed' else '错误原因' }}</div>
+                    {{ c.error or '（未记录原因 —— 属实现缺陷: failed/error 必须写 error 字段）' }}
+                </div>
+            </td>
+        </tr>
+        {% endif %}
+        </tbody>
+    </table>
+    {% else %}
+    {# ── 没指标 → 标题只能是独立块 ──
+       (没有表就没有表头组, 也就不存在「续页重复」这回事 ——
+        何况没指标的项都很短, 不会跨页) #}
     <div class="case-head">
         <span class="case-name">{{ loop.index }}. {{ c.display_name }}</span>
         <span>
@@ -169,30 +317,23 @@ pre.log {
             <span class="case-meta">{{ c.duration }}</span>
         </span>
     </div>
-
-    {% if c.metrics %}
-    <table>
-        <thead><tr><th style="width:46mm">指标</th><th>值</th></tr></thead>
-        <tbody>
-        {% for k, v in c.metrics %}
-            <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
-        {% endfor %}
-        </tbody>
-    </table>
-    {% endif %}
-
-    {# §8.2: failed / error 必须给完整原因, 不能只有状态色块 #}
+    {# 没指标的项, 原因还是独立框 —— 但 .case-head 上有 break-after: avoid,
+       标题不会被甩到上一页, 框不会跟标题分家。 #}
     {% if c.status in ('failed', 'error') %}
     <div class="warn-box">
         <div class="t">{{ '失败原因' if c.status == 'failed' else '错误原因' }}</div>
         {{ c.error or '（未记录原因 —— 属实现缺陷: failed/error 必须写 error 字段）' }}
     </div>
     {% endif %}
-
-    {% if c.stderr_tail %}
-    <h3>stderr 末若干行</h3>
-    <pre class="log">{{ c.stderr_tail }}</pre>
     {% endif %}
+
+    {# 逐项段**不再**放日志摘录 ——
+       原来这里印的是「stderr 末若干行」(末尾 15 行, 还按关键词筛过),
+       那是同一份日志的**残缺副本**。残缺副本比没有更糟: 纸面读者看着
+       有一段日志, 会以为那就是全部, 不会想到要去翻文末的附录。
+       现在报告里**只有一处**日志 —— 文末的「日志附录」, 每一项的**完整**
+       日志。逐项段只留一句指路, 免得读者以为这一项没有日志。 #}
+    <p class="log-pointer">本项完整日志见文末「日志附录」。</p>
 </div>
 {% endfor %}
 
@@ -204,6 +345,8 @@ pre.log {
 
 {# ───────────── 配置快照 (§8.2 报告头要求) ───────────── #}
 <h2>本次配置快照</h2>
+{# 只列本轮勾选并执行的项目 —— 但**得说清楚**, 否则纸面读者会以为报告漏了 #}
+<p class="snapshot-note">仅列本轮勾选并执行的项目（未勾选的项目不在此表内）。</p>
 <table class="kv">
 {% for k, v in config_items %}
     <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
@@ -213,6 +356,10 @@ pre.log {
 {# ───────────── 日志附录: 独立分页 (§8.2) ───────────── #}
 <div class="log-appendix">
     <h2>日志附录</h2>
+    {# 写清楚「这是完整日志」—— 否则读者会以为是节选, 白白去别处找 #}
+    {# 「原地重绘已还原」也得说: 测试工具(memtester 4.x)用退格符原地重绘
+       进度, 落库前已按终端规矩还原 —— 免得读者对着原始字节比对时以为少东西 #}
+    <p class="snapshot-note">下列为本轮<strong>每一项的完整日志</strong>（未截断、未删节；测试工具的原地重绘进度已还原为最终状态）。</p>
     <pre class="log">{{ full_log }}</pre>
 </div>
 

@@ -150,6 +150,11 @@ async def get_config():
         # §2.2 / §7.2: SN 常驻显示在页面顶部。跟着 /api/config 一起下发而不是
         # 单开一个接口 —— 页面本来就要拉它, 多一次请求没有收益。
         "sn": identity.get_sn(),
+        # §8.2 本轮测试人员姓名的**默认值** —— 前端拿它预填输入框。
+        # 工人可以每轮改; 不改就直接用这个值(多半就是当班的人)。
+        "report": {
+            "operator": (Config.get("report") or {}).get("operator") or "",
+        },
     }
 
 
@@ -157,6 +162,10 @@ async def get_config():
 class StartRequest(BaseModel):
     tests: dict                     # {"cpu": {"enabled": true, "duration_sec": 60}, ...}
     order: Optional[List[str]] = None  # §7.6 用户拖动后的执行顺序 (空则用推荐序)
+    # §8.2 本轮测试人员**姓名**。每轮手输 —— 同一工位轮班时, 报告上得写当班
+    # 的人, 不能是 config.yaml 里写死的那一个。留空则回落到 config.yaml 的
+    # report.operator (前端会用它预填输入框, 所以多数时候其实不用手输)。
+    tester_name: str = ""
 
 
 @app.post("/api/test/start")
@@ -168,6 +177,17 @@ async def test_start(req: StartRequest):
     }
     # 也把整个 yaml config 灌进去
     config.update(Config.all())
+    # §8.2 本轮测试人员: **前端手填的优先**, 没填才回落到 config.yaml 的
+    # report.operator。
+    #
+    # ⚠️ 必须放在 config.update() **之后**: update() 会用 yaml 里的整个 report
+    # 段盖掉前面拼的 config, 提前写会被**静默冲掉** —— 表现是「填了姓名,
+    # 报告里还是未填写」, 而且日志上一点异常都没有。
+    rep = dict(config.get("report") or {})
+    name = (req.tester_name or "").strip()
+    if name:
+        rep["operator"] = name
+    config["report"] = rep
     return await runner.start(config)
 
 
