@@ -21,9 +21,13 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const APP_JS = path.join(__dirname, '..', 'static', 'app.js');
+/* AGING_APP_JS: 指到别处去, 就能对着**副本**跑 app.js ——
+ * 用来做「变异测试」: 把副本改坏, 断言必须红, 否则这测试是个摆设。
+ * (配合 AGING_STATIC_DIR 一起用, 副本里 html/css/js 是同一套。) */
+const APP_JS = process.env.AGING_APP_JS
+    || path.join(__dirname, '..', 'static', 'app.js');
 
-function makeVue(grab) {
+function makeVue(grab, sockets, mount) {
     return {
         createApp(options) {
             return {
@@ -37,7 +41,17 @@ function makeVue(grab) {
         reactive: (o) => o,
         computed: (fn) => ({ get value() { return fn(); } }),
         watch: () => {},
-        onMounted: () => {},
+        // ⚠️ 默认**不跑** onMounted 的回调 —— 它会去 loadConfig / connectWS,
+        //    那是启动流程, 不是每个用例都要的东西。
+        //    opts.mount = true 时才真跑 (想测「收到某条 WS 事件之后界面变成
+        //    什么样」就得开这个 —— WS 是在 onMounted 里连上的)。
+        onMounted: (fn) => {
+            if (!mount) return;
+            try {
+                const r = fn();
+                if (r && typeof r.catch === 'function') r.catch(() => {});
+            } catch (e) { /* 启动失败不该让用例炸掉 */ }
+        },
         nextTick: () => Promise.resolve(),
     };
 }
@@ -46,27 +60,50 @@ function makeVue(grab) {
  * @param {object} [opts]
  * @param {function} [opts.fetch]  fetch 桩 —— 默认直接 reject(测试里不该
  *                                   真发网络请求)。要测网络交互就自己传。
+ * @param {boolean} [opts.mount]   真跑 onMounted(连 WS)。开了之后
+ *                                   app.__sockets 里能拿到假 socket,
+ *                                   调 ws.onmessage({data: JSON.stringify(msg)})
+ *                                   就能喂一条 WS 事件进去。
  */
 function loadApp(opts) {
     opts = opts || {};
     const src = fs.readFileSync(APP_JS, 'utf8');
     let app = null;
+    const sockets = [];
     const ctx = {
-        Vue: makeVue((a) => { app = a; }),
-        window: {},
+        Vue: makeVue((a) => { app = a; }, sockets, opts.mount),
+        // window / document 只提供 app.js 在**启动流程**里用到的那几个空壳方法
+        // (addEventListener / visibilitychange) —— 少了它们, onMounted 会在
+        // 第一行就抛, 后面的 loadConfig / connectWS 全都跑不到。
+        window: { addEventListener: () => {}, removeEventListener: () => {} },
+        document: { addEventListener: () => {}, removeEventListener: () => {} },
         console,
         setTimeout, clearTimeout, setInterval, clearInterval,
         fetch: opts.fetch || (() => Promise.reject(new Error('测试里不该发网络请求'))),
+        // confirm / alert 是浏览器里**会打断人的**两个函数 —— 测试里必须换成
+        // 假实现, 否则一点「重测」就卡在那儿等真人点确定。
+        // 默认: confirm 一律同意, alert 记进 opts.alerts 里供断言。
+        confirm: opts.confirm || (() => true),
+        alert: opts.alert || ((msg) => { ctx.__alerts.push(String(msg)); }),
         location: { protocol: 'http:', host: '127.0.0.1:8000' },
         navigator: {},
-        WebSocket: function () { this.close = () => {}; },
+        WebSocket: function () {
+            this.close = () => {};
+            this.send = () => {};
+            this.readyState = 1;
+            sockets.push(this);
+        },
         JSON, Math, Date, Object, Array, Map, Set, String, Number, Boolean,
         Promise, Error, isNaN, parseInt, parseFloat,
     };
+    ctx.WebSocket.OPEN = 1;
+    ctx.__alerts = [];
     ctx.globalThis = ctx;
     vm.createContext(ctx);
     vm.runInContext(src, ctx, { filename: 'app.js' });
     if (!app) throw new Error('setup() 没跑起来');
+    app.__sockets = sockets;
+    app.__alerts = ctx.__alerts;
     return app;
 }
 

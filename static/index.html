@@ -29,7 +29,8 @@
             <div class="header-right">
                 <span class="device-tag" v-if="config">设备配置: {{ Object.keys(config.interfaces || {}).length }} 接口</span>
                 <button class="btn-text" v-if="view === 'main'" @click="goHistory">历史记录</button>
-                <button class="btn-text" v-else @click="goConfig">← 返回配置</button>
+                <button class="btn-text" v-else @click="goConfig" :disabled="isRunning"
+                    :title="isRunning ? '测试运行中不能返回配置页' : '返回配置页'">← 返回配置</button>
                 <!-- 关闭服务: 工人不敲命令, 关服务的唯一入口。跑测试时禁用。 -->
                 <button
                     class="btn-shutdown"
@@ -59,17 +60,40 @@
         <!-- =============== 配置页 =============== -->
         <main v-if="view === 'main'">
             <section class="config-panel">
-                <h2>测试配置</h2>
+                <!-- 标题行: 左边「测试配置」, 右边一排按钮。
+                     2026-10-27: 「↺ 重置顺序」按钮**删掉**了 —— 下面 10 项
+                     的顺序已经固定成 §7.6 的推荐执行顺序, 拖不动也用不着
+                     复位; 留着它反而给人「顺序是能乱的」的错觉。
+                     「▶ 开始测试」顶了它原来的位置(最右), 和「全选/全不选」
+                     排在一起。 -->
+                <div class="config-head">
+                    <h2>测试配置</h2>
+                    <div class="config-head-actions">
+                        <button class="btn-secondary" @click="selectAll(true)">全选</button>
+                        <button class="btn-secondary" @click="selectAll(false)">全不选</button>
+                        <button class="btn-primary" @click="startTest" :disabled="!hasAnyEnabled">▶ 开始测试</button>
+                    </div>
+                </div>
+
+                <!-- §8.2 本轮测试人员: 放在「测试配置」下面**第一个**。
+                     工人是「先签名, 再挑项, 最后开始」—— 姓名原来埋在
+                     10 项列表的最末尾, 常常是勾完一轮才发现没填, 报告
+                     里只能写「未填写」, 事后追不到人。 -->
+                <div class="tester-row">
+                    <label for="tester-name">本轮测试人员</label>
+                    <input id="tester-name" type="text" v-model="testerName"
+                           placeholder="填姓名, 报告上打印这一栏" autocomplete="off">
+                    <span class="hint-tag">打印到报告的「测试人员」栏</span>
+                </div>
+
+                <!-- 10 项的顺序**固定**成 §7.6 的推荐执行顺序(轻量 → 接口 →
+                     射频 → 重载), 拖不动。2026-10-27 去掉了拖拽排序和
+                     「↺ 重置顺序」—— 顺序乱了没有按钮能复位, 而这个顺序
+                     本来就是算出来的(重载项放最后, 避免热累积污染轻量项)。 -->
                 <div class="test-list">
                     <div class="test-item"
-                         v-for="(t, idx) in orderedTests"
-                         :key="t.name"
-                         :draggable="true"
-                         @dragstart="dragStart($event, idx)"
-                         @dragover="dragOver"
-                         @drop="dropAt($event, idx)"
-                         :class="{ dragging: draggedIdx === idx }">
-                        <span class="drag-handle" title="拖动调整顺序">⋮⋮</span>
+                         v-for="t in orderedTests"
+                         :key="t.name">
                         <label class="test-row">
                             <input type="checkbox" v-model="tests[t.name].enabled">
                             <span class="test-name">{{ t.display_name }}</span>
@@ -108,26 +132,13 @@
                         </div>
                     </div>
                 </div>
-
-                <!-- §8.2 本轮测试人员姓名: 每轮手输 (同一工位会轮班) -->
-                <div class="tester-row">
-                    <label for="tester-name">本轮测试人员</label>
-                    <input id="tester-name" type="text" v-model="testerName"
-                           placeholder="填姓名, 报告上打印这一栏" autocomplete="off">
-                    <span class="hint-tag">打印到报告的「测试人员」栏</span>
-                </div>
-
-                <div class="actions">
-                    <button class="btn-secondary" @click="selectAll(true)">全选</button>
-                    <button class="btn-secondary" @click="selectAll(false)">全不选</button>
-                    <button class="btn-text" @click="resetOrder" title="恢复推荐顺序">↺ 重置顺序</button>
-                    <button class="btn-primary" @click="startTest" :disabled="!hasAnyEnabled">▶ 开始测试</button>
-                </div>
             </section>
         </main>
 
         <!-- =============== 向导式测试页 (一个测试一个界面) =============== -->
-        <main v-else-if="view === 'wizard'">
+        <!-- main-fill: 这一屏**撑满视口高度**, 日志框顶到屏幕底
+             (2026-10-27 产线要求「日志显示拉长一点, 顶到界面底部」)。 -->
+        <main v-else-if="view === 'wizard'" class="main-fill">
             <section class="wizard-panel">
                 <div class="wizard-header">
                     <div class="wizard-step-counter">
@@ -185,10 +196,12 @@
                     </div>
                 </div>
 
-                <!-- 实时日志 -->
+                <!-- 实时日志。显示多少行**跟着框的实际高度走**(logVisibleLines,
+                     由 app.js 按 clientHeight 算), 不写死 —— 框拉高到 700px
+                     还只显示 30 行的话, 下面一半是空的。 -->
                 <div class="wizard-log">
                     <h3>实时日志</h3>
-                    <pre class="wizard-log-stream" ref="logEl">{{ logs.slice(-30).join('\n') }}</pre>
+                    <pre class="wizard-log-stream" ref="logEl">{{ logs.slice(-logVisibleLines).join('\n') }}</pre>
                 </div>
             </section>
         </main>
@@ -203,12 +216,33 @@
                     <h1 class="summary-title">
                         {{ passedCount }} 通过 / {{ failedCount + errorCount }} 失败 / {{ skippedCount }} 跳过
                     </h1>
+                    <!-- §9.2 行 1593/1595: 汇总行必须披露未测项, 并把通过率与
+                         「已测 M / 共勾选 K」一起摆出来 —— 光看「8 通过 / 0 失败」
+                         分不清是「8 项全测过」还是「勾了 10 项只测了 8 项」。
+                         skipped 与 stopped 都算「未测」, 但原因不同:
+                         skipped = 主动跳 / 环境原因, stopped = 中途停止没跑到。 -->
+                    <div class="summary-rate" v-if="executedCount">
+                        通过率 {{ passRateText }}
+                        <span class="summary-rate-note">(已测 {{ executedCount }} / 共勾选 {{ plannedCount }})</span>
+                    </div>
+                    <div class="env-banner warn" v-if="notTestedItems.length">
+                        ⚠️ <b>本次有 {{ notTestedItems.length }} 项未测</b> —— {{ notTestedText }}
+                        <span class="env-note">未测项不计入通过率, 需人工确认是否放行</span>
+                    </div>
                     <div :class="['summary-status', lastStatus]">
                         {{ summaryStatusText }}
                     </div>
                     <!-- §7.2 标明「这一轮是哪台机器、什么时候跑的」。
                          快照恢复出来的总结页尤其需要: 那个总结页可能是**上一轮**
                          的结果, 不标出来工人会以为刚刚又测了一遍。 -->
+                    <!-- §7.7 合并重测: 这一轮是「记录 #N 的重测轮」, 结果已经并回
+                         那条记录了 —— **说清楚**, 免得工人以为刚才只测了重测的那
+                         几项(页面上「5 通过」是合并后的口径, 不是这一轮的)。 -->
+                    <div v-if="mergedParent" class="env-banner">
+                        ✅ <b>已合并到记录 #{{ mergedParent }}</b> —— 上面是**合并后**的结果
+                        (原来通过的项 + 重测后通过的项), 那一份报告也已更新。
+                        <span class="env-note">历史记录里那条现在排在最上面</span>
+                    </div>
                     <div class="summary-run-meta" v-if="runSn || runFinishedAt">
                         SN: {{ runSn || 'unknown' }}<span v-if="runFinishedAt"> · {{ formatTime(runFinishedAt) }}</span>
                     </div>
@@ -310,7 +344,13 @@
                             <th>开始时间</th>
                             <th>耗时</th>
                             <th>状态</th>
-                            <th>通过/失败</th>
+                            <!-- ⚠️ 表头写「通过/已测」, 不是「通过/失败」 ——
+                                 格子里是 `passed / total`, 而 total 的口径是
+                                 **实际执行并出结论的项数**(§9.2), 失败只是它的一部分。
+                                 写成「通过/失败」会让人以为分母是失败数 —— 1/8
+                                 读起来像「1 个通过 / 8 个失败」, 而实际是
+                                 「8 项里通过了 1 项」。 -->
+                            <th>通过/已测</th>
                             <th>PDF</th>
                         </tr>
                     </thead>
@@ -332,7 +372,22 @@
                                 </td>
                                 <td>{{ formatTime(h.started_at) }}</td>
                                 <td>{{ formatDuration(h.started_at, h.finished_at) }}</td>
-                                <td :class="'status-' + h.status">{{ statusText(h.status) }}</td>
+                                <td :class="'status-' + h.status">
+                                    {{ statusText(h.status) }}
+                                    <!-- §7.7 这条记录被重测过几轮, 几轮之后(没)通过。
+                                         ⚠️ 措辞要让工人一眼看出「这是**这一条记录**自己的
+                                         重测次数」—— 原来写「第 N 次重测通过」, 会被
+                                         读成「这条记录是第 N 次重测」。现在写
+                                         「重测 N 轮后通过」: 主语是这条记录, 轮数是
+                                         次数, 不会跟「重测轮」那条混。 -->
+                                    <span v-if="h.retest_count" class="retest-tag"
+                                          :class="{ 'still-failed': h.status !== 'passed' }"
+                                          :title="h.status === 'passed'
+                                              ? '这一条记录重测 ' + h.retest_count + ' 轮后全部通过 —— 报告已合并更新'
+                                              : '这一条记录已经重测过 ' + h.retest_count + ' 轮, 仍有项没通过'">
+                                        重测 {{ h.retest_count }} 轮{{ h.status === 'passed' ? '后通过' : '后未过' }}
+                                    </span>
+                                </td>
                                 <td v-if="h.summary">{{ h.summary.passed }} / {{ h.summary.total }}</td>
                                 <td v-else>-</td>
                                 <!-- 导出状态只用一个记号表示, 不做成整列按钮: 这一列
@@ -350,45 +405,112 @@
                                     <div class="history-detail"
                                          v-if="historyDetail && historyDetail.id === h.id"
                                          @click.stop>
-                                        <h3>
-                                            报告 #{{ historyDetail.id }}
-                                            <span v-if="historyDetail.sn" class="sn-tag">{{ historyDetail.sn }}</span>
-                                            <span v-else class="sn-tag sn-unknown"
-                                                  title="未能从 /proc/cmdline 读到设备 SN, 归档前请人工核对">
-                                                SN unknown
-                                            </span>
-                                            <!-- §8.2 这一轮是谁测的。报告纸上印着, 屏幕上也得看得见 ——
-                                                 归档的人核对的是「人对不对得上」, 只看 SN 认不出人。 -->
-                                            <span class="operator-tag"
-                                                  :title="historyDetail.operator ? '这一轮记录的测试人员' : '这一轮没记测试人员姓名'">
-                                                测试人员: {{ historyDetail.operator || '未填写' }}
-                                            </span>
-                                        </h3>
+                                        <!-- 标题在左, 操作在右 (§7.7 合并重测)。
+                                             「重测失败项」摆在右边 —— 它是这一轮最想做的
+                                             动作(这一轮不合格, 就地把它修好), 不该藏在
+                                             下面的 PDF 那一行里。 -->
+                                        <div class="history-detail-head">
+                                            <h3>
+                                                报告 #{{ historyDetail.id }}
+                                                <span v-if="historyDetail.sn" class="sn-tag">{{ historyDetail.sn }}</span>
+                                                <span v-else class="sn-tag sn-unknown"
+                                                      title="未能从 /proc/cmdline 读到设备 SN, 归档前请人工核对">
+                                                    SN unknown
+                                                </span>
+                                                <!-- §8.2 这一轮是谁测的。报告纸上印着, 屏幕上也得看得见 ——
+                                                     归档的人核对的是「人对不对得上」, 只看 SN 认不出人。 -->
+                                                <span class="operator-tag"
+                                                      :title="historyDetail.operator ? '这一轮记录的测试人员' : '这一轮没记测试人员姓名'">
+                                                    测试人员: {{ historyDetail.operator || '未填写' }}
+                                                </span>
+                                                <!-- §7.7 这条记录被重测过几轮 -->
+                                                <span v-if="historyDetail.retest_count"
+                                                      class="retest-tag"
+                                                      :title="'这条记录被重测过 ' + historyDetail.retest_count + ' 轮, 下面是合并后的结果'">
+                                                    重测 {{ historyDetail.retest_count }} 轮
+                                                </span>
+                                            </h3>
 
-                                        <!-- §8.2 PDF 操作区。pdf_path 空 = 这一轮没导出过(自动导出
-                                             失败, 或这轮是老库记录), 给「重新导出」而不是给一个
-                                             点了没反应的下载链接。 -->
-                                        <div class="pdf-actions">
-                                            <template v-if="historyDetail.pdf_path">
-                                                <a class="btn-secondary" :href="'/api/history/' + historyDetail.id + '/pdf'"
-                                                   target="_blank" rel="noopener">📄 打开 PDF</a>
-                                                <span class="pdf-note">已导出</span>
-                                            </template>
-                                            <template v-else>
-                                                <button class="btn-secondary" @click="exportPdf(historyDetail.id)"
-                                                        :disabled="exportingId === historyDetail.id">
-                                                    {{ exportingId === historyDetail.id ? '导出中…' : '📄 导出 PDF' }}
+                                            <div class="history-detail-actions">
+                                                <!-- §7.7 重测失败项 —— 和总结页那个按钮是**同一个**
+                                                     功能, 只是目标不同: 这里重测的是**这条记录**。
+                                                     只给正式轮出: 重测轮是过程, 归档对象始终是
+                                                     最初那一轮, 在重测轮上再重测只会套娃。 -->
+                                                <button v-if="!historyDetail.mini_of && historyFailedNames(historyDetail).length"
+                                                        class="btn-warning"
+                                                        @click="retestHistoryRun(historyDetail)"
+                                                        :disabled="isRunning"
+                                                        :title="isRunning ? '当前有测试在运行, 结束后才能重测' : '只重测这一轮失败/错误的项, 通过后并回本记录并更新报告'">
+                                                    🔂 重测失败项 ({{ historyFailedNames(historyDetail).length }})
                                                 </button>
-                                                <span class="pdf-note">这一轮还没有 PDF 报告</span>
-                                            </template>
+                                                <!-- §8.2 PDF 操作区。pdf_path 空 = 这一轮没导出过(自动导出
+                                                     失败, 或这轮是老库记录), 给「重新导出」而不是给一个
+                                                     点了没反应的下载链接。 -->
+                                                <template v-if="historyDetail.pdf_path">
+                                                    <a class="btn-secondary" :href="'/api/history/' + historyDetail.id + '/pdf'"
+                                                       target="_blank" rel="noopener">📄 打开 PDF</a>
+                                                    <span class="pdf-note">已导出</span>
+                                                </template>
+                                                <template v-else>
+                                                    <button class="btn-secondary" @click="exportPdf(historyDetail.id)"
+                                                            :disabled="exportingId === historyDetail.id">
+                                                        {{ exportingId === historyDetail.id ? '导出中…' : '📄 导出 PDF' }}
+                                                    </button>
+                                                    <span class="pdf-note">这一轮还没有 PDF 报告</span>
+                                                </template>
+                                            </div>
                                         </div>
                                         <div class="pdf-error" v-if="exportError">{{ exportError }}</div>
+
+                                        <!-- §7.7 重测记录 —— 重测轮**不单独占历史列表的一行**
+                                             (它是过程, 归档对象是最初那一轮, §7.7.4)。
+                                             所以「重测过几轮、每一轮重测了哪几项、结果
+                                             如何、那一轮的日志」全摆在这里 ——
+                                             列表一行 = 一条归档记录, 看着不乱;
+                                             证据也没丢, 点开就看得见。 -->
+                                        <div class="retest-rounds"
+                                             v-if="historyDetail.retest_runs && historyDetail.retest_runs.length">
+                                            <div class="retest-rounds-title">
+                                                重测记录 ({{ historyDetail.retest_runs.length }} 轮)
+                                            </div>
+                                            <div class="retest-round"
+                                                 v-for="(mr, mi) in historyDetail.retest_runs"
+                                                 :key="mr.id">
+                                                <div class="retest-round-head">
+                                                    <span class="retest-round-no">第 {{ mi + 1 }} 轮</span>
+                                                    <span class="retest-round-time">{{ formatTime(mr.started_at) }}</span>
+                                                    <span class="result-status">{{ statusText(mr.status) }}</span>
+                                                </div>
+                                                <div class="retest-round-items">
+                                                    <div class="retest-round-item"
+                                                         v-for="rr in mr.results"
+                                                         :key="rr.test_name">
+                                                        <span>
+                                                            {{ displayNameOf(rr.test_name) }} · {{ statusText(rr.status) }}
+                                                            <span v-if="rr.attempt && rr.attempt > 1" class="attempt-tag">
+                                                                第 {{ rr.attempt }} 次
+                                                            </span>
+                                                        </span>
+                                                        <!-- 那一轮的日志 —— 报告里也有(「重测日志附录」),
+                                                             界面上在这儿直接能翻, 不用去开 PDF。 -->
+                                                        <details class="retest-round-log" v-if="rr.log">
+                                                            <summary>看这一轮的日志</summary>
+                                                            <pre>{{ rr.log }}</pre>
+                                                        </details>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
 
                                         <div class="results-list">
                                             <div class="result-item" v-for="r in historyDetail.results" :key="r.test_name" :class="r.status">
                                                 <div class="result-head">
                                                     <span class="result-name">{{ displayNameOf(r.test_name) }}</span>
                                                     <span class="result-status">{{ statusText(r.status) }}</span>
+                                                    <!-- §7.7 这一项是第几次才过的 -->
+                                                    <span v-if="r.attempt && r.attempt > 1" class="attempt-tag">
+                                                        第 {{ r.attempt }} 次{{ r.status === 'passed' ? '测试通过' : '仍未通过' }}
+                                                    </span>
                                                     <span class="result-time">{{ r.duration_sec ? r.duration_sec.toFixed(1) + 's' : '' }}</span>
                                                 </div>
                                                 <div class="result-error" v-if="r.error">{{ r.error }}</div>
@@ -410,7 +532,7 @@
             <div class="modal">
                 <h3>💳 TF 卡未检测到</h3>
                 <p class="modal-msg">
-                    检测不到 TF 卡挂载点。该测试已标为 <b>skipped</b>。<br>
+                    卡槽里没检测到 TF 卡(设备不在)。该测试已标为 <b>skipped</b>。<br>
                     选 一个操作:
                 </p>
                 <div class="actions">

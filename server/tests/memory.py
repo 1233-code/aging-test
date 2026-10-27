@@ -299,15 +299,30 @@ class MemoryTest(TestCase):
                 if rc != 0 and not await ctx.is_cancelled():
                     # `timeout` 到点收尾时退出码是 124 (GNU coreutils 约定),
                     # 说明挂钟跑满了, 是**预期**行为, 不算 fail。
+                    #
+                    # ⚠️ 2026-10-27 收窄: 以前是「跑了 ≥ 0.9×挂钟就豁免」——
+                    #    那样**任何**非 0 退出码都能蒙混过关(rc=1 内部错误、
+                    #    rc=137 被 OOM killer 崩在半路), 只要跑得够久就算通过。
+                    #    现在只认 timeout 家族这三个码:
+                    #      124 = `timeout` 到点收尾 (SIGTERM)
+                    #      137 = `timeout` 的 KILL 路径(收尾时进程赖着不走, 被 KILL)
+                    #      143 = 进程自己收到 SIGTERM
+                    #    这三个 + 确实跑满了挂钟 → 算「跑满挂钟」, 不判失败;
+                    #    其它非 0 退出码 → 一律判 failed。
                     timed_out = (rc == 124)
-                    ran_full = timed_out or elapsed >= timeout_sec * 0.9
-                    if ran_full:
-                        why = "`timeout` 到点收尾" if timed_out else "挂钟已跑满"
+                    killed_by_timeout = (
+                        rc in (137, 143) and elapsed >= timeout_sec * 0.9
+                    )
+                    if timed_out or killed_by_timeout:
+                        why = ("`timeout` 到点收尾" if timed_out
+                               else f"被信号 {rc} 收尾(挂钟已跑满)")
                         await ctx.on_log(f"[内存] 跑满挂钟 {elapsed:.0f}s ({why}, rc={rc})")
                         # 不 break, 继续到下面的 ok_count 统计
                     else:
                         await ctx.on_log(f"[内存] ❌ memtester 返回 {rc} (跑了 {elapsed:.0f}s)")
-                        result.error = f"memtester 退出码 {rc}"
+                        result.error = (
+                            f"memtester 退出码 {rc} (跑了 {elapsed:.0f}s, 未跑满挂钟)"
+                        )
                         result.status = "failed"
                         all_passed = False
                         break

@@ -6,6 +6,7 @@ import asyncio
 import os
 import shutil
 import signal
+import subprocess
 import time
 from typing import Awaitable, Callable, List, Optional, Tuple
 
@@ -281,8 +282,66 @@ def is_root() -> bool:
 
 
 def sudo_available() -> bool:
-    """sudo 是否可用 (对应 §11.2 的 `sudo -n true` 自检项)."""
-    return find_tool("sudo") is not None
+    """sudo 是否**真的**可用 (§11.2 的 `sudo -n true` 自检项)。
+
+    ⚠️ 2026-10-27: 以前这里只 `find_tool("sudo") is not None` —— 那只说明
+    **装了 sudo 二进制**, 不说明**配了免密**。sudo 在、但没配 NOPASSWD 时,
+    这儿照样返回 True 放行, 于是运行期 `sudo -n <cmd>` 才失败, 那时该项已经
+    判成 **failed**(设备不合格)而不是 **error**(环境配置问题) —— 工人会把
+    产线的权限配置的锅算到板子上。
+
+    现在真跑一次 `sudo -n true`:
+      · 退出码 0 → 免密可用
+      · 非 0 / 找不到 / 超时 → 不可用
+    开销 ~10ms, 一项测一次, 可以接受。
+    """
+    sudo_bin = find_tool("sudo")
+    if not sudo_bin:
+        return False
+    try:
+        r = subprocess.run(
+            [sudo_bin, "-n", "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# §11.2: sudo 在、但**没配免密**时的特征报错。
+# 这些串是 sudo 自己吐的, 一条一条对过:
+#   "sudo: a password is required"                    ← -n 模式下没免密
+#   "sudo: a terminal is required to read the password"
+#   "sudo: no tty present and no askpass program specified"
+_SUDO_PASSWORD_ERRORS = (
+    "a password is required",
+    "a terminal is required",
+    "no tty present",
+    "sorry, try again",
+)
+
+
+def is_sudo_password_error(text: str) -> bool:
+    """这段报错是不是「sudo 要密码」(= 没配 NOPASSWD)?"""
+    if not text:
+        return False
+    low = text.lower()
+    return any(s in low for s in _SUDO_PASSWORD_ERRORS)
+
+
+def sudo_nopasswd_hint(text: str = "") -> str:
+    """统一文案: 免密没配 —— 这是**产线环境配置问题**, 不是设备不合格。
+
+    报错口径不能混: 「failed」在工人眼里是「板子坏了, 送修」; 「error」才
+    是「这一项没测成, 查环境」。sudo 要密码属于后者。
+    """
+    tail = f" 原始报错: {text.strip()[:200]}" if text else ""
+    return (
+        "sudo 需免密配置(NOPASSWD): 运行 `sudo -n <命令>` 时 sudo 要密码。"
+        "这是**产线环境配置问题**, 不是被测设备不合格 —— 请联系产线管理员"
+        "给服务账号配好 NOPASSWD 后重测 (见 docs/需求设计.md §11.2)。" + tail
+    )
 
 
 def with_sudo(cmd: List[str], env: Optional[dict] = None,

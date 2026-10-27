@@ -66,6 +66,14 @@ th { background: #eceff1; text-align: left; font-weight: 600; }
     padding: 2.5mm 3mm; margin: 3mm 0; border-radius: 2px;
 }
 .warn-box .t { font-weight: 700; color: #e65100; }
+
+/* 通过率行: 分子分母旁边必须跟一句"已测 N / 共勾选 M"。
+   光印 "6/6" 的话, 读者不知道分母是 6 还是 9 —— 而这正是 §9.2 的要点。 */
+.rate-line {
+    margin: 2.5mm 0 3mm; font-size: 11pt;
+}
+.rate-line b { font-size: 13pt; }
+.rate-note { font-size: 9pt; color: #546e7a; }
 .notice {
     border-left: 2.5pt solid #f9a825; background: #fffde7;
     padding: 2mm 3mm; margin: 3mm 0;
@@ -93,6 +101,13 @@ th { background: #eceff1; text-align: left; font-weight: 600; }
 }
 .case-name { font-weight: 700; font-size: 11pt; }
 .case-meta { color: #607d8b; font-size: 9pt; }
+/* §7.7「第 N 次测试通过」角标 —— 跟状态色块并排, 一眼看出这一项返修过。 */
+.attempt-tag {
+    display: inline-block; margin-left: 2mm;
+    padding: 0.3mm 1.6mm; border-radius: 1mm;
+    background: #fff8e1; color: #ef6c00; border: 0.3mm solid #ffcc80;
+    font-size: 8.5pt; font-weight: 600; white-space: nowrap;
+}
 
 /* ── 指标表: 表头组在**每一页**都重复 (§8.2 排版) ──
  *
@@ -156,6 +171,9 @@ table tr { break-inside: avoid; }
 
 /* §8.2 日志附录: 独立分页 */
 .log-appendix { break-before: page; }
+/* §7.7 重测日志附录: 排在日志附录**后面**, 也独立分页 —— 免得重测日志
+   跟首测日志挤在同一页上, 读者分不清哪段是哪一轮的。 */
+.retest-appendix { break-before: page; }
 pre.log {
     font-family: "DejaVu Sans Mono", monospace; font-size: 7.6pt;
     line-height: 1.32; white-space: pre-wrap; word-break: break-all;
@@ -193,8 +211,18 @@ pre.log {
     <tr><td>开始时间</td><td>{{ started_at }}</td></tr>
     <tr><td>结束时间</td><td>{{ finished_at }}</td></tr>
     <tr><td>总耗时</td><td>{{ total_duration }}</td></tr>
-    <tr><td>整体结论</td><td><span class="st st-{{ run.status }}">{{ run.status }}</span></td></tr>
-    <tr><td>Run ID</td><td>{{ run.id }}{% if run.mini_of %}（第 {{ run.mini_of }} 次重测）{% endif %}</td></tr>
+    {# 整体结论: 光印一个英文状态词, 纸面读者(质检/返修)未必知道 "skipped"
+       是什么意思 —— 尤其 "skipped" 跟 "failed" 在他们眼里都像"没通过"。
+       这里给一句**中文结论**, 明确这轮能不能放行。 #}
+    {% set conclusion = {
+        'passed':  '✅ 已测项目全部通过',
+        'failed':  '❌ 存在失败/错误项 —— 不合格, 需返修',
+        'error':   '⚠ 本轮异常终止 —— 结果不作数, 需重跑',
+        'skipped': '⏭ 本次未实际执行任何测试项 —— 不构成合格判定',
+        'stopped': '🛑 用户中途停止 —— 已完成的项按自身判定, 未跑的不算数',
+    }.get(run.status, run.status) %}
+    <tr><td>整体结论</td><td><span class="st st-{{ run.status }}">{{ run.status }}</span> {{ conclusion }}</td></tr>
+    <tr><td>Run ID</td><td>{{ run.id }}{% if run.mini_of %}（记录 #{{ run.mini_of }} 的**重测轮** —— 本报告只含被重测的那几项; 完整报告见记录 #{{ run.mini_of }}）{% endif %}</td></tr>
 </table>
 
 {# §2.2: SN 读不到必须在 PDF 里也提示, 不能只靠 UI 顶上那一行黄字 #}
@@ -211,32 +239,63 @@ pre.log {
 {% if summary.total == 0 %}
 <div class="warn-box">
     <div class="t">⚠ 本次未实际执行任何测试项</div>
-    勾选数为 0 或全部未跑到。**本报告不构成合格判定**（§9.2: total=0 不得判 passed）。
+    共勾选了 {{ summary.planned or 0 }} 项, 但**一项都没实际执行**(全部被跳过, 或中途停止没跑到)。
+    **本报告不构成合格判定**（§9.2: total=0 不得判 passed）。
 </div>
 {% endif %}
 
+{# §9.2 口径: total = passed + failed + error = **实际执行过**的项数。
+   skipped / stopped 不进 total, 所以"合计"这一列不能叫"共勾选"。
+   三个数分清楚, 纸面读者才不会把"测了 6 项"误读成"勾了 6 项全测过了"。 #}
 <table>
     <tr>
         <th>通过 passed</th><th>失败 failed</th><th>错误 error</th>
-        <th>未测 skipped</th><th>合计 total</th>
+        <th>未测 skipped</th><th>未跑到 stopped</th>
+        <th>已测 total</th><th>共勾选 planned</th>
     </tr>
     <tr>
         <td>{{ summary.passed }}</td>
         <td>{{ summary.failed }}</td>
         <td>{{ summary.error }}</td>
         <td>{{ summary.skipped }}</td>
+        <td>{{ summary.not_run or 0 }}</td>
         <td>{{ summary.total }}</td>
+        <td>{{ summary.planned or 0 }}</td>
     </tr>
 </table>
 
+{# 通过率必须带分母说明: 分子分母都是**已测**的项, 不是勾选的项。
+   否则"6/6 通过"配上"共勾选 9 项"会让人以为 100% 合格。 #}
+{% if summary.total %}
+<div class="rate-line">
+    通过率 <b>{{ summary.passed }} / {{ summary.total }}</b>
+    <span class="rate-note">(已测 {{ summary.total }} 项 / 共勾选 {{ summary.planned or 0 }} 项 —— 未测项不计入)</span>
+</div>
+{% endif %}
+
+{# §7.7 合并重测: 这一轮被重测过 —— 报告必须说清「这是合并后的最终结果」。
+   不说的话, 读者会把这一版跟当初那版对不上, 以为测试结果凭空变了;
+   更糟的是他会以为「通过率提高了」是工具算错了。 #}
+{% if summary.retest_count %}
+<div class="notice">
+    <b>ℹ 本报告含 {{ summary.retest_count }} 轮重测</b> —— 结论为**重测合并后的最终结果**:
+    原来通过的项 + 重测后通过的项。
+    逐项标着「第 N 次测试」的, 就是重测之后才过的那几项。
+</div>
+{% endif %}
+
 {# §8.2 / §9.3: 未测项必须逐一列出, 且不计入通过率 #}
-{% if skipped_cases %}
+{% if not_tested_cases %}
 <h3>未测项明细（不计入通过率, 需人工确认是否放行）</h3>
 <table>
-    <thead><tr><th style="width:34mm">测试项</th><th>跳过原因</th></tr></thead>
+    <thead><tr><th style="width:34mm">测试项</th><th>状态</th><th>未测原因</th></tr></thead>
     <tbody>
-    {% for c in skipped_cases %}
-        <tr><td>{{ c.display_name }}</td><td>{{ c.error or '（未记录原因）' }}</td></tr>
+    {% for c in not_tested_cases %}
+        <tr>
+            <td>{{ c.display_name }}</td>
+            <td><span class="st st-{{ c.status }}">{{ c.status }}</span></td>
+            <td>{{ c.error or '（未记录原因）' }}</td>
+        </tr>
     {% endfor %}
     </tbody>
 </table>
@@ -258,6 +317,11 @@ pre.log {
                         <span class="case-name">{{ loop.index }}. {{ c.display_name }}</span>
                         <span>
                             <span class="st st-{{ c.status }}">{{ c.status }}</span>
+                            {# §7.7「第 N 次测试通过」: 这一项试了几次才过。
+                               不标的话, 读者只看到 passed, 不知道这机器返修过一次。 #}
+                            {% if c.attempt and c.attempt > 1 %}
+                            <span class="attempt-tag">第 {{ c.attempt }} 次{{ '测试通过' if c.status == 'passed' else '仍未通过' }}</span>
+                            {% endif %}
                             <span class="case-meta">{{ c.duration }}</span>
                         </span>
                     </div>
@@ -314,6 +378,9 @@ pre.log {
         <span class="case-name">{{ loop.index }}. {{ c.display_name }}</span>
         <span>
             <span class="st st-{{ c.status }}">{{ c.status }}</span>
+            {% if c.attempt and c.attempt > 1 %}
+            <span class="attempt-tag">第 {{ c.attempt }} 次{{ '测试通过' if c.status == 'passed' else '仍未通过' }}</span>
+            {% endif %}
             <span class="case-meta">{{ c.duration }}</span>
         </span>
     </div>
@@ -333,7 +400,7 @@ pre.log {
        有一段日志, 会以为那就是全部, 不会想到要去翻文末的附录。
        现在报告里**只有一处**日志 —— 文末的「日志附录」, 每一项的**完整**
        日志。逐项段只留一句指路, 免得读者以为这一项没有日志。 #}
-    <p class="log-pointer">本项完整日志见文末「日志附录」。</p>
+    <p class="log-pointer">本项完整日志见文末「日志附录」。{% if c.retested %}本项另有重测轮, 那轮的日志见其后的「重测日志附录」。{% endif %}</p>
 </div>
 {% endfor %}
 
@@ -362,6 +429,18 @@ pre.log {
     <p class="snapshot-note">下列为本轮<strong>每一项的完整日志</strong>（未截断、未删节；测试工具的原地重绘进度已还原为最终状态）。</p>
     <pre class="log">{{ full_log }}</pre>
 </div>
+
+{# ───────────── §7.7 重测日志附录: 排在「日志附录」**后面** ───────────── #}
+{# 上面那一节是**首测的原始日志**, 一个字都不许动 —— 那是「当初为什么失败」
+   的证据。下面是**重测那一轮**的日志, 单独一节, 两段证据各归各的。
+   混在一起的话, 事后申诉时读者分不清哪段是当初的、哪段是后来的。 #}
+{% if has_retest_log %}
+<div class="retest-appendix">
+    <h2>重测日志附录</h2>
+    <p class="snapshot-note">下列为<strong>重测轮</strong>的完整日志（本轮共经过 {{ summary.retest_count }} 轮重测）。上面的「日志附录」是首测原始日志，<strong>未作任何改动</strong>。</p>
+    <pre class="log">{{ retest_log }}</pre>
+</div>
+{% endif %}
 
 <div class="footer-note">
     文件名 {{ filename }}　·　SN {{ run.sn or 'unknown' }}　·　Run ID {{ run.id }}

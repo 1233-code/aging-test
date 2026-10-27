@@ -13,6 +13,70 @@ from ._tools import (
 )
 
 
+# ─────────────────── §6.11 ③ 寿命健康度 ───────────────────
+#
+# 节点内容形如 "0x01 0x01" —— 两个值, 分别是 TYPE_A / TYPE_B 两条通道的
+# **已用寿命百分比**(SD 规范: 0x00=0%, 0x0A=100%, 0xFF=未知)。
+#
+# 这一项以前**根本没实现**: 文档 §6.11 写着「3 项全过」(写 + 读 + 寿命),
+# 代码却只跑 fio 写 + 读两阶段 —— 寿命损耗 ≥80% 的板子照样判 passed, 报告里
+# 也没有任何寿命数据。§9.4 行 1630 的「eMMC 综合 3 项」同样对不上。
+#
+# 叫法统一成「**已用寿命百分比**」(life_used_pct): 节点给的就是已用百分比,
+# 别再叫 health_pct_wear(健康度) —— 一个说剩余一个说已用, 纸面上必然打架。
+LIFE_TIME_PATH = "/sys/block/mmcblk0/device/life_time"
+# 损耗**大于** 80% → 判 failed(老化风险, 送修)。恰好 80% 放过。
+LIFE_TIME_MAX_USED_PCT = 80
+
+
+def _parse_life_time(text: str) -> Optional[int]:
+    """解析 life_time 节点内容 → 已用寿命百分比(0-100)。
+
+    形如 "0x01 0x01"。取各值里**最大**的 —— 两条通道取最差的那条,
+    一条磨穿了就是磨穿了。
+
+    0xFF = 「未知」(SD 规范里的 predefined/unknown), 返回 None ——
+    **不能**当成 255% 也不能当成 0%。调用方据此区分「未知」和「读不到」。
+    """
+    vals = []
+    for tok in text.split():
+        tok = tok.strip()
+        if not tok.lower().startswith("0x"):
+            continue
+        try:
+            v = int(tok, 16)
+        except ValueError:
+            continue
+        if v == 0xFF:
+            return None          # 未知 —— 整条作废
+        vals.append(min(v * 10, 100))   # 0x0A = 10 → 100%
+    if not vals:
+        return None
+    return max(vals)
+
+
+def _read_life_time(path: str = LIFE_TIME_PATH) -> tuple:
+    """读寿命节点 → (used_pct, raw, err)
+
+    · used_pct 不是 None → 读到了, 那个数就是已用寿命百分比
+    · used_pct 是 None、raw 有值、err 是 None → 节点说「未知」(0xFF)
+    · used_pct 是 None、err 有值 → 读不到 / 格式不认识
+    """
+    try:
+        with open(path, "r") as f:
+            raw = f.read().strip()
+    except FileNotFoundError:
+        return None, None, f"寿命节点不存在: {path}"
+    except OSError as e:
+        return None, None, f"读寿命节点失败: {path} ({e})"
+    if not raw:
+        return None, raw, f"寿命节点是空的: {path}"
+    pct = _parse_life_time(raw)
+    if pct is None:
+        return None, raw, None        # 0xFF 未知 —— 不是错误, 但也判不了
+    return pct, raw, None
+
+
 def _parse_fio_text(text: str) -> dict:
     """解析 fio 文本输出中的关键指标"""
     metrics = {}
@@ -177,6 +241,10 @@ class EMMCTest(TestCase):
                 if read < min_read:
                     await ctx.on_log(f"[eMMC] ❌ 读速度 {read:.1f} < 阈值 {min_read} MB/s")
                     all_passed = False
+                    # 失败原因要**写进结果** —— 以前只打了日志, result.error 是空的,
+                    # 报告的「原因框」于是印出一段空白, 纸面读者不知道到底为什么
+                    # 这一项没过。
+                    result.error = f"读速度 {read:.1f} MB/s 低于阈值 {min_read} MB/s"
                 result.metrics[f"round_{round_idx}_read_mbps"] = read
                 result.metrics[f"round_{round_idx}_write_mbps"] = write
                 if not all_passed:
@@ -196,6 +264,43 @@ class EMMCTest(TestCase):
                     os.unlink(test_file)
             except Exception:
                 pass
+
+        # ── ③ 寿命健康度 (§6.11) ──
+        #
+        # 放在 fio 之后, 但**不管 fio 跑得怎么样都要查** —— 寿命数据对复盘有用,
+        # 而且它只花几毫秒。
+        used_pct, raw, life_err = _read_life_time()
+        if used_pct is not None:
+            result.metrics["life_time_hex"] = raw
+            result.metrics["life_used_pct"] = used_pct
+            await ctx.on_log(
+                f"[eMMC] 寿命: 已用 {used_pct}% (节点 {raw}, 阈值 ≤ {LIFE_TIME_MAX_USED_PCT}%)"
+            )
+            if used_pct > LIFE_TIME_MAX_USED_PCT:
+                await ctx.on_log(
+                    f"[eMMC] ❌ 已用寿命 {used_pct}% > {LIFE_TIME_MAX_USED_PCT}% —— 老化风险, 送修"
+                )
+                all_passed = False
+                if not result.error:
+                    result.error = (
+                        f"eMMC 寿命损耗 {used_pct}% 超过 {LIFE_TIME_MAX_USED_PCT}%, 老化风险, 送修"
+                    )
+        elif life_err:
+            # 读不到 → 判 error(§6.11)。我们根本没能力判这块介质的寿命,
+            # 拿「读不到」当「好」是**静默的通过** —— 比失败更糟。
+            result.status = "error"
+            result.error = f"eMMC 寿命检查失败: {life_err}"
+            await ctx.on_log(f"[eMMC] ❌ {result.error}")
+            return result
+        else:
+            # 节点自己说「未知」(0xFF) —— 不是错误, 但也判不了。
+            # 放行(不能因为板子没报数就判它坏), 但把「判不了」明写进指标,
+            # 不让它悄悄变成「好」。
+            result.metrics["life_time_hex"] = raw
+            result.metrics["life_used_pct"] = "未知"
+            await ctx.on_log(
+                f"[eMMC] ⚠ 寿命节点报「未知」({raw}) —— 本项不判寿命, 需人工确认"
+            )
 
         if all_passed:
             result.status = "passed"

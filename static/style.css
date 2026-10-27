@@ -83,6 +83,32 @@ section h2 {
     color: #2c3e50;
 }
 
+/* ============== 配置页标题行 ==============
+   「测试配置」标题 + 最右角一排按钮(全选/全不选/▶ 开始测试)。
+   整页唯一的「开始」按钮不再沉在列表末尾, 工人填完姓名在同一屏就能按。 */
+.config-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+    /* 允许挤了以后换行: 窄屏下按钮组会顶到标题边上, 这时宁可换行也别把
+       「开始测试」挤掉。 */
+    flex-wrap: wrap;
+}
+.config-head h2 { margin-bottom: 0; }
+
+/* 最右角那三个按钮。 */
+.config-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+/* 主按钮和左边那两个次要按钮之间多留一截间距, 免得三个按钮挤成一坨,
+   工人分不清哪个是「开始」。 */
+.config-head-actions .btn-primary { margin-left: 16px; }
+
 /* ============== Test List ============== */
 .test-list { display: flex; flex-direction: column; gap: 4px; }
 .test-item {
@@ -160,24 +186,12 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .btn-warning:hover:not(:disabled) { background: #cf6d1c; }
 
-/* §7.6 drag-and-drop 排序 */
+/* §7.6 顺序固定(拖拽排序已于 2026-10-27 移除, 见上面那段说明) */
 .test-item {
     position: relative;
-    padding-left: 22px;
 }
-.test-item .drag-handle {
-    position: absolute;
-    left: 4px;
-    top: 12px;
-    color: #bbb;
-    cursor: grab;
-    user-select: none;
-    font-size: 14px;
-    line-height: 1;
-}
-.test-item .drag-handle:hover { color: #888; }
-.test-item.dragging { opacity: 0.4; }
-.test-item.dragging .drag-handle { cursor: grabbing; }
+/* 2026-10-27: 拖拽排序和「↺ 重置顺序」一起去掉了 —— 10 项顺序固定成
+   §7.6 的推荐执行顺序, 原来那套 .drag-handle / .dragging 的样式一并删。 */
 
 /* §7.6 5 秒静默期提示 */
 .interval-hint {
@@ -214,13 +228,17 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     border: 1px solid #bbdefb;
 }
 
-/* §8.2 本轮测试人员 —— 放在「开始测试」按钮上方一行, 别塞进按钮行:
-   产线工人是「先看这一行, 再按开始」, 挤在按钮里容易被当成按钮的一部分。 */
+/* §8.2 本轮测试人员 —— 现在是「测试配置」标题行下面的**第一块**
+   (原来埋在 10 项列表的最末尾, 工人勾完一轮才发现没填)。 */
 .tester-row {
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-top: 16px;
+    /* 上下留白: 上面隔开标题行, 下面隔开测试项列表。 */
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    background: #f7f9fb;
+    border-radius: 6px;
     font-size: 14px;
     color: #333;
     flex-wrap: wrap;
@@ -487,6 +505,79 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .pdf-actions { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
 .pdf-note { color: #999; font-size: 13px; }
+
+/* ============== §7.7 合并重测 ==============
+ *
+ * 详情头部: 标题在左, 操作在右。「重测失败项」是这一轮最想做的动作
+ * (这一轮不合格, 就地把它修好), 摆在右边一眼可见 —— 挤在下面的 PDF
+ * 那一行里, 工人多半看不见, 于是只能回总结页去重测, 而那边重测的是
+ * 「当前这一轮」, 不是他要修的那一条历史记录。 */
+.history-detail-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap;
+}
+.history-detail-actions {
+    display: flex; align-items: center; gap: 10px;
+    flex-wrap: wrap; justify-content: flex-end;
+}
+/* 「第 N 次重测通过」/「已重测 N 次」 */
+.retest-tag {
+    display: inline-block;
+    background: #fff8e1; color: #ef6c00;
+    border: 1px solid #ffcc80;
+    padding: 2px 8px; border-radius: 4px;
+    font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+/* 重测了几轮还是没全过 —— 颜色要跟「通过」那版区分开, 别让人一眼看成好消息 */
+.retest-tag.still-failed { background: #ffebee; color: #c62828; border-color: #ef9a9a; }
+/* §7.7 重测记录(详情里的那一块) —— 重测轮不单独占历史列表的一行,
+   它的信息全在这儿: 哪一轮、什么时候、重测了哪几项、结果如何、日志。
+   配色跟「重测轮」那版(紫)一致, 让人一眼认出这是「重测的过程」而不是
+   又一轮完整测试。 */
+.retest-rounds {
+    margin: 10px 0; padding: 8px 12px;
+    background: #faf5ff; border: 1px solid #e1bee7;
+    border-left: 3px solid #7e57c2;
+    border-radius: 4px;
+}
+.retest-rounds-title {
+    font-size: 12px; font-weight: 600; color: #5e35b1; margin-bottom: 6px;
+}
+.retest-round { padding: 4px 0; }
+.retest-round + .retest-round { border-top: 1px dashed #d1c4e9; }
+.retest-round-head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-size: 12px;
+}
+.retest-round-no { font-weight: 600; color: #4527a0; }
+.retest-round-time { color: #78909c; }
+.retest-round-items {
+    margin: 4px 0 0 12px;
+    display: flex; flex-direction: column; gap: 3px;
+    font-size: 12px;
+}
+.retest-round-item { color: #37474f; }
+/* 那一轮的日志: 默认收起 —— 日志可能有几十行, 摊开会把详情撑得很长 */
+.retest-round-log { margin-top: 2px; }
+.retest-round-log > summary {
+    cursor: pointer; color: #1565c0; font-size: 11px;
+    list-style: revert;
+}
+.retest-round-log > pre {
+    margin: 4px 0 0; padding: 6px 8px;
+    background: #fafafa; border: 1px solid #cfd8dc; border-radius: 3px;
+    font-family: "DejaVu Sans Mono", monospace; font-size: 11px;
+    line-height: 1.35; white-space: pre-wrap; word-break: break-all;
+    max-height: 320px; overflow: auto;
+}
+/* 逐项「第 N 次测试通过」角标 */
+.attempt-tag {
+    display: inline-block;
+    background: #fff8e1; color: #ef6c00;
+    border: 1px solid #ffcc80;
+    padding: 1px 7px; border-radius: 3px;
+    font-size: 11px; white-space: nowrap;
+}
 .pdf-error {
     margin: 6px 0; padding: 8px 12px; border-radius: 4px;
     background: #fff8e1; border: 1px solid #ef6c00;
@@ -500,10 +591,51 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .history-detail-loading { padding: 14px 16px; color: #999; font-size: 13px; }
 
 /* ============== Wizard (一测试一屏) ============== */
-.wizard-panel {
-    min-height: 70vh;
+
+/* 跑测试这一屏**撑满视口高度**, 日志区吃掉剩下的所有高度 —— 日志框顶到
+   屏幕底, 而不是固定 180px、下面空一大截(2026-10-27 产线要求)。
+   高度靠 flex 链一节一节传下来, **不写死「视口高减去多少像素」** ——
+   顶栏高度会随 SN 标签换行而变, 写死的减法迟早对不上。 */
+#app {
+    min-height: 100vh;
     display: flex;
     flex-direction: column;
+}
+/* ⚠️ 跑测试这一屏的高度必须**确定**(height, 不能只有 min-height) ——
+   flex 容器的 main size 不确定时, flex-basis 的百分比会退化成「内容高度」:
+   日志框就会长到内容那么高(实测 90 行 → 1644px), 整页被撑到 1893px,
+   1080 的屏根本看不到底。给一个确定的 100vh, flex 链才吃得下剩余高度。
+
+   只在跑测试这一屏给确定高度: 配置/总结/历史三屏内容比一屏长, 让它们
+   照旧撑开、整页滚动, 别被压扁。
+
+   :has() 要 Chrome 105+/Firefox 121+ —— 板子上是 chromium 112(§11.7),
+   够用。真不支持时退回到「日志框按内容长、整页滚动」, 不白屏、不少字。 */
+#app:has(> main.main-fill) {
+    height: 100vh;
+    /* 下留白**保留** 20px(跟左右一样), 不抵掉 —— 日志框底边停在屏幕底
+       往上 20px。完全贴死屏幕边缘看着像被切掉一截, 留一截更稳。 */
+}
+#app > main.main-fill {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+#app > main.main-fill > .wizard-panel {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 0;      /* section 默认 16px */
+    padding-bottom: 0;     /* section 默认 20px */
+}
+
+.wizard-panel {
+    display: flex;
+    flex-direction: column;
+    /* 高度不再写 min-height —— 由上面那条 flex 链决定(那一节优先级更高,
+       这里写的 70vh 一直是**死的**)。 */
 }
 .wizard-header {
     display: flex;
@@ -668,16 +800,22 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .status-pill.pending { background: #f5f5f5; color: #888; }
 .status-pill.running { background: #e3f2fd; color: #1976d2; }
 
+/* 日志区: 吃掉面板里剩下的高度(原来靠 margin-top:auto 顶到底, 现在改成
+   flex: 1 —— 有了 flex 之后 auto 边距就没意义了, 留着反而会抢空间)。 */
 .wizard-log {
-    margin-top: auto;
     padding-top: 16px;
     border-top: 1px solid #eef0f4;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
 }
 .wizard-log h3 {
     font-size: 13px;
     color: #888;
     margin-bottom: 8px;
     text-transform: uppercase;
+    flex: 0 0 auto;
 }
 .wizard-log-stream {
     background: #1e1e1e;
@@ -687,7 +825,11 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
     font-size: 12px;
     line-height: 1.5;
-    height: 180px;
+    /* 原来写死 height: 180px —— 现在吃满日志区剩下的高度, 顶到屏幕底。
+       ⚠️ 高度由 flex 决定, **不由内容决定**, 所以显示多少行日志都不会把
+       框撑高(内容多了是框内滚动)。 */
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     white-space: pre-wrap;
 }
@@ -708,6 +850,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .summary-emoji.passed { color: #2e7d32; }
 .summary-emoji.failed { color: #c62828; }
+.summary-emoji.skipped { color: #607d8b; }
 .summary-emoji.stopped { color: #ef6c00; }
 .summary-emoji.error { color: #c62828; }
 .summary-title {
@@ -724,8 +867,29 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .summary-status.passed { background: #e8f5e9; color: #2e7d32; }
 .summary-status.failed { background: #ffebee; color: #c62828; }
+/* skipped = 一项都没实际执行(全被跳过)。灰色, 不是红色 ——
+   红色会被当成「设备不合格」, 而这其实是「没测」, 性质完全不同。 */
+.summary-status.skipped { background: #eceff1; color: #607d8b; }
 .summary-status.stopped { background: #fff8e1; color: #ef6c00; }
 .summary-status.error { background: #ffebee; color: #c62828; }
+
+/* §9.2 行 1595: 通过率 + (已测 M / 共勾选 K) —— 紧跟在标题下面。
+   灰底小字, 跟上面那个大结论区分开: 这是**口径说明**, 不是结论。 */
+.summary-rate {
+    display: inline-block;
+    margin-bottom: 10px;
+    padding: 3px 10px;
+    border-radius: 10px;
+    background: #eceff1;
+    color: #455a64;
+    font-size: 13px;
+    font-weight: 500;
+}
+.summary-rate-note {
+    color: #78909c;
+    font-weight: 400;
+    margin-left: 6px;
+}
 
 /* §7.2 这一轮是哪台机器、什么时候跑的。灰底小字 —— 它是**身份标注**,
    不是结论; 结论由上面那个大 emoji 和状态胶囊说。 */

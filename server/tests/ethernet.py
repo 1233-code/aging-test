@@ -411,7 +411,7 @@ class EthTest(TestCase):
         return result
 
     def operator_prompt(self, result: TestResult):
-        """链路 DOWN → 停下来等工人插网线 (§7.8)。
+        """链路 DOWN → 停下来等工人插网线 (§7.3)。
 
         **只对 unplugged 停**。另外两个 skipped_reason 不停:
           · no_ip     —— 工位没 DHCP, 插一百根网线也没用, 停下来只是白等

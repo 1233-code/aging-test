@@ -204,14 +204,39 @@ def _metric_views(metrics: dict) -> list:
     return views
 
 
-def render_html(run: dict, results: list, filename: str = "") -> str:
-    """把一条 run + 它的逐项结果渲染成完整 HTML。"""
+def render_html(run: dict, results: list, filename: str = "",
+                retest_runs: list = None) -> str:
+    """把一条 run + 它的逐项结果渲染成完整 HTML。
+
+    `retest_runs` 是**重测轮**列表(§7.7), 由 `Database.get_retest_runs()` 给 ——
+    里面的日志渲染成「重测日志附录」, 单独一节, 排在「日志附录」**后面**;
+    前面的「日志附录」是首测原始日志, 一个字都不动。
+    """
     from .tests.registry import get_all_tests
     names = {t["name"]: t["display_name"] for t in get_all_tests()}
 
     summary = dict(run.get("summary") or {})
-    for k in ("total", "passed", "failed", "error", "skipped"):
+    for k in ("total", "passed", "failed", "error", "skipped", "not_run", "planned"):
         summary.setdefault(k, 0)
+    # §7.7 合并重测: 这一轮被重测过几轮。报告要写明「这是合并后的最终结果」
+    # —— 不写的话, 读者会拿这一版跟当初那版对不上, 以为结果凭空变了。
+    summary["retest_count"] = run.get("retest_count") or 0
+    # 老 run 的 summary_json 里没有 planned/not_run(那是这轮才加的两个口径)。
+    # 直接印「共勾选 0」会跟旁边的「已测 6」打架, 所以用可推的口径补:
+    # 勾选数 = 已测 + 未测 + 未跑到。对**新** run 这个等式本来就成立
+    # (每个勾选项最终必落在 passed/failed/error/skipped/stopped 之一),
+    # 所以这个回退不会把新 run 的数字算歪, 只会把老 run 的空缺补上。
+    if not summary["planned"]:
+        summary["planned"] = (summary["total"] + summary["skipped"]
+                              + summary["not_run"])
+
+    # 哪些项被重测过 —— 逐项段要给「这一项另有重测轮的日志」的指路,
+    # 否则读者看完「日志附录」就以为只有首测那一份日志。
+    retested_names = set()
+    for mr in (retest_runs or []):
+        for r in (mr.get("results") or []):
+            if r.get("test_name"):
+                retested_names.add(r.get("test_name"))
 
     cases = []
     for r in results:
@@ -221,8 +246,16 @@ def render_html(run: dict, results: list, filename: str = "") -> str:
             "duration": _fmt_dur(r.get("duration_sec")),
             "metrics": _metric_views(r.get("metrics") or {}),
             "error": r.get("error"),
+            # §7.7「第 N 次测试通过」: 这一项试了几次(1 = 首测)。
+            "attempt": r.get("attempt") or 1,
+            # 这一项另有一轮重测的日志(在「重测日志附录」那一节里)。
+            "retested": r.get("test_name") in retested_names,
         })
-    skipped_cases = [c for c in cases if c["status"] == "skipped"]
+    # 「未测项」= skipped(用户主动跳/环境原因) + stopped(中途停止没跑到)。
+    # §9.3 这两种都**没有实际执行**, 都不计入通过率, 都必须逐一列出让质检
+    # 人工确认能不能放行 —— 只列 skipped 会漏掉"中途停止"那批, 纸面上
+    # 看上去就像"这轮全测了", 而实际上有一半的项压根没跑。
+    not_tested_cases = [c for c in cases if c["status"] in ("skipped", "stopped")]
 
     # ── 日志附录: **每一项的完整日志** (§8.2「全量测试日志」) ──
     #
@@ -240,6 +273,8 @@ def render_html(run: dict, results: list, filename: str = "") -> str:
             body = log
         elif c["status"] == "skipped":
             body = "(本项被跳过, 未执行, 所以没有日志)"
+        elif c["status"] == "stopped":
+            body = "(本项未跑到 —— 中途停止, 未执行, 所以没有日志)"
         else:
             body = "(本项没有产生任何日志 —— 属异常: 跑过的项都该有日志)"
         m = r.get("metrics") or {}
@@ -248,6 +283,31 @@ def render_html(run: dict, results: list, filename: str = "") -> str:
                      f"(前面 {m.get('log_dropped_lines')} 行已丢弃)")
         log_sections.append(f"===== {c['display_name']} [{c['status']}] =====\n{body}")
     full_log = "\n\n".join(log_sections) or "(本次运行无逐项日志)"
+
+    # ── §7.7 重测日志: **单独一节**, 排在「日志附录」后面 ──
+    #
+    # 为什么要单独一节, 而不是把重测日志接在首测日志后面:
+    #   · 父轮那一行的 log 是**首测的原始日志**, 是返修时最要看的证据
+    #     (「当初为什么失败」) —— 报告里那一节**一个字都不许动**。
+    #   · 重测的日志是**另一轮**的证据, 混进首测那一节里, 读者分不清
+    #     哪段是当初的、哪段是后来的 —— 而这正是事后申诉最要紧的分界。
+    # 所以: 前面的「日志附录」原样不动, 后面另起一节说明重测那一轮。
+    retest_sections = []
+    for mr in (retest_runs or []):
+        for r in (mr.get("results") or []):
+            log = (r.get("log") or "").strip()
+            disp = names.get(r.get("test_name"), r.get("test_name") or "?")
+            head = (f"===== {disp} [{r.get('status') or '?'}] "
+                    f"· 第 {r.get('attempt') or 1} 次 =====")
+            if log:
+                body = log
+            else:
+                # 跟「日志附录」一个口径: 一行都没有就把原因写清楚, 不写
+                # "(无日志)" 那种分不清"没记"还是"没跑"的含糊话。
+                # 也不**跳过**这一项 —— 跳过了读者会以为这一项没被重测过。
+                body = "(本项重测没有产生任何日志 —— 属异常: 跑过的项都该有日志)"
+            retest_sections.append(f"{head}\n{body}")
+    retest_log = "\n\n".join(retest_sections)
 
     cfg = run.get("config") or {}
     test_cfgs = (cfg.get("tests") if isinstance(cfg, dict) else None) or {}
@@ -297,9 +357,11 @@ def render_html(run: dict, results: list, filename: str = "") -> str:
         run=run,
         summary=summary,
         cases=cases,
-        skipped_cases=skipped_cases,
+        not_tested_cases=not_tested_cases,
         config_items=config_items,
         full_log=full_log,
+        retest_log=retest_log,
+        has_retest_log=bool(retest_log),
         started_at=_fmt_time(started),
         finished_at=_fmt_time(finished),
         total_duration=_fmt_dur(total_dur),
@@ -370,8 +432,12 @@ async def _print_pdf(chromium: str, html_path: Path, pdf_path: Path) -> None:
     #   缺字形时 chromium 依然 rc=0 并输出合法 PDF。真判据在 verify_cjk()。
 
 
-async def export_pdf(run: dict, results: list) -> str:
+async def export_pdf(run: dict, results: list, retest_runs: list = None) -> str:
     """导出一次 run 的 PDF, 返回最终文件路径。
+
+    `retest_runs`: 可选, §7.7 重测轮列表 —— 它的日志会另起一节印在
+    「日志附录」后面。传 None(默认)表示"这一轮没有重测", 报告里就不出现
+    那一节。
 
     任何一步失败都抛 `ReportError` —— **调用方负责降级**(§8.2: 结果已入库,
     PDF 失败不阻断, `pdf_path` 留空 + warning + UI 提示可手动重导)。
@@ -398,7 +464,9 @@ async def export_pdf(run: dict, results: list) -> str:
     # HTML 写到系统临时目录, 用 run_id 命名 —— 同一个 run 重复导出会覆盖同一个
     # 文件, 不会攒垃圾。覆盖写不是删除, 不涉及清理。
     html_file = Path(tempfile.gettempdir()) / f"aging-report-{run.get('id', 'x')}.html"
-    html_file.write_text(render_html(run, results, filename), encoding="utf-8")
+    html_file.write_text(render_html(run, results, filename,
+                                     retest_runs=retest_runs),
+                         encoding="utf-8")
 
     await _print_pdf(chromium, html_file, staging)
 

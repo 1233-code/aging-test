@@ -208,7 +208,14 @@ async def case3():
 
 
 async def case4():
-    print("\n【4】mini-run 写父轮 → **追加**, 不覆盖父轮原有的日志")
+    print("\n【4】mini-run 写父轮 → 父轮的原始日志**一个字都不许动**")
+    # 父轮那一行的 log 是**首测的原始日志** —— 返修时最要看的证据
+    # (「当初为什么失败」)。重测那一轮的日志留在**重测轮自己的行**里,
+    # 报告里另起一节「重测日志附录」印在「日志附录」后面(§7.7.2)。
+    #
+    # 所以父轮那行**只更新「结论」那几个字段**(状态/耗时/attempt),
+    # log 压根不参与写回 —— 冲掉原始失败原因, 或者把两轮混进同一段,
+    # 都是把「事后申诉要的两段证据」毁掉。
     PARENT_LOGS[(10, "fake")] = "父轮原来的日志"
 
     class Simple(TestCase):
@@ -226,8 +233,18 @@ async def case4():
     await rn._run_one("fake", Simple, cfg, write_to_parent=True)
 
     got = PARENT_LOGS.get((10, "fake")) or ""
-    check("父轮原来的日志" in got, "父轮原来的日志没被冲掉", got)
-    check("重测的日志" in got, "重测的日志接在后面", got)
+    check(got == "父轮原来的日志",
+          "父轮的原始日志**原封不动**(既没被冲掉, 也没被追加)", got)
+
+    mini_log = PARENT_LOGS.get((11, "fake")) or ""
+    check("重测的日志" in mini_log,
+          "重测的日志写在**重测轮自己**的行里(报告再从那儿取)", mini_log)
+
+    pf = last_written(10, "fake") or {}
+    check(pf.get("status") == "passed",
+          "父轮那一项的**结论**更新了(状态)", pf)
+    check("log" not in pf,
+          "父轮那一行的写回里**没有** log 这个字段", pf)
 
 
 async def case5():

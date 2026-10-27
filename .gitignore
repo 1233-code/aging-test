@@ -9,6 +9,10 @@ venv/
 logs/
 reports/*.html
 reports/*.pdf
+# ⚠️ `reports/*.pdf` 只匹配 **reports/ 这一层**, 命不中 `reports/pdf/` 里的
+#    导出件 —— 产线真机的历史 PDF 会被 git 当成新文件, 一次 `git add -A`
+#    就把客户数据提进仓。这里把整个子目录排除掉。
+reports/pdf/
 .DS_Store
 *.swp
 .idea/

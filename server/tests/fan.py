@@ -56,6 +56,10 @@ _DEFAULT_DRIVE_SETTLE_SEC = 5.0
 _DEFAULT_ACTIVE_LEVEL = "high"
 # '0\n' / '1\n' —— 一次读 4 字节足够, 也是实测安全的长度
 _READ_CHUNK = 4
+# §10.1: 单项测试期间每 **≤ 2 秒**至少推 1 帧 progress 或 log。
+# 风扇的 `drive_settle_sec`(默认 5s) 是一段**全静默**的等待 —— 以前
+# 4 次相位 × 5s = 20 秒屏幕一动不动, 看着像卡死。等待期间必须有心跳。
+_HEARTBEAT_SEC = 1.5
 
 
 def _read_level(path: str) -> Optional[int]:
@@ -196,7 +200,18 @@ class FanTest(TestCase):
                         await ctx.on_log(f"[风扇] ✗ {result.error}")
                         return result
 
-                    if await self._sleep_cancellable(ctx, settle):
+                    # 写完电平要等 settle 秒再回读(风扇要真的转起来, 工人还要
+                    # 看得见)。这段等待原来**一帧都不推** → 屏幕静止 5 秒,
+                    # 违反 §10.1「每 ≤2 秒至少推 1 帧」。这里加心跳。
+                    async def _settle_beat(elapsed: float, _i=i, _tag=tag):
+                        await ctx.on_progress(
+                            int(5 + 90 * ((_i - 1) / cycles)),
+                            f"第 {_i}/{cycles} 轮 · "
+                            f"{'拉低停转' if _tag == 'inactive' else '拉高运转'}"
+                            f" · 等待电平稳定 ({elapsed:.1f}/{settle:.1f}s)",
+                        )
+
+                    if await self._sleep_cancellable(ctx, settle, on_beat=_settle_beat):
                         cancelled = True
                         break
 
@@ -332,16 +347,27 @@ class FanTest(TestCase):
         return result
 
     @staticmethod
-    async def _sleep_cancellable(ctx: TestContext, seconds: float) -> bool:
+    async def _sleep_cancellable(ctx: TestContext, seconds: float,
+                                 on_beat=None) -> bool:
         """可被取消打断的 sleep。返回 True = 期间被取消。
 
         分片睡而不是一觉睡到底 —— 否则用户点「停止」还得等满整个间隔才生效。
+
+        `on_beat`: 可选的 async 回调(参数是「已经过去了几秒」), 每
+        `_HEARTBEAT_SEC` 调一次 —— §10.1 要求「单项测试期间每 ≤2 秒至少推
+        1 帧 progress 或 log」。风扇的 `drive_settle_sec` 默认 5 秒, 以前
+        这 5 秒里**一帧都不推**, 屏幕看着像卡死。
         """
         deadline = time.monotonic() + seconds
+        last_beat = time.monotonic()
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             if await ctx.is_cancelled():
                 return True
+            now = time.monotonic()
+            if on_beat is not None and (now - last_beat) >= _HEARTBEAT_SEC:
+                last_beat = now
+                await on_beat(seconds - remaining)
             await asyncio.sleep(min(0.2, remaining))

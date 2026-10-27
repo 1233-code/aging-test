@@ -201,7 +201,7 @@ async def test_status():
     return runner.snapshot()
 
 
-# ── §7.8 等操作员: 卡槽空 / 网线没插时的「已插好重测」/「跳过」 ──
+# ── §7.3 等操作员: 卡槽空 / 网线没插时的「已插好重测」/「跳过」 ──
 class OperatorAnswer(BaseModel):
     decision: str    # "retest" (已插好, 原地再跑一遍这一项) | "skip" (进下一项)
 
@@ -390,8 +390,14 @@ async def test_retest(req: RetestRequest):
 
 # ==================== 历史 ====================
 @app.get("/api/history")
-async def history(limit: int = 50):
-    return await db.Database.list_runs(limit)
+async def history(limit: int = 50, include_mini: bool = False):
+    """历史列表 —— **默认只列归档记录**(不含重测轮)。
+
+    重测轮是**过程**, 不是归档对象(§7.7.4)。列出来的话, 工人重测两次
+    就会看见**四条**带「重测」字样的行 —— 实际只重测过两条。带
+    `?include_mini=1` 可以看原始行(排障用), 界面不用。
+    """
+    return await db.Database.list_runs(limit, include_mini=include_mini)
 
 
 @app.get("/api/history/{run_id}")
@@ -458,8 +464,11 @@ async def history_reexport_pdf(run_id: int):
     if not data.get("sn"):
         data["sn"] = identity.get_sn()
     results = data.pop("results", [])
+    # §7.7 手动重导也要带上「重测日志附录」那一节 —— 不然手动补导出来的
+    # 报告会**比**自动导的那份**少一节**, 读者会以为重测日志没了。
+    retest_runs = await db.Database.get_retest_runs(run_id)
     try:
-        path = await report.export_pdf(data, results)
+        path = await report.export_pdf(data, results, retest_runs=retest_runs)
     except report.ReportError as e:
         raise HTTPException(500, f"导出失败: {e}")
     await db.Database.set_pdf_path(run_id, path)

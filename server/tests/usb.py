@@ -105,11 +105,28 @@ class USBTest(TestCase):
         )
         stdout, _ = await proc.communicate()
         usb_lines = stdout.decode(errors="replace").strip().splitlines()
-        usb_count = len([l for l in usb_lines if l])
-        await ctx.on_log(f"[USB] lsusb 找到 {usb_count} 个设备")
-        for line in usb_lines:
+        # §6.5 行 511: 「枚举到 ≥ 1 个**非 root-hub** 设备」才算有设备。
+        #
+        # lsusb 每次都会把 root hub 也列出来(实测本机 6 行里 3 行是 root hub:
+        # `ID 1d6b:0001/0002/0003 Linux Foundation ... root hub`)。不剔掉的话
+        # usb_count 恒 ≥ 2 → 「未检测到任何 USB 设备 → failed」那道闸门**永远
+        # 不触发**, 空 USB 口会接着走「没有可写的 USB 块设备 → 跳过读写 →
+        # passed」, 也就是**空口判通过**。
+        raw_lines = [l for l in usb_lines if l.strip()]
+        root_hub_lines = [l for l in raw_lines if "root hub" in l.lower()]
+        device_lines = [l for l in raw_lines if "root hub" not in l.lower()]
+        usb_count = len(device_lines)
+        await ctx.on_log(
+            f"[USB] lsusb 找到 {usb_count} 个设备"
+            + (f" (另有 {len(root_hub_lines)} 个 root hub, 不计入设备数)"
+               if root_hub_lines else "")
+        )
+        for line in raw_lines:
             await ctx.on_log(f"  {line}")
         result.metrics["device_count"] = usb_count
+        # root hub 数单列一个指标 —— 排查时能看出「lsusb 到底列了几行」,
+        # 免得再问「为什么 device_count 是 0 但 lsusb 有输出」。
+        result.metrics["root_hub_count"] = len(root_hub_lines)
 
         if usb_count == 0:
             result.status = "failed"

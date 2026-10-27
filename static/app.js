@@ -14,11 +14,55 @@ createApp({
         const testList = ref([]);
         const tests = reactive({});
         const testOrder = ref([]);
-        const draggedIdx = ref(null);
         const isRunning = ref(false);
         const resultList = ref([]);
         const logs = ref([]);
         const logEl = ref(null);
+        // 日志框能显示多少行 —— 按框的**实际高度**算, 不写死。
+        // §10.2 原来写「屏幕上只显示最后 30 行」, 那是按 180px 高的小框定的;
+        // 框拉高到贴屏幕底(2026-10-27)之后, 30 行只占一半, 下面一片空白。
+        //
+        // 往多了算(×1.4 再 +5): 行会换行时一行可能占两行, 宁可多渲染几条让
+        // 框里滚 —— 框空着比框滚着难看。
+        const LOG_LINE_PX = 18;          // 12px 字 × line-height 1.5
+        const LOG_MIN_LINES = 30;
+        const logVisibleLines = ref(LOG_MIN_LINES);
+
+        // 框高(px) → 能显示多少行。单独拎出来是为了能直接测它 ——
+        // 这条算式的值错了, 症状是「日志框下面空一大截」或者「滚不到头」,
+        // 光看截图很难看出是差 5 行还是差 50 行。
+        const computeLogLines = (h) => {
+            if (!h || h <= 0) return LOG_MIN_LINES;   // 还没量到, 先用下限
+            return Math.max(LOG_MIN_LINES, Math.ceil(h / LOG_LINE_PX * 1.4) + 5);
+        };
+
+        const measureLogLines = () => {
+            const el = logEl.value;
+            if (!el) return;
+            const h = el.clientHeight;
+            if (h <= 0) return;          // 还没布局好, 下次再量
+            const lines = computeLogLines(h);
+            if (lines !== logVisibleLines.value) logVisibleLines.value = lines;
+        };
+
+        // 日志框高度变了 → 能显示多少行得跟着变。
+        // 用 ResizeObserver 盯着**框本身**, 而不是只听 window.resize ——
+        // 框高不只受窗口影响: 向导页顶部的「当前测试」标题一换行, 框就矮了,
+        // 而窗口一动没动。少了这个观察者, 换行那一刻框底会空出一截。
+        //
+        // 框是 flex 撑出来的(flex: 1 = basis 0% + grow, 高度全由 flex 分配),
+        // 内容增减**不会**改变它的高度 —— 所以观察到的每次变化都是真高度变化,
+        // 不会因为来一行日志就重算一遍(那会让每条日志都触发一次重排)。
+        let logResizeObserver = null;
+        watch(logEl, (el) => {
+            if (logResizeObserver) { logResizeObserver.disconnect(); logResizeObserver = null; }
+            if (!el) return;                       // 不是向导页, 日志框不存在
+            measureLogLines();
+            if (typeof ResizeObserver !== 'undefined') {
+                logResizeObserver = new ResizeObserver(() => measureLogLines());
+                logResizeObserver.observe(el);
+            }
+        });
         const history = ref([]);
         const historyDetail = ref(null);
         // 历史页当前**就地展开**的那一条(存 run id, 不是下标 —— 下标会随
@@ -64,6 +108,10 @@ createApp({
         // §7.6 整轮异常终止的原因(status=error)。没有它, 总结页上只有
         // 「0 通过 / 0 失败 / 0 跳过」, 工人根本看不出出了什么事。
         const runError = ref('');
+        // §7.7 合并重测: 刚才这一轮是「记录 #N 的重测轮」, 结果已经并回
+        // 那条记录了。记着这个 id, 总结页才能说清「你现在看到的是合并后
+        // 的结果」, 而不是让人以为刚才只测了重测的那几项。
+        const mergedParent = ref(null);
 
         // TF 卡 prompt
         const tfPrompt = ref({ visible: false, testName: '', reason: '' });
@@ -81,10 +129,17 @@ createApp({
         //    「已完成 (部分跳过)」—— 停止(stopped)和异常(error)也这么说。
         //    「异常终止」被说成「部分跳过」, 工人会以为只是跳过了几项,
         //    拿着一个根本没跑完的结果去出货。两种状态必须分开说。
-        const SUMMARY_EMOJI = { passed: '✅', failed: '❌', stopped: '🛑', error: '⚠️' };
+        // §9.2 行 1585-1589: total=0(一项都没实际执行)→ 整轮判 **skipped**,
+        // 不判 passed —— 否则工人把所有项都选「跳过」就能拿到一份
+        // 「100% 通过」的空报告。这个 run 级状态以前后端根本不会产生,
+        // 这里把它补上(样式见 style.css 的 .summary-status.skipped)。
+        const SUMMARY_EMOJI = {
+            passed: '✅', failed: '❌', skipped: '⏭', stopped: '🛑', error: '⚠️',
+        };
         const SUMMARY_STATUS_TEXT = {
             passed: '整体通过',
             failed: '存在失败项',
+            skipped: '本次未实际执行任何测试项',
             stopped: '已停止',
             error: '本轮出错',
         };
@@ -124,6 +179,32 @@ createApp({
         );
         const skippedCount = computed(() =>
             resultList.value.filter(r => r.status === 'skipped').length
+        );
+
+        // ── §9.2 的通过率口径 ──
+        //
+        // total = 实际执行并出结论的项数(passed+failed+error);
+        // **skipped / stopped 都不计入** —— 没跑的项不该拉低通过率。
+        //
+        // 光有「8 通过 / 0 失败 / 0 跳过」是不够的: 屏幕上分不清
+        // 「勾了 8 项全测过」和「勾了 10 项只测了 8 项、2 项没测」。
+        // 所以把通过率、(已测 M / 共勾选 K) 和未测项名一起摆出来。
+        const executedCount = computed(() =>
+            passedCount.value + failedCount.value + errorCount.value
+        );
+        const plannedCount = computed(() => resultList.value.length);
+        const passRateText = computed(() => {
+            if (!executedCount.value) return '—';
+            return `${passedCount.value}/${executedCount.value}`;
+        });
+        // 未测 = skipped(用户主动跳 / 环境原因) + stopped(中途停止没跑到)
+        const notTestedItems = computed(() =>
+            resultList.value
+                .filter(r => r.status === 'skipped' || r.status === 'stopped')
+                .map(r => ({ name: r.display_name, status: r.status }))
+        );
+        const notTestedText = computed(() =>
+            notTestedItems.value.map(x => x.name).join('、')
         );
 
         // 当前向导显示的测试
@@ -187,7 +268,7 @@ createApp({
             return t ? t.display_name : name;
         };
 
-        // ========== 加载 + 拖动 ==========
+        // ========== 加载 ==========
         const loadConfig = async () => {
             const r = await fetch('/api/config');
             const data = await r.json();
@@ -218,31 +299,10 @@ createApp({
             }
         };
 
-        const dragStart = (e, idx) => {
-            draggedIdx.value = idx;
-            if (e.dataTransfer) {
-                e.dataTransfer.effectAllowed = 'move';
-                e.dataTransfer.setData('text/plain', String(idx));
-            }
-        };
-        const dragOver = (e) => {
-            e.preventDefault();
-            if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-        };
-        const dropAt = (e, targetIdx) => {
-            e.preventDefault();
-            const from = draggedIdx.value;
-            draggedIdx.value = null;
-            if (from === null || from === targetIdx) return;
-            const order = [...testOrder.value];
-            const [moved] = order.splice(from, 1);
-            order.splice(targetIdx, 0, moved);
-            testOrder.value = order;
-        };
-        const resetOrder = () => {
-            if (!config.value || !config.value.recommended_order) return;
-            testOrder.value = [...config.value.recommended_order];
-        };
+        // 2026-10-27: 拖拽排序和「↺ 重置顺序」一起去掉了 —— 10 项的顺序
+        // 固定成后端下发的推荐顺序(§7.6), 工人拖不动也不需要复位。
+        // `testOrder` 留着: 它是**这一轮的执行顺序**的唯一来源, 开始测试
+        // 时原样发给后端, 后端按它跑。
 
         // ========== 测试运行 ==========
         const selectAll = (val) => {
@@ -273,7 +333,8 @@ createApp({
             logs.value = [];
             window._retesting = false;
 
-            // 初始化 resultList - 按用户拖动顺序 (testOrder)
+            // 初始化 resultList - 按执行顺序 (testOrder, 恒等于后端下发的
+            // 推荐顺序 §7.6; 2026-10-27 起 UI 上不可拖动)
             const enabled = testOrder.value.filter(n => tests[n] && tests[n].enabled);
             resultList.value = enabled.map(name => {
                 const t = testList.value.find(x => x.name === name);
@@ -512,6 +573,15 @@ createApp({
 
         // 向导 → 总结 / 重测
         const goConfig = () => {
+            // 跑测期间**不许**回配置页 —— §7.1 的状态机里本来就没有
+            // 「运行中 → 配置」这条转移。
+            //
+            // 以前这一下把 resultList 整个清空, 后端却照跑不误: 等
+            // run_finished 到达时, 总结页就是一张「✅ 整体通过 / 0 通过 /
+            // 0 失败 / 0 跳过」的空页 —— 工人会以为机器一项都没测。
+            // 按钮已经 disable 了, 这里再挡一道(按钮 disable 只挡点击,
+            // 挡不住代码里别处调 goConfig)。
+            if (isRunning.value) return;
             view.value = 'main';
             isRunning.value = false;
             resultList.value = [];
@@ -534,24 +604,51 @@ createApp({
             await loadHistory();
         };
 
-        // ========== 失败重测 (§7.7) ==========
-        const retestFailed = async () => {
-            const names = failedItemNames.value;
-            if (!names.length || !runId.value) return;
+        // ========== 重测失败项 (§7.7) ==========
+        //
+        // **总结页和历史页调的是同一个函数** —— 两者唯一的差别是「重测哪一轮」:
+        //   · 总结页: 刚跑完这一轮 → 目标 = 当前这一轮
+        //   · 历史页: 点开的那条记录 → 目标 = **那条记录**(可能是刚跑完, 也可能
+        //     是过了一会儿、期间还开了别的测试)
+        // 两条路走的是同一个后端接口, 都会把结果**合并回被重测的那一轮**,
+        // 并更新那一份报告 —— 这才是「重测失败项」该有的样子。
+        //
+        // seedItems: 历史页进来时向导页的结果列表是空的, 得用那条记录的
+        // 逐项结果把它铺上, 否则工人看到的是个空白的向导页。
+        const retestRun = async (targetRunId, names, sourceLabel, seedItems) => {
+            if (!targetRunId || !names || !names.length) return;
+            // runner 是**单例** —— 一次只能跑一轮。别的测试正跑着的时候不能
+            // 插队重测: 那会把正在跑的那一轮的状态搅乱(当前项、结果、日志
+            // 全是同一份)。
+            if (isRunning.value) {
+                alert('当前有测试在运行, 结束后才能重测。');
+                return;
+            }
             if (!confirm(
-                `将重新测试 ${names.length} 项失败/错误:\n${names.join(', ')}\n\n继续?`
+                `将重新测试 ${names.length} 项失败/错误:\n${names.join(', ')}\n\n` +
+                `结果会合并回${sourceLabel}, 并更新那一份报告。\n继续?`
             )) {
                 return;
             }
             isRunning.value = true;
             window._retesting = true;
-            for (const name of names) {
-                const r = resultList.value.find(x => x.name === name);
-                if (r) {
-                    r.status = 'pending';
-                    r.pct = 0;
-                    r.metrics = {};
-                    r.error = null;
+            if (seedItems && seedItems.length) {
+                // 历史页来的: 把那条记录的逐项结果铺成向导页的列表,
+                // 要重测的几项先摆成「等待」。
+                resultList.value = seedItems.map(it => ({
+                    ...it,
+                    status: names.includes(it.name) ? 'pending' : it.status,
+                    pct: 0,
+                }));
+            } else {
+                for (const name of names) {
+                    const r = resultList.value.find(x => x.name === name);
+                    if (r) {
+                        r.status = 'pending';
+                        r.pct = 0;
+                        r.metrics = {};
+                        r.error = null;
+                    }
                 }
             }
             // 切回 wizard 显示重测过程
@@ -564,13 +661,17 @@ createApp({
                 const resp = await fetch('/api/test/retest', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ run_id: runId.value, test_names: names }),
+                    body: JSON.stringify({ run_id: targetRunId, test_names: names }),
                 });
                 const data = await resp.json();
                 if (!data.ok) {
                     alert('重测启动失败: ' + data.error);
                     isRunning.value = false;
                     window._retesting = false;
+                } else if (data.dropped_tests && data.dropped_tests.length) {
+                    // 注册表里已经没了的项(后来被删掉的测试项)没法重测 ——
+                    // 说出来, 别让工人以为「说好的 3 项怎么只测了 2 项」。
+                    alert(`以下测试项已不在册, 本次跳过: ${data.dropped_tests.join(', ')}`);
                 }
             } catch (e) {
                 alert('网络错误: ' + e.message);
@@ -579,11 +680,39 @@ createApp({
             }
         };
 
+        // 总结页的「重测失败项」—— 目标就是当前这一轮
+        const retestFailed = async () => {
+            await retestRun(runId.value, failedItemNames.value, '这一轮');
+        };
+
+        // 历史页的「重测失败项」—— 目标是**被点开的那条记录**。
+        // 只给正式轮(不是重测轮)出这个入口: 重测轮只是过程, 归档对象
+        // 始终是最初那一轮 —— 在重测轮上再重测, 只会套出一串套娃记录。
+        const historyFailedNames = (detail) => (detail && detail.results || [])
+            .filter(r => r.status === 'failed' || r.status === 'error')
+            .map(r => r.test_name);
+        const retestHistoryRun = async (detail) => {
+            if (!detail) return;
+            const names = historyFailedNames(detail);
+            if (!names.length) return;
+            // 历史详情的结果用 test_name, 向导页用 name —— 铺列表时得对上。
+            const seed = (detail.results || []).map(r => ({
+                name: r.test_name,
+                display_name: displayNameOf(r.test_name),
+                status: r.status,
+                pct: 0,
+                metrics: r.metrics || {},
+                error: r.error || null,
+                duration_sec: r.duration_sec,
+            }));
+            await retestRun(detail.id, names, `记录 #${detail.id}`, seed);
+        };
+
         const ENV_REASON_TEXT = {
             unplugged: '未插网线 —— PHY 层无链路 (ethtool Link detected: no)',
             no_ip: 'DHCP 与静态兜底均取不到 IP —— 工位网络环境不具备条件',
             no_egress: '链路与 DHCP 正常, 但网关/DNS/公网全不通 —— 上游网络问题',
-            no_mount: '未检测到 TF 卡挂载点',
+            no_card: '未检测到 TF 卡 —— 卡槽是空的',
             no_ap: '未扫描到任何 WiFi 热点 —— 环境无 AP',
             dhcp_failed: 'WiFi 关联成功但 DHCP 未拿到地址 —— 地址池耗尽或 AP 侧限制',
             no_route: '关联成功但无默认路由 —— 网络配置异常',
@@ -660,7 +789,15 @@ createApp({
         // ========== 历史 ==========
         const loadHistory = async () => {
             const r = await fetch('/api/history');
-            history.value = await r.json();
+            const rows = await r.json();
+            // §7.2: 历史列表**一行 = 一条归档记录** —— 重测轮(mini-run)是
+            // **过程**, 不是归档对象, 不单独占一行(它的信息在它那一轮的
+            // 详情里)。后端也过滤了, 这里**再滤一道**: 后端没重启时这一道
+            // 照样管用 —— 前端是热路径, 刷新页面就生效, 不用等产线安排重启。
+            // (不滤的话: 工人重测两次, 列表里就出现四条带「重测」的行,
+            //  实际只重测过两条 —— 工人原话:「我都有点看不懂」。)
+            history.value = (Array.isArray(rows) ? rows : [])
+                .filter(x => x && !x.mini_of);
         };
         const loadHistoryDetail = async (id) => {
             const r = await fetch('/api/history/' + id);
@@ -771,6 +908,9 @@ createApp({
                     reportPath.value = '';
                     reportRunId.value = null;
                     reportError.value = '';
+                    // 上一轮的「已合并到记录 #N」也一并清掉 —— 新的一轮跟它
+                    // 没关系了, 挂着那条提示只会让人以为这一轮也是重测。
+                    mergedParent.value = null;
                     break;
                 case 'test_started': {
                     // **画面只由这一条事件推动。**
@@ -778,7 +918,7 @@ createApp({
                     // `当前索引 + 1` 自己猜下一项是谁。原来那种前端自增的写法,
                     // 只要有一处没对齐 (提示框、停止、超时), 画面就会跑到后端
                     // 前面去, 而日志仍在写真正在跑的那一项。
-                    // §7.8 的原地重测会再发一次**同名**事件, 索引不变, 屏幕
+                    // §7.3 的原地重测会再发一次**同名**事件, 索引不变, 屏幕
                     // 自然停在原地。
                     const idx = resultList.value.findIndex(x => x.name === msg.name);
                     if (idx >= 0 && view.value === 'wizard') {
@@ -812,7 +952,7 @@ createApp({
                     break;
                 }
                 case 'waiting_operator': {
-                    // §7.8 后端**真的停住了**。弹框只是把这件既成事实告诉工人。
+                    // §7.3 后端**真的停住了**。弹框只是把这件既成事实告诉工人。
                     const why = msg.text || '需要人工介入';
                     if (msg.name === 'tfcard') {
                         tfPrompt.value = { visible: true, testName: msg.name, reason: why };
@@ -881,7 +1021,7 @@ createApp({
                     tfPrompt.value.visible = false;
                     ethPrompt.value.visible = false;
 
-                    // 这里**只出总结**。§7.8 的中途重测不走 mini-run 了 ——
+                    // 这里**只出总结**。§7.3 的中途重测不走 mini-run 了 ——
                     // 插卡重测是在主循环里原地重跑, 不会产生 run_finished,
                     // 所以这个事件只可能意味着整轮真的全部跑完了。
                     // §7.7「失败项重测」是另一种 mini-run, 发生在整轮之后,
@@ -901,6 +1041,39 @@ createApp({
                     if (msg.error) runError.value = msg.error;
                     view.value = 'summary';
                     window._retesting = false;
+                    // 逐项结果**以快照为准重建** ——
+                    //
+                    // run_finished 事件本身**不带**逐项结果, 只带一个 summary
+                    // 计数。以前那份列表是 test_started 事件一路攒出来的, 所以
+                    // 工人中途点了「← 返回配置」(goConfig 会清空 resultList)
+                    // 的话, 这里就凑不出列表了 → 总结页变成一张
+                    // 「✅ 整体通过 / 0 通过 / 0 失败 / 0 跳过」的空页,
+                    // 工人会以为机器一项都没测。
+                    //
+                    // 补一次拉取: 快照里有 test_queue + results(含中途停止时
+                    // 补上的 stopped 行), 列表就有内容了。
+                    syncStatus();
+                    break;
+                }
+                // §7.7 合并重测完成 —— 被重测的那条记录现在是「通过」了,
+                // 报告也换成了合并后的那一版。
+                //
+                // 这个事件在 run_finished **之前**到(后端先合并再广播收尾),
+                // 所以这里把报告指向**合并后**的那一份 —— 重测轮自己那份
+                // (只含被重测的那几项)留在库里当过程记录, 但工人要归档的
+                // 是合并版, 报告按钮必须指对。
+                case 'parent_merged': {
+                    const pid = msg.parent_run_id;
+                    mergedParent.value = pid;
+                    reportRunId.value = pid;
+                    reportPath.value = msg.pdf_path || '';
+                    // 历史列表刷新 —— 合并过的那条记录会跳到最上面
+                    // (它刚刚才动过, 是列表里最新的状态)。
+                    await loadHistory();
+                    // 正展开着它的话, 详情也要跟着刷新(逐项状态/计数/角标)。
+                    if (expandedId.value === pid) {
+                        await loadHistoryDetail(pid);
+                    }
                     break;
                 }
                 // §8.2 收尾导出。run_finished 之后**还会**来这两个事件之一 ——
@@ -951,36 +1124,43 @@ createApp({
                     window._hbSend && window._hbSend();
                 }
             });
+            // 窗口尺寸变了 → 日志框高度变了 → 能显示的行数也得跟着变。
+            // 产线的屏是固定的 1920×1080, 但工人偶尔会拖一下窗口。
+            window.addEventListener('resize', measureLogLines);
         });
 
         watch(view, (v) => {
             if (v === 'history') loadHistory();
+            // 切到跑测试这一屏 → 量一次日志框高度, 算出能显示多少行。
+            // nextTick: 得等 DOM 更新完, logEl 才存在、clientHeight 才准。
+            if (v === 'wizard') nextTick(measureLogLines);
         });
 
         return {
             // state
             view, config, testList, tests, testOrder,
-            isRunning, resultList, logs, logEl,
+            isRunning, resultList, logs, logEl, logVisibleLines, computeLogLines,
             history, historyDetail, runId, expandedId,
             exportingId, exportError, reportPath, reportError, reportRunId,
             tfPrompt, ethPrompt, currentTestIndex, lastStatus,
             depsInfo, shuttingDown,
-            runSn, runFinishedAt, runError,
+            runSn, runFinishedAt, runError, mergedParent,
             // computed
             snUnknown, snDisplay, snTitle,
             hasAnyEnabled, hasFailedItems, failedCount,
             passedCount, errorCount, skippedCount,
+            executedCount, plannedCount, passRateText, notTestedItems, notTestedText,
             currentTest, previousTest, overallProgress,
-            orderedTests, draggedIdx,
+            orderedTests,
             testerName,
             summaryEmoji, summaryStatusText,
             // methods
             statusText, formatTime, formatDuration, displayNameOf, envReasonText,
             fmtMetricValue,
             selectAll, startTest, stopTest, shutdownService,
-            goConfig, goHistory, retestFailed, toggleHistoryDetail,
+            goConfig, goHistory, retestFailed, retestHistoryRun, historyFailedNames,
+            toggleHistoryDetail,
             tfInserted, tfSkip, ethPlugged, ethSkip,
-            dragStart, dragOver, dropAt, resetOrder,
             loadConfig, loadDeps, loadHistory, loadHistoryDetail, exportPdf,
             // 导出 applySnapshot 是为了**可测** —— §7.6 的「靠快照恢复」这条
             // 规则要能自动验证, 就得能在测试里直接调它 (tests/test_frontend_snapshot.js)。

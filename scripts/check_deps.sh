@@ -12,13 +12,56 @@
 # 重要: 普通用户 PATH 不一定含 /sbin /usr/sbin, 这里强制加上
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+# 项目根目录 (config.yaml 的位置) —— 与 server/config.py 的 PROJECT_ROOT 一致
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+CONFIG_FILE="$PROJECT_ROOT/config.yaml"
+
+# ── 读 config.yaml 里的点号路径 (如 defaults.gpu.variant) ──
+#
+# 用 python3 + PyYAML, 因为服务端自己就是靠 PyYAML 读这份配置的 —— 凡能跑
+# 这套工具的机器, 这个依赖一定在。读不到(文件缺失/键不存在/没装 PyYAML)
+# 一律回落到默认值, **不阻断**: 自检脚本的意义是"挡住真缺东西的板子",
+# 不是"因为读不到配置就把所有板子都拒了"。
+_cfg_py() {
+    local key="$1" py
+    for py in python3 "$PROJECT_ROOT/.venv/bin/python"; do
+        command -v "$py" >/dev/null 2>&1 || continue
+        "$py" -c "import yaml" >/dev/null 2>&1 || continue
+        "$py" - "$CONFIG_FILE" "$key" <<'PYEOF' 2>/dev/null
+import sys, yaml
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as f:
+        d = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(1)
+for k in key.split("."):
+    if isinstance(d, dict) and k in d:
+        d = d[k]
+    else:
+        sys.exit(1)
+if d is None:
+    sys.exit(1)
+print(str(d))
+PYEOF
+        return $?
+    done
+    return 1
+}
+
+read_cfg() {
+    local key="$1" default="$2" val=""
+    val="$(_cfg_py "$key")" || val=""
+    printf "%s" "${val:-$default}"
+}
+
 BLOCK=0   # 有阻断项缺失
 
 # ───────────────────────── ① 包类·关键 ─────────────────────────
 # §11.7 "打包必装清单", 缺一拒绝出货
 declare -A CRITICAL=(
     ["stress-ng"]="CPU 压力"
-    ["glmark2-es2"]="GPU 渲染 (glmark2-es2-wayland)"
     ["fio"]="存储 读写 (USB/eMMC/TF)"
     ["memtester"]="内存"
     ["ethtool"]="网口 链路"
@@ -32,15 +75,22 @@ declare -A CRITICAL=(
     ["xrandr"]="HDMI 读当前实际输出 (x11-xserver-utils)"
     ["chromium-browser"]="PDF 报告导出 + UI 打开 (§4.4 / §8.2)"
 )
+# ⚠️ glmark2 **不在**上面那张表里 —— GPU 要哪个二进制取决于会话类型
+#    (x11 → glmark2-es2, wayland → glmark2-es2-wayland), 在一张固定表里
+#    写死其中一个, 就会在另一种会话的机器上误判「缺关键工具 → 拒绝出货」。
+#    它挪到 ③ 里按 variant 逐台判定 (见下面「GPU 变体与会话」)。
 
-# ───────────────────────── ② 包类·备份路径 ─────────────────────────
-# §11.7 "依赖补位": libgpiod 系列是风扇的备份路径, 主路径走
-# /proc/rp_gpio/pi5 (厂家内核节点), 故缺了只警告不阻断
+# ───────────────────────── ② 包类·诊断工具 ─────────────────────────
+# §11.7 "依赖补位": libgpiod 系列是风扇的**诊断工具**, **不是备份路径** ——
+# 本板风扇由厂商私有内核驱动直接控制, 标准 gpiod 接口看不到它
+# (/sys/class/gpio/ 不存在), 代码里也明确禁止拿 gpioget 静默兼底成 skipped
+# (见 server/tests/fan.py 的错误文案)。装它们是为了 scripts/find_pi5_label.py
+# 能查 PI5 的 gpiod 标签。故缺了只警告不阻断。
 declare -A BACKUP=(
-    ["gpioget"]="GPIO 读 (风扇备份路径, libgpiod-tools)"
-    ["gpioinfo"]="GPIO 自动探测 (风扇备份路径)"
-    ["gpioset"]="GPIO 写 (风扇备份路径)"
-    ["gpiomon"]="GPIO 监听 (风扇备份路径)"
+    ["gpioget"]="GPIO 读 (风扇诊断工具, libgpiod-tools)"
+    ["gpioinfo"]="GPIO 自动探测 (风扇诊断工具)"
+    ["gpioset"]="GPIO 写 (风扇诊断工具)"
+    ["gpiomon"]="GPIO 监听 (风扇诊断工具)"
 )
 
 echo "==> ① 包类·关键工具 (§11.7 打包必装清单)"
@@ -55,7 +105,7 @@ for cmd in "${!CRITICAL[@]}"; do
 done
 
 echo ""
-echo "==> ② 包类·备份路径 (缺不阻断)"
+echo "==> ② 包类·诊断工具 (缺不阻断)"
 MISSING_BAK=()
 for cmd in "${!BACKUP[@]}"; do
     if command -v "$cmd" > /dev/null 2>&1; then
@@ -134,19 +184,83 @@ else
     sc_block "HDMI 已连接" err "无 connected 的 HDMI connector, GPU 项将判 error (§6.3 前置 1)"
 fi
 
-# Wayland 会话 —— §6.3 前置条件 2
-if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-    sc_block "Wayland 会话 (WAYLAND_DISPLAY=$WAYLAND_DISPLAY)" ok
+# ── GPU 变体与会话 (§6.3) ──
+#
+# 口径必须跟 server/tests/gpu.py 的 _pick_variant() **讲同一套话**。
+# 否则这个脚本跟真跑起来的测试项会互相打脸: 脚本说"缺前置 → 拒绝出货",
+# 结果测试项自己跑得好好的(或者反过来) —— 两种情况产线都会开始不信这个工具。
+#
+# 2026-10-27 修掉的坑: 原来这里无条件要求 WAYLAND_DISPLAY, 于是**每块
+# 跑 X11 会话的板子都被判"缺前置 → 拒绝出货"** —— 而 gpu.py 在 auto 模式下
+# 本来就能用 DISPLAY + glmark2-es2 正常跑完(runs 41/48 那种 GPU 完全正常
+# 却把自己挡死的坑, 就是这么来的)。
+GPU_VARIANT_CFG="$(read_cfg defaults.gpu.variant auto)"
+case "$GPU_VARIANT_CFG" in
+    x11|wayland) ;;
+    *) GPU_VARIANT_CFG="auto" ;;
+esac
+
+_gpu_env_val() {
+    # $1 = DISPLAY | WAYLAND_DISPLAY
+    if [ "$1" = "DISPLAY" ]; then printf "%s" "${DISPLAY:-}"; else printf "%s" "${WAYLAND_DISPLAY:-}"; fi
+}
+
+GPU_PICK=""; GPU_ENV=""; GPU_BIN=""; GPU_WHY=""
+if [ "$GPU_VARIANT_CFG" != "auto" ]; then
+    GPU_PICK="$GPU_VARIANT_CFG"
+    if [ "$GPU_PICK" = "x11" ]; then
+        GPU_ENV="DISPLAY"; GPU_BIN="glmark2-es2"
+    else
+        GPU_ENV="WAYLAND_DISPLAY"; GPU_BIN="glmark2-es2-wayland"
+    fi
+    GPU_WHY="config gpu.variant=$GPU_PICK 强制指定"
 else
-    sc_block "Wayland 会话" err "WAYLAND_DISPLAY 为空, 无 GLES 上下文, GPU 项将判 error (§6.3 前置 2)"
+    # auto: 谁的环境变量在 + 谁装了二进制, 就用谁 (与 gpu.py 同序: wayland 优先)
+    for _v in wayland x11; do
+        if [ "$_v" = "x11" ]; then _e=DISPLAY; _b=glmark2-es2
+        else _e=WAYLAND_DISPLAY; _b=glmark2-es2-wayland; fi
+        if [ -n "$(_gpu_env_val "$_e")" ] && command -v "$_b" >/dev/null 2>&1; then
+            GPU_PICK="$_v"; GPU_ENV="$_e"; GPU_BIN="$_b"; GPU_WHY="auto 选中 $_v 会话"
+            break
+        fi
+    done
+    if [ -z "$GPU_PICK" ]; then
+        # 没有"会话+二进制"都齐的组合 —— GPU 项必然判 error。
+        # 说清到底缺什么, 而不是笼统地报"缺前置"。
+        if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+            GPU_WHY="有图形会话环境变量, 但对应的 glmark2 二进制没装"
+        else
+            GPU_WHY="既无 DISPLAY 也无 WAYLAND_DISPLAY, 没有图形会话"
+        fi
+    fi
+fi
+
+if [ -z "$GPU_PICK" ]; then
+    sc_block "GPU 图形会话前置 (§6.3)" err "$GPU_WHY, GPU 项将判 error"
+elif ! command -v "$GPU_BIN" >/dev/null 2>&1; then
+    sc_block "GPU 渲染二进制 $GPU_BIN" err "未安装, GPU 项将判 error (§6.3)"
+elif [ -z "$(_gpu_env_val "$GPU_ENV")" ]; then
+    sc_block "GPU 图形会话 ($GPU_ENV)" err "为空, 无 GLES 上下文, GPU 项将判 error (§6.3 前置 2)"
+elif [ "$GPU_VARIANT_CFG" = "auto" ] && [ "$GPU_PICK" = "x11" ]; then
+    # 能跑, 但不是设计稿写的那个会话 —— 降级成告警, **不阻断出货**。
+    sc_warn "GPU 图形会话 (X11)" err "本机会话是 X11 而非设计稿的 Wayland; 已按 auto 选 glmark2-es2, GPU 项能跑 —— 属非阻断告警, 请确认产线用的是 X11 镜像"
+    printf "      %s, 二进制 %s\n" "$GPU_WHY" "$GPU_BIN"
+else
+    sc_block "GPU 图形会话 ($GPU_PICK)" ok
+    printf "      %s, %s=%s, 二进制 %s\n" "$GPU_WHY" "$GPU_ENV" "$(_gpu_env_val "$GPU_ENV")" "$GPU_BIN"
 fi
 
 # eMMC 健康节点 —— 不存在则 eMMC 项判 error (§6.11)
+# ⚠️ 从「警告」提到「阻断」: 寿命检查进了 eMMC 项的**判定**里(已用寿命
+#    百分比 > 80% → failed; 节点读不到 → error), 所以它不是"锦上添花的
+#    健康信息", 而是**决定这板子能不能出货**的必读项。留成警告的话, 脚本
+#    放行 → 跑到 eMMC 那一步才 error → 白跑前面十几分钟。
 LIFE_TIME="/sys/block/mmcblk0/device/life_time"
 if [ -r "$LIFE_TIME" ]; then
-    sc_warn "eMMC 健康节点 life_time" ok
+    sc_block "eMMC 健康节点 life_time" ok
+    printf "      内容 = %s\n" "$(cat "$LIFE_TIME" 2>/dev/null | tr -s ' ')"
 else
-    sc_warn "eMMC 健康节点 life_time" err "不存在, eMMC 项的寿命检查判 error (§6.11)"
+    sc_block "eMMC 健康节点 life_time" err "不存在, eMMC 项的寿命检查判 error → 该板不合格 (§6.11)"
 fi
 
 # ⚠️ CJK 字体 —— §8.2.1。**查的是「字体真有这个字形」, 不是「装没装中文字体包」**
@@ -214,7 +328,7 @@ fi
 if [ ${#MISSING_BAK[@]} -gt 0 ] || [ "$_selfcheck_warn" = "1" ]; then
     echo "==> ⚠ 可出货, 但有非阻断告警"
     if [ ${#MISSING_BAK[@]} -gt 0 ]; then
-        echo "    缺备份路径 (主路径不受影响): $(printf '%s ' "${MISSING_BAK[@]}")"
+        echo "    缺诊断工具 (主路径不受影响): $(printf '%s ' "${MISSING_BAK[@]}")"
         echo "    风扇主路径走 $GPIO_NODE, 不受影响"
     fi
     exit 0

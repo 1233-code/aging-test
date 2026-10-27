@@ -12,8 +12,8 @@
 - 📶 **WiFi 仅扫描验证** —— 不连 AP, 4 步 iw 流水线
 - 🎬 **GPU 渲染压测** —— glmark2-es2 Wayland 全屏跑, 无需外部视频素材
 - 📊 **实时进度** —— WebSocket 推送温度、进度、日志
-- 📄 **自动出报告** —— pass/fail 逐项 + 历史可查, 拖动排序 + 5s 静默
-- 🔂 **失败重测** —— 只重跑 failed 项 (mini-run 模式)
+- 📄 **自动出报告** —— pass/fail 逐项 + 历史可查, 5s 静默
+- 🔂 **失败重测** —— 只重跑 failed/error 项 (mini-run 模式); 总结页和历史记录两个入口是同一个功能, 通过后**合并回原来那一轮**并更新那一份报告; 重测那一轮的日志在报告里**另起一节**印在「日志附录」后面, 首测的原始日志一个字不动 (§7.7)
 - 💾 **SQLite 存历史** —— 每次测试都有记录
 
 ## 📋 测试项 (10 项)
@@ -27,7 +27,7 @@
 | 5 | 网口 链路+ping | `ethtool` + `ping` | ✅ |
 | 6 | HDMI 输出 | `xrandr` (读当前实际输出) | ✅ |
 | 7 | 风扇 GPIO | `/proc/rp_gpio/pi5` (echo 拉高/拉低轮转 2 轮) | ✅ |
-| 8 | TF 卡 (auto + 提示) | `fio` | ✅ |
+| 8 | TF 卡 (自动探卡 + 自己挂载) | `fio` | ✅ |
 | 9 | 内存 压力 | `memtester` | ✅ |
 | 10 | eMMC 存储 | `fio` (稀疏文件) | ✅ |
 
@@ -41,7 +41,7 @@
 sudo bash scripts/install_deps.sh
 ```
 
-关键工具: `stress-ng` (CPU), `glmark2-es2` / `glmark2-es2-wayland` (GPU), `fio` (存储), `memtester` (内存), `ethtool`, `iputils-ping` (`ping`), `busybox` (`udhcpc`), `iw`, `rfkill` (WiFi), `iproute2`, `usbutils` (`lsusb`), `util-linux` (`lsblk`), `x11-xserver-utils` (`xrandr`, HDMI 读当前实际输出), `chromium-browser` (PDF 报告导出 + 自动打开界面), `fonts-wqy-zenhei` (中文报告字体 —— **缺了 PDF 报告会静默变成全空白**, 见 docs §8.2.1), `libgpiod-tools` / `libgpiod2-tools` (风扇备份路径, 缺不阻断) 等 (与 docs/需求设计.md §11.7 一致)。
+关键工具: `stress-ng` (CPU), `glmark2-es2` / `glmark2-es2-wayland` (GPU), `fio` (存储), `memtester` (内存), `ethtool`, `iputils-ping` (`ping`), `busybox` (`udhcpc`), `iw`, `rfkill` (WiFi), `iproute2`, `usbutils` (`lsusb`), `util-linux` (`lsblk`), `x11-xserver-utils` (`xrandr`, HDMI 读当前实际输出), `chromium-browser` (PDF 报告导出 + 自动打开界面), `fonts-wqy-zenhei` (中文报告字体 —— **缺了 PDF 报告会静默变成全空白**, 见 docs §8.2.1), `libgpiod-tools` / `libgpiod2-tools` (**风扇的诊断工具, 不是备份路径** —— 本板风扇是厂商私有驱动, 标准 gpiod 接口看不到它; 缺不阻断) 等 (与 docs/需求设计.md §11.7 一致)。
 
 > **不再需要 `libdrm-tools` / `modetest`** —— HDMI 模式切换已整块移除(改用 sysfs + xrandr 读当前状态), 详见 docs §6.7.1。
 
@@ -101,7 +101,7 @@ aging-test/
 │       ├── cpu.py / gpu.py / fan.py / emmc.py / ...
 │       └── registry.py          # @register 装饰器
 ├── static/
-│   ├── index.html               # Vue 3 单页 (带拖动排序 + 5s 静默期提示)
+│   ├── index.html               # Vue 3 单页 (5s 静默期提示)
 │   ├── app.js
 │   └── style.css
 ├── scripts/
@@ -120,14 +120,14 @@ aging-test/
 |---|---|---|
 | `/api/health` | GET | 健康检查 |
 | `/api/config` | GET | 配置 + 测试项 + **推荐顺序** |
-| `/api/test/start` | POST | 启动测试 (workers 拖动后的顺序) |
-| `/api/test/retest` | POST | mini-run: 只重跑 failed 项 |
+| `/api/test/start` | POST | 启动测试 (按 §7.6 推荐顺序) |
+| `/api/test/retest` | POST | mini-run: 只重跑失败/出错的项, **合并回被重测的那一轮**并重导那一份报告 (§7.7)。总结页与历史记录两个入口共用它, 只有目标轮次不同 |
 | `/api/test/stop` | POST | 停止 |
 | `/api/test/status` | GET | 当前状态 |
 | `/api/deps/check` | GET | 装机时缺工具自检 (拒绝出货) |
-| `/api/history` | GET | 历史列表 (含 mini-run) |
-| `/api/history/{id}` | GET | 单次详情 |
-| `/ws` | WS | 实时事件流 (`progress / log / metric / between_tests / run_started / test_started / test_finished / run_finished`) |
+| `/api/history` | GET | 历史列表 (**一行 = 一条归档记录**; 默认不列重测轮, `?include_mini=1` 看原始行。按 `COALESCE(updated_at, started_at) DESC` 排 —— 被重测合并过的记录刚动过, 排在最上面) |
+| `/api/history/{id}` | GET | 单次详情 (带 `retest_runs`: 这一轮底下有几轮重测、每轮重测了什么、日志) |
+| `/ws` | WS | 实时事件流 (`progress / log / metric / between_tests / run_started / test_started / test_finished / run_finished / parent_merged`) |
 
 ## 🛠️ 后续 TODO
 
