@@ -28,6 +28,21 @@ header h1 { font-size: 22px; }
     min-width: 0;      /* 允许收缩, 否则 SN 一长就把右侧按钮顶出屏幕 */
 }
 .header-right { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+/* §10.5 本轮总耗时 —— 顶栏右上角的读秒。
+   等宽字体: 它一秒一秒地跳, 比例字体的数字宽度会带着整块标签左右晃。 */
+.run-timer {
+    background: #37474f;
+    color: #fff;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: ui-monospace, "DejaVu Sans Mono", "Courier New", monospace;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;   /* 每个数字一样宽, 不跳版 */
+}
+/* 跑完了 → 换个颜色: 还在跑的是「进行中」, 停了的是「已完」的记录。 */
+.run-timer.run-timer-done { background: #546e7a; }
 .device-tag {
     background: #e3f2fd;
     color: #1976d2;
@@ -670,8 +685,21 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     transition: width 0.3s ease;
 }
 .wizard-current {
-    flex: 1;
-    padding: 24px 0;
+    /* ⚠️ **必须是 0 0 auto, 不能是 flex: 1** ——
+       下面那个日志区也是 flex: 1, 两个都「长大」的话, 剩下的高度会被
+       **平分**: 日志框被推下去, 中间空出一大片白 —— 工人要看的日志挤在
+       屏幕最底下, 上面全是空白(2026-10-28 产线提的「日志往上面挪挪,
+       别留太多空白」)。
+       这里只占**内容该占的高度**, 剩下的全给日志框。 */
+    flex: 0 0 auto;
+    padding: 16px 0;
+}
+/* 测试项名字在左、这一项的结果在右 —— 一行摆完, 不占两行。 */
+.wizard-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
 }
 .wizard-step-label {
     color: #888;
@@ -684,7 +712,10 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     font-size: 36px;
     font-weight: 600;
     color: #2c3e50;
-    margin-bottom: 12px;
+    /* 原来这里有 margin-bottom: 12px —— 那时候名字自己占一行。
+       现在名字跟结果药丸**同一行**(见 .wizard-title-row, align-items:center),
+       再留个下边距, 文字就会比右边那个药丸高半个身位, 看着没对齐。 */
+    margin-bottom: 0;
 }
 .wizard-status {
     display: inline-flex;
@@ -694,7 +725,11 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
     border-radius: 20px;
     font-size: 14px;
     font-weight: 500;
-    margin-bottom: 20px;
+    /* 原来这里有 margin-bottom: 20px —— 结果药丸自己占一行还要带 20px
+       下边距, 白占竖着的地方。现在它跟测试项名字同一行(见 .wizard-title-row),
+       下边距交给 .wizard-current 的 padding 管。 */
+    margin-bottom: 0;
+    flex: 0 0 auto;
 }
 .wizard-status .status-dot {
     width: 8px; height: 8px;
@@ -734,6 +769,45 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .wizard-progress-pct { font-weight: 600; color: #1976d2; min-width: 40px; }
 .wizard-progress-msg { color: #888; font-size: 13px; }
+
+/* ⚠️ **大横幅** —— 「屏幕马上要黑了」这类**必须让工人看见**的事。
+   摆在进度条底下, 字号拉到 22px, 底色压重, 还一明一暗地跳 ——
+   因为马上要黑的那块屏就是工人正盯着的那块, 提示得抢得到那一眼。
+   颜色: danger = 红 (马上要出状况), warn = 橙 (提醒), info = 蓝 (纯告知)。 */
+.wizard-alert {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 4px 0 16px;
+    padding: 16px 20px;
+    border-radius: 8px;
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.4;
+    color: #fff;
+    background: #ef6c00;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+    animation: alert-blink 1s ease-in-out infinite;
+}
+.wizard-alert .alert-icon { font-size: 28px; }
+.wizard-alert .alert-text { flex: 1; }
+.wizard-alert .alert-countdown {
+    flex: 0 0 auto;
+    min-width: 52px;
+    padding: 2px 10px;
+    text-align: center;
+    font-size: 30px;
+    font-weight: 800;
+    background: rgba(0, 0, 0, 0.28);
+    border-radius: 6px;
+}
+.wizard-alert.warn { background: #ef6c00; }
+.wizard-alert.danger { background: #c62828; }
+.wizard-alert.info { background: #1976d2; }
+@keyframes alert-blink {
+    0%, 100% { filter: brightness(1); }
+    50% { filter: brightness(1.22); }
+}
 
 /* 「本项预计 / 已过 / 剩余」方块的样式 (2026-10-23 随该元素一并移除)。
    留在这里当记录: 那个方块与 .wizard-progress-line 是两套不同的数 —— 方块按

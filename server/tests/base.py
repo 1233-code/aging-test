@@ -15,6 +15,10 @@ class TestContext:
     on_log: Any             # async callback(line: str)
     is_cancelled: Any       # async callable -> bool
     on_metric: Any          # async callback(key: str, value: Any) 实时指标
+    # async callback(text, level, seconds) —— **界面上显眼的横幅**。
+    # 默认 None = 这一项不需要横幅(现在只有 HDMI 的「马上要黑屏」用)。
+    # text 为空串 = **收起**横幅。
+    on_alert: Any = None
 
 
 @dataclass

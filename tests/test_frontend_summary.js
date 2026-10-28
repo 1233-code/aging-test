@@ -22,11 +22,20 @@
 
 const fs = require('fs');
 const path = require('path');
+
+/* 同别的前端测试: AGING_STATIC_DIR 指到别处就能对着**副本**跑 ——
+ * 变异测试要把 static/ 改坏, 断言必须红, 否则这测试是个摆设。 */
+const STATIC_DIR = process.env.AGING_STATIC_DIR
+    || path.join(__dirname, '..', 'static');
+/* 让 _vue_harness 也读副本里的 app.js (模块加载时就取值, 必须先设好)。 */
+process.env.AGING_APP_JS = process.env.AGING_APP_JS
+    || path.join(STATIC_DIR, 'app.js');
+
 const { loadApp, makeChecker } = require('./_vue_harness');
 
 const { check, section, finish } = makeChecker();
 
-const INDEX_HTML = path.join(__dirname, '..', 'static', 'index.html');
+const INDEX_HTML = path.join(STATIC_DIR, 'index.html');
 
 /** 让挂起的 promise 走完 (WS 事件处理是 async 的) */
 const tick = (ms) => new Promise(r => setTimeout(r, ms || 5));
@@ -285,6 +294,99 @@ async function main() {
         check(/goConfig[^>]*:disabled="isRunning"/.test(html)
               || /:disabled="isRunning"[^>]*goConfig/.test(html),
               '「返回配置」按钮在运行中是禁用的');
+    }
+
+    // ══════════════════════════════════════════════════════════
+    section('【9】四项四种状态: 通过率**每一项只数一次**');
+    /* 老坑: `failedCount` 本来数的是「failed + error」(它原本是给重测按钮
+     * 用的), 而通过率写的是 `passed + failedCount + errorCount` ——
+     * 于是**每个出错的项被数了两遍**:
+     *
+     *     1 passed + 1 failed + 1 error → 界面显示「3 失败」「1/4 通过」
+     *
+     * 而 §9.2 的口径是 total = passed + failed + error, 每一项只该数一次。 */
+    {
+        const a = await makeApp();
+        a.applySnapshot(snap({
+            status: 'running',
+            results: {
+                cpu: { status: 'passed', metrics: {}, error: null },
+                gpu: { status: 'failed', metrics: {}, error: '渲染分数不达标' },
+                usb: { status: 'error', metrics: {}, error: '这一项没测成' },
+                wifi: { status: 'skipped', metrics: {}, error: '环境不具备条件' },
+            },
+        }));
+        check(a.passedCount.value === 1, '通过 1 项', a.passedCount.value);
+        check(a.failedCount.value === 1, '失败 1 项 (只有 failed)',
+              a.failedCount.value);
+        check(a.errorCount.value === 1, '出错 1 项', a.errorCount.value);
+        check(a.skippedCount.value === 1, '跳过 1 项', a.skippedCount.value);
+        check(a.executedCount.value === 3,
+              '已测 3 项 (1+1+1, 跳过的不算)', a.executedCount.value);
+        check(a.passRateText.value === '1/3',
+              '通过率 1/3 (**不是** 1/4 —— error 不该数两遍)',
+              a.passRateText.value);
+        check(a.plannedCount.value === 4, '共勾选 4 项', a.plannedCount.value);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    section('【10】可重测的项 = 失败 + 出错 + **跳过** (总结页)');
+    /* 跳过的项也是「没测成」—— 没接显示器 / 没插网线 / 卡槽是空的。
+     * 补上料、补上环境之后就该能重测, 所以跟失败项走**同一个**重测入口
+     * (§7.7)。stopped(用户中途叫停)不算: 那些项压根没轮到, 工人是主动
+     * 叫停的, 不该由这个入口接管。 */
+    {
+        const a = await makeApp();
+        a.applySnapshot(snap({
+            status: 'running',
+            results: {
+                cpu: { status: 'passed', metrics: {}, error: null },
+                gpu: { status: 'failed', metrics: {}, error: '渲染分数不达标' },
+                usb: { status: 'error', metrics: {}, error: '这一项没测成' },
+                wifi: { status: 'skipped', metrics: {}, error: '环境不具备条件' },
+            },
+        }));
+        check(a.hasRetestableItems.value === true,
+              '有可重测的项 → 按钮该出现', a.hasRetestableItems.value);
+        check(a.retestableCount.value === 3,
+              '可重测 3 项 (失败+出错+跳过)', a.retestableCount.value);
+        const names = a.retestableItemNames.value.slice().sort();
+        check(JSON.stringify(names) === JSON.stringify(['gpu', 'usb', 'wifi']),
+              '可重测的是 gpu / usb / wifi', JSON.stringify(names));
+        check(!names.includes('cpu'),
+              '已经过了的不重测 (免得白跑一遍)', JSON.stringify(names));
+    }
+
+    section('【11】stopped 的项**不**进重测清单');
+    {
+        const a = await makeApp();
+        a.applySnapshot(snap({
+            status: 'running',
+            results: {
+                cpu: { status: 'passed', metrics: {}, error: null },
+                gpu: { status: 'stopped', metrics: {}, error: '用户中途停止' },
+                usb: { status: 'pending', metrics: {}, error: null },
+                wifi: { status: 'pending', metrics: {}, error: null },
+            },
+        }));
+        check(a.retestableCount.value === 0,
+              '没跑到/还没到的项不算可重测', a.retestableCount.value);
+        check(a.hasRetestableItems.value === false,
+              '按钮不该出现', a.hasRetestableItems.value);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    section('【12】模板: 总结页的重测按钮挂的是**新的**口径');
+    {
+        const html = fs.readFileSync(INDEX_HTML, 'utf8');
+        check(html.includes('hasRetestableItems'),
+              '总结页按钮用 hasRetestableItems 当守卫');
+        check(html.includes('retestableCount'),
+              '按钮上的数字用 retestableCount');
+        check(html.includes('retestFailedOrSkipped'),
+              '按钮点的是 retestFailedOrSkipped');
+        check(/重测失败\/跳过项/.test(html),
+              '按钮上写着「重测失败/跳过项」(工人一眼知道跳过项也能重测)');
     }
 
     return finish();

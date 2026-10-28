@@ -145,4 +145,16 @@ check(/@click="startTest"/.test(panel), '开始测试仍绑 startTest');
 check(/:disabled="!hasAnyEnabled"/.test(panel),
       '开始测试仍按 hasAnyEnabled 禁用 (一项没勾不许开跑)');
 
+/* §6.7.3 断开→恢复轮: 工具自己用 xrandr --off/--auto 关一次屏再开回来,
+ * 工人**不用动手**; 但关屏那几秒这块屏是黑的 —— 不提前说清楚, 工人会
+ * 以为工具卡死了(而这时候界面正好也停在黑屏上, 连日志都看不见)。
+ * 所以配置页上必须提前把这件事说清楚 —— 这是一条纯提示, 但删了它,
+ * 现场表现就是「工人说工具卡住了」。 */
+section('【6】HDMI 断开→恢复轮的提示在配置页上 (关屏那几秒会黑屏, 但不用操作)');
+check(/t\.name === 'hdmi'/.test(panel), '配置页里有 hdmi 那一档的提示');
+check(/replug_check/.test(panel), '提示跟着 replug_check 开关走 (关了就不显示)');
+check(/断开\/恢复/.test(panel), '提示里写了「自动断开/恢复」');
+check(/黑/.test(panel), '提示里写了「会黑几秒」');
+check(/不用操作/.test(panel), '提示里说了不用工人操作');
+
 process.exit(finish());

@@ -240,7 +240,8 @@ class TestRunner:
 
         # 创建 DB 记录
         self.run_id = await Database.create_run(config, self._run_meta())
-        await self._broadcast({"type": "run_started", "run_id": self.run_id})
+        await self._broadcast({"type": "run_started", "run_id": self.run_id,
+                               "started_at": self.started_at})
 
         self._task = asyncio.create_task(self._run_all(config))
         return {"ok": True, "run_id": self.run_id}
@@ -342,6 +343,9 @@ class TestRunner:
             "run_id": self.run_id,
             "mode": "mini",
             "parent_run_id": root_id,
+            # §10.5 计时起点 —— 前端顶栏那个读秒要用它(它跟报告里的
+            # 「总耗时」是同一个数)。
+            "started_at": self.started_at,
         })
 
         # mini-run 也按推荐顺序跑
@@ -489,6 +493,8 @@ class TestRunner:
             on_log=lambda line, n=name: self._on_log(n, line),
             is_cancelled=self._is_cancelled,
             on_metric=lambda k, v, n=name: self._on_metric(n, k, v),
+            on_alert=lambda text, level="warn", seconds=0, n=name:
+                self._on_alert(n, text, level, seconds),
         )
 
         # §7.3 的重试: 头一次的日志**接在后面**, 不是冲掉 —— 头一次为什么
@@ -711,6 +717,9 @@ class TestRunner:
                 "parent_run_id": self.parent_run_id,
                 # 总结页要显示「哪台机器、什么时候、出的什么事」(§7.2/§7.6)
                 "sn": self.sn,
+                # 起点也得带上 —— 界面上的总耗时是「结束 − 起点」算的,
+                # 只给结束时间的话前端配不上起点(见下面正常收尾那条的说明)。
+                "started_at": self.started_at,
                 "finished_at": self.finished_at,
                 "error": self.run_error,
             })
@@ -730,6 +739,7 @@ class TestRunner:
                 "mode": self.mode,
                 "parent_run_id": self.parent_run_id,
                 "sn": self.sn,
+                "started_at": self.started_at,
                 "finished_at": self.finished_at,
                 "error": "未选择任何测试",
             })
@@ -903,6 +913,12 @@ class TestRunner:
             # 的总结页尤其需要这个 —— 那个总结页可能是**上一轮**的结果, 不标
             # 出来工人会以为刚刚又测了一遍。
             "sn": self.sn,
+            # ⚠️ **起点也得带上** —— 界面上的总耗时是「结束 − 起点」算出来的,
+            #    只给结束时间的话, 前端只能拿**上一条**事件里留下的起点来配 ——
+            #    而合并重测(§7.7)时上一条是 `run_started`(重测轮的起点),
+            #    这里却是父轮的结束时间 ⇒ 界面上那个数大得离谱。
+            #    两个数一起发, 前端拿到的才是**同一轮**的一对。
+            "started_at": self.started_at,
             "finished_at": self.finished_at,
             "error": self.run_error,
         })
@@ -1158,6 +1174,22 @@ class TestRunner:
 
     async def _on_metric(self, name: str, key: str, value):
         await self._broadcast({"type": "metric", "name": name, "key": key, "value": value})
+
+    async def _on_alert(self, name: str, text: str, level: str = "warn",
+                        seconds: float = 0):
+        """界面上那条**显眼的大横幅**(不是日志行)。
+
+        为什么日志不够: 屏幕马上要黑掉的时候, 工人的注意力在**屏上**,
+        不在下面那框日志里 —— 而这一屏正是马上要变黑的那一块, 提示得
+        出现在**进度条底下**、字号大、颜色重, 才抢得到那一眼。
+
+        text 为空串 = **收起**横幅(倒计时走完、开始操作了)。
+        seconds = 横幅上的倒计时秒数(0 = 不倒计时, 一直挂着直到被收起)。
+        """
+        await self._broadcast({
+            "type": "alert", "name": name, "text": text,
+            "level": level or "warn", "seconds": seconds,
+        })
 
     async def stop(self):
         if self.status != "running":

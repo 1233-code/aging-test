@@ -92,6 +92,15 @@ HDMI-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis
    1920x1080_50.00  50.00*+
 """
 
+# xrandr 里**只有 DP-1**, 没有 HDMI 口 —— 而 sysfs 说 HDMI 是 connected。
+# 这是「xrandr 里没有对应输出口」, 不是「读不到 xrandr」: 三态里都是
+# unavailable(降级放行), 但**指标上要分得开** —— 否则报告上写着「未验证」,
+# 看报告的人以为压根没查, 而不是「查了, 但 xrandr 里没有这个口」。
+XR_NO_HDMI = """Screen 0: minimum 320 x 200, current 1920 x 1080, maximum 8192 x 8192
+DP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 527mm x 296mm
+   1920x1080_60.00  59.96*+
+"""
+
 
 class FakeCtx:
     def __init__(self, target="1920x1080@60"):
@@ -256,6 +265,16 @@ async def case9():
           "日志里明写了不一致", ctx2.text[-200:])
 
 
+async def case10():
+    print("\n【10】xrandr 里**没有对应输出口** → 降级 pass, 指标要跟「读不到 xrandr」分得开")
+    r, ctx = await run_hdmi([CONN_HDMI], XR_NO_HDMI)
+    check(r.status == "passed", "降级放行 (不误杀好板子)", r.status)
+    check(r.metrics.get("current_resolution") == "(xrandr 无对应输出口)",
+          "指标写的是「无对应输出口」, 不是笼统的「未验证」",
+          r.metrics.get("current_resolution"))
+    check("没有与" in ctx.text, "日志里点名说是没有对应输出口", ctx.text[-200:])
+
+
 async def main():
     await case1()
     await case2()
@@ -266,6 +285,7 @@ async def main():
     await case7()
     await case8()
     await case9()
+    await case10()
     print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))
     return 0 if not FAILS else 1
 

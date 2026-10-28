@@ -20,18 +20,61 @@ const { execFileSync } = require('child_process');
 const REPO = path.join(__dirname, '..');
 const SRC = path.join(REPO, 'static');
 const TEST = path.join(__dirname, 'test_frontend_retest_history.js');
+/* 总结页那套断言(通过率口径 + 可重测清单)住在另一个测试文件里。
+ * 带 `summary: true` 的变异**两个测试都跑** —— 任意一个变红就算守住了。
+ * (路径是写死的常量, 不从变异表里取 —— 不给「跑任意文件」留口子。) */
+const TEST_SUMMARY = path.join(__dirname, 'test_frontend_summary.js');
 
 /* 每个变异: 把某个文件里的 from 换成 to, 测试必须变红。 */
 const MUTATIONS = [
     {
-        name: 'JS: historyFailedNames 不再挑「出错」的项 (只挑 failed)',
+        name: 'JS: historyRetestableNames 不再挑「出错」的项 (只挑 failed)',
         file: 'app.js',
-        from: `        const historyFailedNames = (detail) => (detail && detail.results || [])
-            .filter(r => r.status === 'failed' || r.status === 'error')
+        from: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
+            .filter(r => r.status === 'failed' || r.status === 'error'
+                     || r.status === 'skipped')
             .map(r => r.test_name);`,
-        to: `        const historyFailedNames = (detail) => (detail && detail.results || [])
+        to: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
             .filter(r => r.status === 'failed')
             .map(r => r.test_name);`,
+    },
+    {
+        name: 'JS: historyRetestableNames 不再挑「跳过」的项 (跳过的不能重测了)',
+        file: 'app.js',
+        from: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
+            .filter(r => r.status === 'failed' || r.status === 'error'
+                     || r.status === 'skipped')
+            .map(r => r.test_name);`,
+        to: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
+            .filter(r => r.status === 'failed' || r.status === 'error')
+            .map(r => r.test_name);`,
+    },
+    {
+        name: 'JS: 总结页的可重测清单里没有「跳过」的项',
+        file: 'app.js',
+        summary: true,
+        from: `        const retestableItemNames = computed(() =>
+            resultList.value
+                .filter(r => r.status === 'failed' || r.status === 'error'
+                         || r.status === 'skipped')
+                .map(r => r.name)
+        );`,
+        to: `        const retestableItemNames = computed(() =>
+            resultList.value
+                .filter(r => r.status === 'failed' || r.status === 'error')
+                .map(r => r.name)
+        );`,
+    },
+    {
+        name: 'JS: failedCount 又把「出错」算进去 (通过率把 error 数两遍)',
+        file: 'app.js',
+        summary: true,
+        from: `        const failedCount = computed(() =>
+            resultList.value.filter(r => r.status === 'failed').length
+        );`,
+        to: `        const failedCount = computed(() =>
+            resultList.value.filter(r => r.status === 'failed' || r.status === 'error').length
+        );`,
     },
     {
         name: 'JS: 历史页重测打的是**当前轮**而不是被点开的那条记录',
@@ -87,8 +130,22 @@ const MUTATIONS = [
     {
         name: 'HTML: 按钮没有「有失败项才出现」的守卫 (全过了也给重测)',
         file: 'index.html',
-        from: `<button v-if="!historyDetail.mini_of && historyFailedNames(historyDetail).length"`,
+        from: `<button v-if="!historyDetail.mini_of && historyRetestableNames(historyDetail).length"`,
         to: `<button v-if="!historyDetail.mini_of"`,
+    },
+    {
+        name: 'HTML: 总结页的重测按钮没有守卫 (全过了也给重测)',
+        file: 'index.html',
+        summary: true,
+        from: `                        v-if="hasRetestableItems"`,
+        to: `                        v-if="true"`,
+    },
+    {
+        name: 'HTML: 总结页按钮上的数字写死 (跳过项没算进去)',
+        file: 'index.html',
+        summary: true,
+        from: `>🔂 重测失败/跳过项 ({{ retestableCount }})</button>`,
+        to: `>🔂 重测失败/跳过项 ({{ failedCount }})</button>`,
     },
     {
         name: 'HTML: 按钮不再禁用 (跑着的时候也能点)',
@@ -152,15 +209,21 @@ for (const mut of MUTATIONS) {
     }
     fs.writeFileSync(p, orig.replace(mut.from, mut.to));
     let code = 0, out = '';
-    try {
-        out = execFileSync('node', [TEST], {
-            env: { ...process.env, AGING_STATIC_DIR: TMP },
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
-    } catch (e) {
-        code = e.status === undefined ? -1 : e.status;
-        out = (e.stdout || '') + (e.stderr || '');
+    /* 带 summary 标记的变异: 重测那套断言盯不到通过率口径, 两个测试都跑,
+     * 任意一个变红就算守住了。 */
+    const tests = mut.summary ? [TEST, TEST_SUMMARY] : [TEST];
+    for (const t of tests) {
+        try {
+            const o = execFileSync('node', [t], {
+                env: { ...process.env, AGING_STATIC_DIR: TMP },
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            out += o;
+        } catch (e) {
+            code = e.status === undefined ? -1 : e.status;
+            out += (e.stdout || '') + (e.stderr || '');
+        }
     }
     const fails = (out.match(/✗/g) || []).length;
     if (code !== 0) {

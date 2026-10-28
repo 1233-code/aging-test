@@ -63,6 +63,36 @@ createApp({
                 logResizeObserver.observe(el);
             }
         });
+        // ⚠️ **大横幅** (2026-10-28) —— 「屏幕马上要黑了」这类**必须让工人
+        // 看见**的事, 不能只写进日志框。
+        //
+        // 为什么日志不够: 马上要黑屏的那一块, 就是工人正盯着的那一块; 而
+        // 日志框在屏幕最下面, 工人此刻的视线在**进度条**上。所以提示得摆在
+        // 进度条底下, 大字 + 重底色 + 倒计时, 才抢得到那一眼。
+        //
+        // 后端推 alert 事件 → setAlert(); text 为空串 = **收起**横幅
+        // (倒计时走完、后端开始真操作了 —— 那会儿屏已经是黑的, 挂着没意义)。
+        const alertBanner = ref(null);
+        let alertTimer = null;
+        const setAlert = (text, level, seconds) => {
+            if (alertTimer) { clearInterval(alertTimer); alertTimer = null; }
+            if (!text) { alertBanner.value = null; return; }
+            const total = Math.max(0, Math.ceil(Number(seconds) || 0));
+            alertBanner.value = { text, level: level || 'warn', countdown: total };
+            if (total <= 0) return;
+            // 倒计时每秒减 1。减到 0 **横幅不撤** —— 撤不撤由后端说了算
+            // (它知道黑屏那一刻到了); 这里只把数字藏掉。
+            alertTimer = setInterval(() => {
+                const b = alertBanner.value;
+                if (!b) { clearInterval(alertTimer); alertTimer = null; return; }
+                if (b.countdown > 0) b.countdown -= 1;
+            }, 1000);
+            // Node 里 (测试用) 让这个定时器别吊着进程 —— 浏览器里没这方法。
+            if (alertTimer && typeof alertTimer.unref === 'function') {
+                alertTimer.unref();
+            }
+        };
+
         const history = ref([]);
         const historyDetail = ref(null);
         // 历史页当前**就地展开**的那一条(存 run id, 不是下标 —— 下标会随
@@ -105,6 +135,51 @@ createApp({
         // 工人会以为刚刚又测了一遍。
         const runSn = ref('');
         const runFinishedAt = ref(0);
+        // ── §10.5 本轮总耗时 ──
+        //
+        // 口径跟报告里的「总耗时」**完全一致**: finished_at - started_at,
+        // 两个数都是**后端**记的 —— 工人中途刷新页面, 计时照样接着走
+        // (§7.6: 界面状态不能只挂在事件上)。
+        //
+        // ⚠️ 为什么不用前端自己记起点: 前端记的是「浏览器说它什么时候开始」,
+        // 而报告印的是「后端说它什么时候开始」 —— 两个数差几秒, 工人对着
+        // 屏幕和对着纸面会看出两回事。用后端的时间戳, 界面跟报告永远对得上。
+        const runStartedAt = ref(0);
+        // 「现在」—— 每秒走一格, 只为让读秒**看得见在动**。
+        // 计时本身不用它算(用的是后端的时间戳), 它只在**还没结束**时兜底。
+        const clockNow = ref(Date.now() / 1000);
+        let clockTimer = null;
+        const startClock = () => {
+            if (clockTimer) return;
+            clockTimer = setInterval(() => {
+                clockNow.value = Date.now() / 1000;
+            }, 1000);
+            // Node 里(测试用)让这个定时器别吊着进程 —— 浏览器里没这方法。
+            if (clockTimer && typeof clockTimer.unref === 'function') {
+                clockTimer.unref();
+            }
+        };
+        const stopClock = () => {
+            if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
+        };
+        // 秒 → 「HH:MM:SS」。给顶栏那个读秒用。
+        const fmtHms = (sec) => {
+            const s = Math.max(0, Math.floor(Number(sec) || 0));
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const ss = s % 60;
+            const p2 = (n) => String(n).padStart(2, '0');
+            return `${p2(h)}:${p2(m)}:${p2(ss)}`;
+        };
+        // 秒 → 「2m00s」/「58.2s」。
+        //
+        // ⚠️ **必须跟报告里的 `_fmt_dur` 一个格式** —— 工人盯着屏幕上的总耗时,
+        //    又翻报告对一眼, 两个写法不一样的话他会以为其中一个是错的。
+        const fmtDur = (sec) => {
+            const s = Number(sec);
+            if (!isFinite(s) || s < 0) return '—';
+            return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m${String(Math.floor(s % 60)).padStart(2, '0')}s`;
+        };
         // §7.6 整轮异常终止的原因(status=error)。没有它, 总结页上只有
         // 「0 通过 / 0 失败 / 0 跳过」, 工人根本看不出出了什么事。
         const runError = ref('');
@@ -164,13 +239,35 @@ createApp({
             return `被测设备 SN: ${sn.value}`;
         });
 
-        const failedItemNames = computed(() =>
+        // ── §7.7 「没测出通过结果」的项都能重测 ──
+        //
+        // failed + error + **skipped**: 跳过的项也是**没测成** —— 未接显示器、
+        // 网口没插、TF 卡槽是空的、环境不具备条件。这些恰恰是「补上料/补上环境
+        // 之后再跑一遍」就能测的项, 所以跟失败项走**同一个**重测入口。
+        // (stopped —— 用户中途停止、压根没跑到的项 —— 不算: 那不是「跳过」,
+        //  工人是主动叫停的, 那一轮剩下的项本来就不该由这个入口接管。)
+        const retestableItemNames = computed(() =>
             resultList.value
-                .filter(r => r.status === 'failed' || r.status === 'error')
+                .filter(r => r.status === 'failed' || r.status === 'error'
+                         || r.status === 'skipped')
                 .map(r => r.name)
         );
-        const hasFailedItems = computed(() => failedItemNames.value.length > 0);
-        const failedCount = computed(() => failedItemNames.value.length);
+        const hasRetestableItems = computed(() => retestableItemNames.value.length > 0);
+        const retestableCount = computed(() => retestableItemNames.value.length);
+
+        // ⚠️ `failedCount` **只数 failed**。
+        //
+        // 以前这个 computed 数的是「failed + error」(它本来是给重测按钮用的),
+        // 而汇总标题写的是 `failedCount + errorCount`、通过率写的是
+        // `passed + failedCount + errorCount` —— 于是**每个出错的项被数了两遍**:
+        // 1 个 failed + 1 个 error 的轮次, 界面上会显示「3 失败」「1/4 通过」。
+        // §9.2 的口径是 total = passed + failed + error, 每一项只该数一次。
+        const failedCount = computed(() =>
+            resultList.value.filter(r => r.status === 'failed').length
+        );
+        const hasFailedItems = computed(() =>
+            resultList.value.some(r => r.status === 'failed' || r.status === 'error')
+        );
         const passedCount = computed(() =>
             resultList.value.filter(r => r.status === 'passed').length
         );
@@ -206,6 +303,24 @@ createApp({
         const notTestedText = computed(() =>
             notTestedItems.value.map(x => x.name).join('、')
         );
+
+        // ── §10.5 本轮总耗时 ──
+        //
+        // 「已经过了多少秒」—— 还没结束就用本机时钟兜底, 结束了就锁死在
+        // 后端记的 finished_at 上(那才是报告里印的那个数)。
+        const elapsedSec = computed(() => {
+            if (!runStartedAt.value) return 0;
+            const end = runFinishedAt.value || clockNow.value;
+            return Math.max(0, Math.floor(end - runStartedAt.value));
+        });
+        // 顶栏那个读秒: 「00:12:34」
+        const elapsedText = computed(() => fmtHms(elapsedSec.value));
+        // 总结页上的「总耗时」: 「12m34s」—— **跟报告里那个数同一个格式**。
+        const totalDurationText = computed(() => {
+            if (!runStartedAt.value) return '';
+            const end = runFinishedAt.value || clockNow.value;
+            return fmtDur(Math.max(0, end - runStartedAt.value));
+        });
 
         // 当前向导显示的测试
         const currentTest = computed(() =>
@@ -450,6 +565,13 @@ createApp({
             // 这一轮的身份 —— 总结页顶部要印 (§7.2)
             if (msg.sn) runSn.value = msg.sn;
             if (msg.finished_at) runFinishedAt.value = msg.finished_at;
+            // §10.5 计时起点 —— 快照是**权威**: 刷新页面/WS 断线重连之后,
+            // 计时照样从后端记的那个起点接着走(§7.6 同一条规矩)。
+            if (msg.started_at) runStartedAt.value = msg.started_at;
+            // ⚠️ **刷新页面也得把表走起来** —— run_started 事件只在开跑那一刻
+            // 广播一次, 工人跑到一半按 F5, 这条事件不会再来。不在这里起表,
+            // 顶栏的读秒就停在「页面刚打开那一刻」, 一直不走。
+            if (msg.status === 'running') startClock();
             // 整轮异常终止的原因 (status=error)。快照里没带就不动它 ——
             // 跟 pdf_path 一个道理, 别拿一个空值把已有的原因冲掉。
             if (msg.error) runError.value = msg.error;
@@ -604,14 +726,18 @@ createApp({
             await loadHistory();
         };
 
-        // ========== 重测失败项 (§7.7) ==========
+        // ========== 重测失败/跳过项 (§7.7) ==========
         //
         // **总结页和历史页调的是同一个函数** —— 两者唯一的差别是「重测哪一轮」:
         //   · 总结页: 刚跑完这一轮 → 目标 = 当前这一轮
         //   · 历史页: 点开的那条记录 → 目标 = **那条记录**(可能是刚跑完, 也可能
         //     是过了一会儿、期间还开了别的测试)
         // 两条路走的是同一个后端接口, 都会把结果**合并回被重测的那一轮**,
-        // 并更新那一份报告 —— 这才是「重测失败项」该有的样子。
+        // 并更新那一份报告 —— 这才是「重测失败/跳过项」该有的样子。
+        //
+        // **重测哪些项**: failed + error + skipped(见上面 retestableItemNames)。
+        // 跳过的那几项也是**没测成**(没接显示器 / 没插网线 / 卡槽是空的) ——
+        // 补上料、补上环境之后就该能重测, 所以跟失败项走同一个入口。
         //
         // seedItems: 历史页进来时向导页的结果列表是空的, 得用那条记录的
         // 逐项结果把它铺上, 否则工人看到的是个空白的向导页。
@@ -625,7 +751,7 @@ createApp({
                 return;
             }
             if (!confirm(
-                `将重新测试 ${names.length} 项失败/错误:\n${names.join(', ')}\n\n` +
+                `将重新测试 ${names.length} 项(失败/出错/跳过):\n${names.join(', ')}\n\n` +
                 `结果会合并回${sourceLabel}, 并更新那一份报告。\n继续?`
             )) {
                 return;
@@ -680,20 +806,24 @@ createApp({
             }
         };
 
-        // 总结页的「重测失败项」—— 目标就是当前这一轮
-        const retestFailed = async () => {
-            await retestRun(runId.value, failedItemNames.value, '这一轮');
+        // 总结页的「重测失败/跳过项」—— 目标就是当前这一轮
+        const retestFailedOrSkipped = async () => {
+            await retestRun(runId.value, retestableItemNames.value, '这一轮');
         };
 
-        // 历史页的「重测失败项」—— 目标是**被点开的那条记录**。
+        // 历史页的「重测失败/跳过项」—— 目标是**被点开的那条记录**。
         // 只给正式轮(不是重测轮)出这个入口: 重测轮只是过程, 归档对象
         // 始终是最初那一轮 —— 在重测轮上再重测, 只会套出一串套娃记录。
-        const historyFailedNames = (detail) => (detail && detail.results || [])
-            .filter(r => r.status === 'failed' || r.status === 'error')
+        //
+        // 挑哪些项: failed + error + **skipped** —— 跟总结页**同一套口径**
+        // (§7.7): 跳过的项也是没测成的, 补上料/环境之后就该能重测。
+        const historyRetestableNames = (detail) => (detail && detail.results || [])
+            .filter(r => r.status === 'failed' || r.status === 'error'
+                     || r.status === 'skipped')
             .map(r => r.test_name);
         const retestHistoryRun = async (detail) => {
             if (!detail) return;
-            const names = historyFailedNames(detail);
+            const names = historyRetestableNames(detail);
             if (!names.length) return;
             // 历史详情的结果用 test_name, 向导页用 name —— 铺列表时得对上。
             const seed = (detail.results || []).map(r => ({
@@ -911,8 +1041,22 @@ createApp({
                     // 上一轮的「已合并到记录 #N」也一并清掉 —— 新的一轮跟它
                     // 没关系了, 挂着那条提示只会让人以为这一轮也是重测。
                     mergedParent.value = null;
+                    // §10.5 计时: 新的一轮从 0 开始。
+                    //
+                    // ⚠️ **结束时间必须清掉, 起点不能清** —— 起点清掉的话,
+                    //    万一 startTest 里的那次补查(syncStatus)比这条事件
+                    //    **先**到(两条 TCP 连接, 谁先到没保证), 补查带来的
+                    //    起点就会被这里抹掉, 顶栏的读秒会空着不动。
+                    //    起点用「有值才写」: 后端给的优先(它才是报告用的那个
+                    //    数), 没有才退回本机时钟。
+                    runFinishedAt.value = 0;
+                    runStartedAt.value = msg.started_at || (Date.now() / 1000);
+                    startClock();
                     break;
                 case 'test_started': {
+                    // 换了一项 → 上一项可能挂着的横幅(比如「马上要黑屏」)
+                    // 必须收掉, 否则它会一直杵在下一项的界面上。
+                    setAlert('', 'warn', 0);
                     // **画面只由这一条事件推动。**
                     // 后端说「现在开始跑 X」, 界面就显示 X —— 不再用
                     // `当前索引 + 1` 自己猜下一项是谁。原来那种前端自增的写法,
@@ -992,6 +1136,11 @@ createApp({
                     }
                     break;
                 }
+                case 'alert': {
+                    // ⚠️ 大横幅 (见上面 setAlert 的说明): 空 text = 收起。
+                    setAlert(msg.text || '', msg.level || 'warn', msg.seconds || 0);
+                    break;
+                }
                 case 'log': {
                     logs.value.push(`[${msg.name}] ${msg.line}`);
                     if (logs.value.length > 500) logs.value = logs.value.slice(-500);
@@ -1020,6 +1169,9 @@ createApp({
                     userStopped.value = false;
                     tfPrompt.value.visible = false;
                     ethPrompt.value.visible = false;
+                    // 整轮跑完了 → 横幅(比如「马上要黑屏」)一律收掉,
+                    // 别让它跟着总结页一起杵在那儿。
+                    setAlert('', 'warn', 0);
 
                     // 这里**只出总结**。§7.3 的中途重测不走 mini-run 了 ——
                     // 插卡重测是在主循环里原地重跑, 不会产生 run_finished,
@@ -1037,6 +1189,21 @@ createApp({
                     // 这一轮的身份 —— 总结页顶部要印 (§7.2)
                     if (msg.sn) runSn.value = msg.sn;
                     if (msg.finished_at) runFinishedAt.value = msg.finished_at;
+                    // §10.5 计时到点 —— 停表, 顶栏那个读秒锁死在总耗时上。
+                    //
+                    // ⚠️ **起点也在这里写**, 因为后端给的 `started_at` 跟
+                    //    `finished_at` 是**同一轮**的两个数 —— 合并重测(§7.7)
+                    //    时后端已经把 runner 切到父轮了, 两个数都是父轮的,
+                    //    界面上的总耗时跟报告里印的那个**必然一致**。
+                    //
+                    //    ⚠️ 早先这里是**不写**起点的(想着「交给后面那次
+                    //    syncStatus 的快照来定」)—— 那就错位了: `finished_at`
+                    //    这里写的是**父轮**的结束时间, 起点却还是**重测轮**的
+                    //    开始时间 ⇒ 界面上那个数是「父轮的结束 − 重测轮的开始」,
+                    //    大得离谱, 要等后面那次快照来纠正。工人要是刚好在
+                    //    这中间抬头看一眼, 看到的就是一个假数。
+                    if (msg.started_at) runStartedAt.value = msg.started_at;
+                    stopClock();
                     // 整轮异常终止的原因 (§7.6)
                     if (msg.error) runError.value = msg.error;
                     view.value = 'summary';
@@ -1140,16 +1307,20 @@ createApp({
             // state
             view, config, testList, tests, testOrder,
             isRunning, resultList, logs, logEl, logVisibleLines, computeLogLines,
+            alertBanner, setAlert,
             history, historyDetail, runId, expandedId,
             exportingId, exportError, reportPath, reportError, reportRunId,
             tfPrompt, ethPrompt, currentTestIndex, lastStatus,
             depsInfo, shuttingDown,
             runSn, runFinishedAt, runError, mergedParent,
+            runStartedAt, clockNow, startClock, stopClock, fmtHms, fmtDur,
             // computed
             snUnknown, snDisplay, snTitle,
             hasAnyEnabled, hasFailedItems, failedCount,
+            hasRetestableItems, retestableCount, retestableItemNames,
             passedCount, errorCount, skippedCount,
             executedCount, plannedCount, passRateText, notTestedItems, notTestedText,
+            elapsedSec, elapsedText, totalDurationText,
             currentTest, previousTest, overallProgress,
             orderedTests,
             testerName,
@@ -1158,7 +1329,8 @@ createApp({
             statusText, formatTime, formatDuration, displayNameOf, envReasonText,
             fmtMetricValue,
             selectAll, startTest, stopTest, shutdownService,
-            goConfig, goHistory, retestFailed, retestHistoryRun, historyFailedNames,
+            goConfig, goHistory, retestFailedOrSkipped, retestHistoryRun,
+            historyRetestableNames,
             toggleHistoryDetail,
             tfInserted, tfSkip, ethPlugged, ethSkip,
             loadConfig, loadDeps, loadHistory, loadHistoryDetail, exportPdf,

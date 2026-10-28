@@ -273,6 +273,16 @@ pre.log {
 </div>
 {% endif %}
 
+{# §10.5 本轮总耗时 —— 汇总段里也印一遍。
+   报告头那张表里已经有一行了(「总耗时」), 这里是**再说一遍**, 因为
+   汇总段才是读者真正会盯的那一块: 头表容易被翻过去, 而"这轮一共花了
+   多久"跟"通过率"是同一个层级的信息(这一轮花了多长时间、结果如何)。
+   数值跟头表里的是**同一个** (total_duration), 不是另算一遍。 #}
+<div class="rate-line">
+    总耗时 <b>{{ total_duration }}</b>
+    <span class="rate-note">(本轮从开始到结束 —— 与测试界面右上角的读秒同一个数)</span>
+</div>
+
 {# §7.7 合并重测: 这一轮被重测过 —— 报告必须说清「这是合并后的最终结果」。
    不说的话, 读者会把这一版跟当初那版对不上, 以为测试结果凭空变了;
    更糟的是他会以为「通过率提高了」是工具算错了。 #}
@@ -288,12 +298,16 @@ pre.log {
 {% if not_tested_cases %}
 <h3>未测项明细（不计入通过率, 需人工确认是否放行）</h3>
 <table>
-    <thead><tr><th style="width:34mm">测试项</th><th>状态</th><th>未测原因</th></tr></thead>
+    {# §10.5: 每一项都要有**它自己**的时间 —— 未测项也不例外。
+       读者要能看出「这一项是压根没跑(0 秒)」还是「跑了 12 秒才被跳过」
+       —— 两者在放行时是**不同的结论**。 #}
+    <thead><tr><th style="width:34mm">测试项</th><th>状态</th><th>耗时</th><th>未测原因</th></tr></thead>
     <tbody>
     {% for c in not_tested_cases %}
         <tr>
             <td>{{ c.display_name }}</td>
             <td><span class="st st-{{ c.status }}">{{ c.status }}</span></td>
+            <td>{{ c.duration }}</td>
             <td>{{ c.error or '（未记录原因）' }}</td>
         </tr>
     {% endfor %}
@@ -322,7 +336,7 @@ pre.log {
                             {% if c.attempt and c.attempt > 1 %}
                             <span class="attempt-tag">第 {{ c.attempt }} 次{{ '测试通过' if c.status == 'passed' else '仍未通过' }}</span>
                             {% endif %}
-                            <span class="case-meta">{{ c.duration }}</span>
+                            <span class="case-meta">耗时 {{ c.duration }}</span>
                         </span>
                     </div>
                 </th>
@@ -381,7 +395,7 @@ pre.log {
             {% if c.attempt and c.attempt > 1 %}
             <span class="attempt-tag">第 {{ c.attempt }} 次{{ '测试通过' if c.status == 'passed' else '仍未通过' }}</span>
             {% endif %}
-            <span class="case-meta">{{ c.duration }}</span>
+            <span class="case-meta">耗时 {{ c.duration }}</span>
         </span>
     </div>
     {# 没指标的项, 原因还是独立框 —— 但 .case-head 上有 break-after: avoid,

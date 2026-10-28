@@ -12,8 +12,9 @@
 - 📶 **WiFi 仅扫描验证** —— 不连 AP, 4 步 iw 流水线
 - 🎬 **GPU 渲染压测** —— glmark2-es2 Wayland 全屏跑, 无需外部视频素材
 - 📊 **实时进度** —— WebSocket 推送温度、进度、日志
+- ⏱️ **本轮总耗时** —— 顶栏右上角读秒 (**整轮一个数**, 换项不归零, 刷新页面接着走); 报告里**总耗时 + 每一项的单项耗时**都印出来, 屏幕上的数跟纸上的是同一个 (§7.8)
 - 📄 **自动出报告** —— pass/fail 逐项 + 历史可查, 5s 静默
-- 🔂 **失败重测** —— 只重跑 failed/error 项 (mini-run 模式); 总结页和历史记录两个入口是同一个功能, 通过后**合并回原来那一轮**并更新那一份报告; 重测那一轮的日志在报告里**另起一节**印在「日志附录」后面, 首测的原始日志一个字不动 (§7.7)
+- 🔂 **失败/跳过重测** —— 只重跑 failed/error/**skipped** 项 (mini-run 模式; 跳过 = 没测成, 补上料/环境之后就该能再测); 总结页和历史记录两个入口是同一个功能, 通过后**合并回原来那一轮**并更新那一份报告; 重测那一轮的日志在报告里**另起一节**印在「日志附录」后面, 首测的原始日志一个字不动 (§7.7)
 - 💾 **SQLite 存历史** —— 每次测试都有记录
 
 ## 📋 测试项 (10 项)
@@ -25,7 +26,7 @@
 | 3 | WiFi 验证 (扫描+切换) | `iw` / `ip` / `rfkill` | ✅ |
 | 4 | USB 枚举+读写 | `lsusb` + `fio` (写30s + 读30s) | ✅ |
 | 5 | 网口 链路+ping | `ethtool` + `ping` | ✅ |
-| 6 | HDMI 输出 | `xrandr` (读当前实际输出) | ✅ |
+| 6 | HDMI 输出 | `xrandr` (读当前实际输出) + 1 轮自动断开/恢复 | ✅ |
 | 7 | 风扇 GPIO | `/proc/rp_gpio/pi5` (echo 拉高/拉低轮转 2 轮) | ✅ |
 | 8 | TF 卡 (自动探卡 + 自己挂载) | `fio` | ✅ |
 | 9 | 内存 压力 | `memtester` | ✅ |
@@ -78,6 +79,7 @@ sudo bash scripts/build_bundle.sh    # 一次下载所有 apt + pip wheel 到本
 - 网口 ping 目标 (`interfaces.ping_target`, 默认网关)
 - 网卡/WiFi 接口名 (`interfaces.eth` / `interfaces.wifi`)
 - 各测试项默认值 (`defaults.*`)
+- HDMI 断开→恢复一轮 (`defaults.hdmi.replug_check`, 仓库里这份配置是**开**的): 用 `xrandr --output <口> --off` **自动关掉**这块屏、等几秒、再 `--auto` 恢复, 按基线那套逻辑判定 —— **工人全程不用动手**。⚠️ 关屏那几秒**这块屏是黑的**(属正常现象, 工具会先**提示 5 秒**: 进度条底下摆一条**显眼的大横幅**, 写着「马上要黑屏, 不用操作」, 旁边 5→4→3→2→1 倒计时); 关不掉是桌面不支持, **不判失败**; 恢复不回来才判失败 (详见 docs §6.7.3)
 - Pass 阈值 (见 `docs/需求设计.md` §10.4)
 
 ## 🏗️ 项目结构
@@ -121,13 +123,13 @@ aging-test/
 | `/api/health` | GET | 健康检查 |
 | `/api/config` | GET | 配置 + 测试项 + **推荐顺序** |
 | `/api/test/start` | POST | 启动测试 (按 §7.6 推荐顺序) |
-| `/api/test/retest` | POST | mini-run: 只重跑失败/出错的项, **合并回被重测的那一轮**并重导那一份报告 (§7.7)。总结页与历史记录两个入口共用它, 只有目标轮次不同 |
+| `/api/test/retest` | POST | mini-run: 只重跑失败/出错/**跳过**的项, **合并回被重测的那一轮**并重导那一份报告 (§7.7)。总结页与历史记录两个入口共用它, 只有目标轮次不同 |
 | `/api/test/stop` | POST | 停止 |
 | `/api/test/status` | GET | 当前状态 |
 | `/api/deps/check` | GET | 装机时缺工具自检 (拒绝出货) |
 | `/api/history` | GET | 历史列表 (**一行 = 一条归档记录**; 默认不列重测轮, `?include_mini=1` 看原始行。按 `COALESCE(updated_at, started_at) DESC` 排 —— 被重测合并过的记录刚动过, 排在最上面) |
 | `/api/history/{id}` | GET | 单次详情 (带 `retest_runs`: 这一轮底下有几轮重测、每轮重测了什么、日志) |
-| `/ws` | WS | 实时事件流 (`progress / log / metric / between_tests / run_started / test_started / test_finished / run_finished / parent_merged`) |
+| `/ws` | WS | 实时事件流 (`progress / log / metric / alert / between_tests / run_started / test_started / test_finished / run_finished / parent_merged`) |
 
 ## 🛠️ 后续 TODO
 
@@ -154,11 +156,25 @@ aging-test/
 
 通过 WebSocket 推送:
 
-- `run_started` / `run_finished`
+- `run_started` (带 `started_at` —— 顶栏读秒的起点) / `run_finished` (带 `started_at` + `finished_at` **这一对** —— 两个数得来自同一轮)
 - `test_started` / `test_finished`
 - `progress` (pct, msg)
 - `log` (line)
 - `metric` (key, value)
+
+### 跑测试
+
+```bash
+.venv/bin/python tests/run_all.py        # 一次跑完所有回归测试 (Python + 前端)
+```
+
+> **变异测试**单独跑 —— 那是「证明断言咬得动」的, 把代码亲手改坏看测试会不会红:
+>
+> ```bash
+> node tests/_mutate_timer.js              # 前端: 计时 + 版式 (24 处)
+> .venv/bin/python tests/_mutate_report_durations.py   # 后端: 报告里的时间 (11 处)
+> .venv/bin/python tests/_mutate_runner_finished_timing.py  # 后端: run_finished 带的那对时间 (4 处)
+> ```
 
 ## 📄 License
 

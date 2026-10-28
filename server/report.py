@@ -30,6 +30,8 @@ PDF 失败不阻断) —— 本模块不吞异常, 也不用"空字符串代表�
 看起来像正式报告的 PDF"这种代码 —— 后者出了事没人查得清。
 """
 import asyncio
+import decimal
+import math
 import os
 import re
 import tempfile
@@ -134,12 +136,38 @@ def _fmt_time(ts) -> str:
         return "—"
 
 
+def _round_half_up(x: float, nd: int = 1) -> float:
+    """四舍五入到一半**往上进**(跟浏览器里的 toFixed() 一个规矩)。
+
+    ⚠️ **不能用 f"{x:.1f}"** —— Python 那个是「四舍六入五成双」:
+    58.25 → "58.2"; 而 JS 的 (58.25).toFixed(1) → "58.3"。
+    报告印在纸上、读秒印在屏幕上, 工人正把这两个数对着看 ——
+    算法不一样, 他会以为其中一个是错的。
+    """
+    try:
+        d = decimal.Decimal(x)
+    except (TypeError, ValueError, ArithmeticError):
+        return float("nan")
+    q = decimal.Decimal(1).scaleb(-nd)
+    return float(d.quantize(q, rounding=decimal.ROUND_HALF_UP))
+
+
 def _fmt_dur(sec) -> str:
     try:
         s = float(sec)
     except (TypeError, ValueError):
         return "—"
-    return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
+    # 负数 / 非有限值 → 「—」。前端 (static/app.js 的 fmtDur) 也是这么写的,
+    # 两边得一致 —— 屏幕上一个 "—", 纸上写个 "-1.0s", 工人会以为工具坏了。
+    if not math.isfinite(s) or s < 0:
+        return "—"
+    if s < 60:
+        return f"{_round_half_up(s)}s"
+    # ⚠️ 分钟/秒的拆法跟前端**一个字不差**: 前端是 Math.floor(s / 60) 和
+    #   Math.floor(s % 60), 这里就写 math.floor(s / 60) 和 math.floor(s % 60)。
+    #   (Python 的 s // 60 实际上也是一个样, 但写成跟前端一模一样的运算,
+    #   以后谁改动都看得出「这两边得一起改」。)
+    return f"{int(math.floor(s / 60))}m{int(math.floor(s % 60)):02d}s"
 
 
 def _report_cfg() -> dict:
@@ -343,8 +371,14 @@ def render_html(run: dict, results: list, filename: str = "",
         ]
 
     started, finished = run.get("started_at"), run.get("finished_at")
-    total_dur = (float(finished) - float(started)
-                 if started and finished else None)
+    # ⚠️ **判空要用 `is not None`, 不能用「是不是真的」** —— 原来写的是
+    #    `if started and finished`, 结果 started_at 正好是 0.0 的时候
+    #    (0.0 是假值) 会被当成「没记录时间」, 总耗时整行变成「—」。
+    try:
+        total_dur = (float(finished) - float(started)
+                     if started is not None and finished is not None else None)
+    except (TypeError, ValueError):
+        total_dur = None
 
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(str(TEMPLATE_DIR)),

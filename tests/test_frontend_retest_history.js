@@ -40,7 +40,14 @@ const { check, section, finish } = makeChecker();
 const INDEX_HTML = path.join(STATIC_DIR, 'index.html');
 const TOOLS_DIR = process.env.VUE_TOOLS_DIR || '/home/User/.claude/vue-tools';
 
-// ── 一条「失败过」的记录: 两项过了, 一项失败, 一项出错 ──────────────
+// ── 一条「没全过」的记录: 两项过了, 一项失败, 一项出错, 一项**跳过** ──
+//
+// ⚠️ skipped 那项是**这次需求的主角**: 跳过的项也是「没测成」(没接显示器 /
+// 没插网线 / 卡槽是空的), 补上料、补上环境之后就该能重测 —— 所以它跟
+// 失败项走**同一个**重测入口(§7.7)。
+//
+// `summary.total` 还是 4 —— §9.2 的口径是 total = passed+failed+error,
+// **skipped 不计入**。
 const DETAIL = {
     id: 88,
     sn: 'SN-RETEST-01',
@@ -60,6 +67,8 @@ const DETAIL = {
           metrics: {}, error: '未插网线', attempt: 1 },
         { test_name: 'tfcard', status: 'error', duration_sec: 0.1,
           metrics: {}, error: '这一项没测成', attempt: 1 },
+        { test_name: 'wifi', status: 'skipped', duration_sec: 0.0,
+          metrics: {}, error: '未扫描到任何 WiFi 热点', attempt: 1 },
     ],
 };
 
@@ -111,23 +120,27 @@ function makeFetch(opts = {}) {
 
 async function main() {
     // ══════════════════════════════════════════════════════════
-    section('【1】historyFailedNames 只挑失败/错误的项');
+    section('【1】historyRetestableNames 挑失败/出错/**跳过**的项');
     {
         const a = loadApp({ fetch: makeFetch() });
-        const names = a.historyFailedNames(DETAIL);
-        check(JSON.stringify(names) === JSON.stringify(['ethernet', 'tfcard']),
-              '挑出失败 + 出错的那两项', JSON.stringify(names));
+        const names = a.historyRetestableNames(DETAIL);
+        check(JSON.stringify(names) === JSON.stringify(['ethernet', 'tfcard', 'wifi']),
+              '挑出失败 + 出错 + **跳过**的那三项', JSON.stringify(names));
+        check(names.includes('wifi'),
+              '**跳过的项也能重测**(它也是没测成, 补上料就能测)', JSON.stringify(names));
+        check(!names.includes('cpu') && !names.includes('usb'),
+              '已经过了的项不重测 (免得白跑一遍)', JSON.stringify(names));
 
         const allPassed = { results: [{ test_name: 'cpu', status: 'passed' }] };
-        check(a.historyFailedNames(allPassed).length === 0,
+        check(a.historyRetestableNames(allPassed).length === 0,
               '全过了 → 没有可重测的项 (按钮就不该出现)');
 
-        check(a.historyFailedNames(null).length === 0,
+        check(a.historyRetestableNames(null).length === 0,
               '详情还没加载 → 也不该报错');
     }
 
     // ══════════════════════════════════════════════════════════
-    section('【2】历史页点「重测失败项」→ 打的是**那条记录**');
+    section('【2】历史页点「重测失败/跳过项」→ 打的是**那条记录**');
     {
         const f = makeFetch();
         const a = loadApp({ fetch: f });
@@ -139,8 +152,10 @@ async function main() {
             check(call.body.run_id === 88,
                   '目标是**被点开的那条记录**(不是当前轮)', call.body.run_id);
             check(JSON.stringify(call.body.test_names)
-                  === JSON.stringify(['ethernet', 'tfcard']),
-                  '只重测失败/出错的项', JSON.stringify(call.body.test_names));
+                  === JSON.stringify(['ethernet', 'tfcard', 'wifi']),
+                  '只重测失败/出错/**跳过**的项', JSON.stringify(call.body.test_names));
+            check(call.body.test_names.includes('wifi'),
+                  '**跳过的项也发过去了**', JSON.stringify(call.body.test_names));
             check(JSON.stringify(Object.keys(call.body).sort())
                   === JSON.stringify(['run_id', 'test_names']),
                   '请求体只有这两个字段', JSON.stringify(Object.keys(call.body)));
@@ -157,14 +172,17 @@ async function main() {
         a.resultList.value = [
             { name: 'cpu', status: 'passed' },
             { name: 'ethernet', status: 'failed' },
+            { name: 'wifi', status: 'skipped' },
         ];
-        await a.retestFailed();
+        await a.retestFailedOrSkipped();
         const sumCall = f.calls.find(c => c.url === '/api/test/retest');
         check(!!sumCall, '总结页也打 /api/test/retest');
         if (sumCall) {
             check(sumCall.body.run_id === 77, '目标是当前这一轮', sumCall.body.run_id);
-            check(JSON.stringify(sumCall.body.test_names) === JSON.stringify(['ethernet']),
-                  '只重测失败的那一项', JSON.stringify(sumCall.body.test_names));
+            check(JSON.stringify(sumCall.body.test_names)
+                  === JSON.stringify(['ethernet', 'wifi']),
+                  '总结页也重测**跳过**的项 (跟历史页一套口径)',
+                  JSON.stringify(sumCall.body.test_names));
             // 两条路的请求体字段必须一模一样 —— 后端就认这一个形状
             const f2 = makeFetch();
             const b = loadApp({ fetch: f2 });
@@ -232,12 +250,15 @@ async function main() {
         const f = makeFetch();
         const a = loadApp({ fetch: f });
         await a.retestHistoryRun(DETAIL);
-        check(a.resultList.value.length === 4,
-              '向导页列出了那条记录的全部四项', a.resultList.value.length);
+        check(a.resultList.value.length === 5,
+              '向导页列出了那条记录的全部五项', a.resultList.value.length);
         const byName = {};
         for (const it of a.resultList.value) byName[it.name] = it;
         check(byName.ethernet && byName.ethernet.status === 'pending',
               '要重测的那项摆成「等待」', byName.ethernet && byName.ethernet.status);
+        check(byName.wifi && byName.wifi.status === 'pending',
+              '**跳过的项**也摆成「等待」(它这轮要重测)',
+              byName.wifi && byName.wifi.status);
         check(byName.cpu && byName.cpu.status === 'passed',
               '原来通过的项保持通过 (报告要合并, 不是重测)',
               byName.cpu && byName.cpu.status);
@@ -379,8 +400,8 @@ async function main() {
             check(!!btn, '操作区里有按钮');
             if (btn) {
                 const vIf = dirText(btn, 'if');
-                check(!!vIf && vIf.includes('historyFailedNames'),
-                      '按钮只在**有失败项**时才出现', String(vIf));
+                check(!!vIf && vIf.includes('historyRetestableNames'),
+                      '按钮只在**有失败/出错/跳过的项**时才出现', String(vIf));
                 check(!!vIf && vIf.includes('mini_of'),
                       '重测轮不给这个按钮 (归档对象始终是最初那一轮)', String(vIf));
                 const click = dirText(btn, 'on', 'click');

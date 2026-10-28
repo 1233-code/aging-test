@@ -27,6 +27,18 @@
                 >SN: {{ snDisplay }}</span>
             </div>
             <div class="header-right">
+                <!-- §10.5 本轮总耗时 —— 摆在**右上角**, 读秒。
+                     为什么在顶栏而不是测试画面里: 顶栏是**每一屏都在**的地方 ——
+                     配置页、测试中、总结页、历史页, 工人随时抬头就能看到这一轮
+                     花了多久, 不用翻到哪个画面去找。
+                     口径跟报告里的「总耗时」一致(后端记的 started/finished),
+                     所以屏幕上的数跟纸面上的数必然对得上。 -->
+                <span
+                    class="run-timer"
+                    v-if="runStartedAt"
+                    :class="{ 'run-timer-done': !isRunning }"
+                    :title="isRunning ? '本轮已跑这么久' : '本轮总耗时 (与报告里的「总耗时」同一个数)'"
+                >⏱ {{ elapsedText }}</span>
                 <span class="device-tag" v-if="config">设备配置: {{ Object.keys(config.interfaces || {}).length }} 接口</span>
                 <button class="btn-text" v-if="view === 'main'" @click="goHistory">历史记录</button>
                 <button class="btn-text" v-else @click="goConfig" :disabled="isRunning"
@@ -129,6 +141,12 @@
                             <span v-if="t.name === 'tfcard'">
                                 <span class="hint-tag">运行时自动检测 · 未插弹提示</span>
                             </span>
+                            <!-- §6.7.3 断开→恢复轮: 工具自己用 xrandr --off/--auto
+                                 关一次屏再开回来, **工人不用动手**; 但关屏那几秒
+                                 这块屏是黑的 —— 不提前说清楚, 工人会以为工具卡住了。 -->
+                            <span v-if="t.name === 'hdmi' && tests[t.name].replug_check">
+                                <span class="hint-tag">含 1 轮自动断开/恢复 · 期间这块屏会黑几秒(正常现象), 不用操作 —— 开跑前会在进度条底下弹一条大横幅提示</span>
+                            </span>
                         </div>
                     </div>
                 </div>
@@ -154,10 +172,16 @@
 
                 <div class="wizard-current" v-if="currentTest">
                     <div class="wizard-step-label">当前测试</div>
-                    <div class="wizard-name">{{ currentTest.display_name }}</div>
-                    <div :class="['wizard-status', currentTest.status]">
-                        <span class="status-dot"></span>
-                        {{ statusText(currentTest.status) }}
+                    <!-- §10.5 版式: **测试项的名字在左, 这一项的结果在右**。
+                         原来结果那个小药丸是**另起一行**摆的, 白占一整行高度 ——
+                         而这一屏下面就是日志框, 高度都得让给日志(见 .wizard-current
+                         的 flex: 0 0 auto)。一行摆完, 竖着省下来的空间全给日志。 -->
+                    <div class="wizard-title-row">
+                        <div class="wizard-name">{{ currentTest.display_name }}</div>
+                        <div :class="['wizard-status', currentTest.status]">
+                            <span class="status-dot"></span>
+                            {{ statusText(currentTest.status) }}
+                        </div>
                     </div>
 
                     <!-- 进度条 (running 时) —— **全页面只有这一根条**。
@@ -171,6 +195,18 @@
                         </div>
                         <span class="wizard-progress-pct">{{ currentTest.pct }}%</span>
                         <span v-if="currentTest.progress_msg" class="wizard-progress-msg">{{ currentTest.progress_msg }}</span>
+                    </div>
+
+                    <!-- ⚠️ **大横幅** —— 「屏幕马上要黑了」这类**必须让工人
+                         看见**的事, 不能只写进日志框。马上要黑的那一块就是
+                         工人正盯着的那一块, 日志框却在屏幕最底下 —— 工人
+                         只会以为工具卡死了。所以这条摆在**进度条底下**:
+                         大字、重底色、带倒计时。
+                         (空 text = 收起; 倒计时走完由后端收。) -->
+                    <div v-if="alertBanner" :class="['wizard-alert', alertBanner.level]">
+                        <span class="alert-icon">⚠</span>
+                        <span class="alert-text">{{ alertBanner.text }}</span>
+                        <span v-if="alertBanner.countdown > 0" class="alert-countdown">{{ alertBanner.countdown }}</span>
                     </div>
 
                     <!-- 关键指标 -->
@@ -245,6 +281,10 @@
                     </div>
                     <div class="summary-run-meta" v-if="runSn || runFinishedAt">
                         SN: {{ runSn || 'unknown' }}<span v-if="runFinishedAt"> · {{ formatTime(runFinishedAt) }}</span>
+                        <!-- §10.5 本轮总耗时 —— **跟报告里的「总耗时」同一个数**
+                             (后端记的 started_at → finished_at), 屏幕跟纸面
+                             必须对得上。 -->
+                        <span v-if="totalDurationText"> · 总耗时 {{ totalDurationText }}</span>
                     </div>
                 </div>
 
@@ -286,12 +326,15 @@
 
                 <div class="summary-actions">
                     <button class="btn-primary" @click="goConfig">🔁 重新测试</button>
+                    <!-- §7.7 重测: 失败 / 出错 / **跳过** 的项都算 —— 跳过的那几项
+                         也是没测成(没接显示器 / 没插网线 / 卡槽是空的), 补上料
+                         之后就该能重测, 所以跟失败项走同一个入口。 -->
                     <button
-                        v-if="hasFailedItems"
+                        v-if="hasRetestableItems"
                         class="btn-warning"
-                        @click="retestFailed"
+                        @click="retestFailedOrSkipped"
                         :disabled="isRunning"
-                    >🔂 重测失败项 ({{ failedCount }})</button>
+                    >🔂 重测失败/跳过项 ({{ retestableCount }})</button>
 
                     <!-- §8.2 报告入口。跟「重新测试」「历史记录」并排放在**同一排**
                          —— 工人跑完一轮后顺势点下去的就是这一排, 报告也在这里,
@@ -315,7 +358,7 @@
                     <button class="btn-secondary" @click="goHistory">📋 历史记录</button>
                     <!-- 这里原来还有一个「⏻ 关闭服务」, 2026-10-23 移除。
                          关闭服务**只在页面顶部有一个入口**(所有视图常驻)。
-                         这一排按钮是工人跑完一轮后顺势点下去的一串 —— 「重测失败项」
+                         这一排按钮是工人跑完一轮后顺势点下去的一串 —— 「重测失败/跳过项」
                          「历史记录」「重新测试」都在这里, 而关服务是个不可逆动作,
                          夹在中间极易误触(点完就退出服务, 页面当场失效)。 -->
                 </div>
@@ -406,7 +449,7 @@
                                          v-if="historyDetail && historyDetail.id === h.id"
                                          @click.stop>
                                         <!-- 标题在左, 操作在右 (§7.7 合并重测)。
-                                             「重测失败项」摆在右边 —— 它是这一轮最想做的
+                                             「重测失败/跳过项」摆在右边 —— 它是这一轮最想做的
                                              动作(这一轮不合格, 就地把它修好), 不该藏在
                                              下面的 PDF 那一行里。 -->
                                         <div class="history-detail-head">
@@ -432,16 +475,18 @@
                                             </h3>
 
                                             <div class="history-detail-actions">
-                                                <!-- §7.7 重测失败项 —— 和总结页那个按钮是**同一个**
+                                                <!-- §7.7 重测失败/跳过项 —— 和总结页那个按钮是**同一个**
                                                      功能, 只是目标不同: 这里重测的是**这条记录**。
                                                      只给正式轮出: 重测轮是过程, 归档对象始终是
-                                                     最初那一轮, 在重测轮上再重测只会套娃。 -->
-                                                <button v-if="!historyDetail.mini_of && historyFailedNames(historyDetail).length"
+                                                     最初那一轮, 在重测轮上再重测只会套娃。
+                                                     挑的项 = 失败 / 出错 / **跳过**(跳过的项也是
+                                                     没测成, 补上料之后就该能重测)。 -->
+                                                <button v-if="!historyDetail.mini_of && historyRetestableNames(historyDetail).length"
                                                         class="btn-warning"
                                                         @click="retestHistoryRun(historyDetail)"
                                                         :disabled="isRunning"
-                                                        :title="isRunning ? '当前有测试在运行, 结束后才能重测' : '只重测这一轮失败/错误的项, 通过后并回本记录并更新报告'">
-                                                    🔂 重测失败项 ({{ historyFailedNames(historyDetail).length }})
+                                                        :title="isRunning ? '当前有测试在运行, 结束后才能重测' : '只重测这一轮失败/出错/跳过的项, 通过后并回本记录并更新报告'">
+                                                    🔂 重测失败/跳过项 ({{ historyRetestableNames(historyDetail).length }})
                                                 </button>
                                                 <!-- §8.2 PDF 操作区。pdf_path 空 = 这一轮没导出过(自动导出
                                                      失败, 或这轮是老库记录), 给「重新导出」而不是给一个

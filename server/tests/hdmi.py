@@ -11,15 +11,30 @@
   1. /sys/class/drm/ 读 connector 状态 + EDID (不需 root)
   2. xrandr 读**当前**实际输出分辨率/刷新率 (需 DISPLAY, 同 §6.3 GPU)
   3. 两者矛盾才判 failed
+
+§6.7.3 新增 **断开→恢复一轮**(**指令式, 工人全程不用动手**): 接上显示器先按
+上面这套判一遍(基线), 再用 `xrandr --output HDMI-1 --off` **自动关掉**这块
+屏, 等几秒, 再用 `--auto` **恢复**, 按**同一套判定逻辑**再判一遍 —— 这一轮
+判的是「断一下之后还能不能点亮」。
+
+⚠️ 执行前会先**提示几秒**: 关屏期间这块屏是黑的(约 3 秒), **属正常现象**,
+工人**不用拔线、不用操作**, 等它自己恢复就行 —— 所以这一轮可以在产线上
+「一个人一只手」地跑, 不用另外找人配合。
 """
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
 from typing import List, Optional
 
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import find_tool
+
+# §6.7.3 断开→恢复一轮的两个节奏
+_POLL_SEC = 0.5        # 恢复后轮询 xrandr 的间隔(等桌面重新认屏)
+_HEARTBEAT_SEC = 1.5   # §10.1: 等待期间每 ≤2 秒至少推 1 帧 progress 或 log
+_RESTORE_RETRY_WAIT = 0.8   # 恢复命令失败后隔多久再试一次
 
 
 def _read_drm_sysfs() -> list:
@@ -138,16 +153,405 @@ async def _read_xrandr(xrandr_bin: str, timeout: int = 5) -> Optional[dict]:
     return parsed if parsed["outputs"] else None
 
 
+# ── §6.7.3 断开→恢复一轮用到的几个小工具 ──────────────────────────────
+
+def _as_bool(v, default: bool = False) -> bool:
+    """配置值转 bool —— 顺手挡掉 YAML 里写成字符串的 "false"(那是 True)。"""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on", "是")
+    return bool(v)
+
+
+def _num(v, default: float) -> float:
+    """配置值转 float —— **0 是合法值**, 不能用 `v or default` 那种写法
+    (那会把「等 0 秒」变成「等 3 秒」, 配置改了不生效还没人发现)。"""
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _cfg(ctx: TestContext, key: str, default=None):
+    """读 HDMI 项的配置键 —— 前端那份优先, 再回落到 config.yaml 的 defaults.hdmi。
+
+    为什么要有回落: 前端是把 `defaults.hdmi` **整个抄一份**发给后端的
+    (§7.2), 所以新加的键要等**页面刷新**之后才会带上。工人忘了刷新 →
+    新功能静默不跑, 而界面上看不出任何区别 —— 那一轮就少测了一截, 却
+    没人知道。回落一层 yaml 默认值, 免得「没刷新页面」= 「少测一截」。
+    """
+    tc = getattr(ctx, "test_config", None) or {}
+    if key in tc:
+        return tc.get(key)
+    defaults = ((getattr(ctx, "config", None) or {}).get("defaults") or {})
+    hdmi = defaults.get("hdmi") or {}
+    if key in hdmi:
+        return hdmi.get(key)
+    return default
+
+
+async def _sleep(ctx: TestContext, seconds: float, what: str, pct: int) -> bool:
+    """可被取消打断的等待, 期间每 ≤2 秒推一帧 progress(§10.1)。
+
+    返回 True = 期间被取消。
+    分片睡而不是一觉睡到底 —— 否则用户点「停止」还得等满整个间隔才生效。
+    """
+    deadline = time.monotonic() + seconds
+    t0 = time.monotonic()
+    last_beat = t0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if await ctx.is_cancelled():
+            return True
+        now = time.monotonic()
+        if (now - last_beat) >= _HEARTBEAT_SEC:
+            last_beat = now
+            await ctx.on_progress(
+                pct, f"{what} (已等 {now - t0:.1f}/{seconds:.1f}s)"
+            )
+        await asyncio.sleep(min(0.2, remaining))
+
+
+async def _run_xrandr_cmd(xrandr_bin: str, args: list,
+                          timeout: int = 10) -> tuple:
+    """执行一条 xrandr 命令, 返回 (rc, 输出文本)。
+
+    ⚠️ **rc=0 不等于成功**: xrandr 在 RANDR 被禁用 / 没有权限时会**打印一行
+    错误**, 有的情况下还返回 0。所以返回文本也一并带出来, 由调用方判断
+    「命令到底成没成」—— 判定失败时得让人看得见到底报了什么。
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            xrandr_bin, *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+    except (FileNotFoundError, PermissionError) as e:
+        return 127, str(e)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        return 124, "命令超时"
+    return proc.returncode, (out or b"").decode(errors="replace").strip()
+
+
+async def _probe_output(ctx: TestContext, active: dict, prefix: str,
+                        xrandr_bin: Optional[str], tag: str = "",
+                        sysfs_status: str = "connected",
+                        log: bool = True) -> dict:
+    """读一次「当前实际输出」, 并按 **xrandr 这一侧** 分三态(§6.7.2 同口径)。
+
+    返回 {"state": "ok" | "unavailable" | "mismatch",
+          "case":  "ok" | "no_xrandr" | "no_output" | "no_mode",
+          "xr": xrandr 解析结果或 None,
+          "cand": 对应的输出口或 None,
+          "why": 不是 ok 时的原因}
+
+    分态只看 xrandr 这一侧 —— sysfs 那侧由调用方自己看:
+      ok          —— 找到对应输出口, 且它 connected 且有当前模式
+      unavailable —— 查不到 xrandr(没装/无 DISPLAY/超时) 或 xrandr 里没有对应口
+      mismatch    —— xrandr 跑通了, 却说这个口没连 / 没当前模式
+
+    `case` 是给「指标写什么」用的: 「没装 xrandr」(no_xrandr)与「xrandr 里没有
+    对应的口」(no_output)在三态里**都是 unavailable**, 但指标上要分得开 ——
+    前者是「读不到当前分辨率(未验证)」, 后者是「xrandr 无对应输出口」。
+
+    基线与断开→恢复轮**共用这一个函数** —— 「加上现有的逻辑来判定」不是嘴上说说:
+    判断开恢复之后能不能点亮, 用的是判基线那套一模一样的三态, 不是另写一套。
+    """
+    xr = None
+    cand = None
+    state = "unavailable"
+    case = "no_xrandr"
+    why = ""
+
+    if xrandr_bin:
+        xr = await _read_xrandr(xrandr_bin)
+    if xr is None:
+        if not os.environ.get("DISPLAY", "").strip():
+            why = "服务无 DISPLAY 环境变量"
+        elif not xrandr_bin:
+            why = "未找到 xrandr"
+        else:
+            why = "xrandr 执行失败或超时"
+    else:
+        # sysfs 叫 `card0-HDMI-A-1`, xrandr 叫 `HDMI-1` —— 按前缀认, 别按全名
+        cands = ([o for o in xr["outputs"] if o["name"].upper().startswith(prefix)]
+                 if prefix else [])
+        cands.sort(key=lambda o: (not o["connected"], not o["primary"]))
+        cand = cands[0] if cands else None
+        if cand is None:
+            case = "no_output"
+            why = "xrandr 无对应输出口"
+        elif (not cand["connected"] or not cand["mode"]
+                or not (cand["w"] and cand["h"])):
+            state = "mismatch"
+            case = "no_mode"
+            why = f"{cand['name']} 无当前模式"
+        else:
+            state = "ok"
+            case = "ok"
+
+    if log:
+        if case == "no_output":
+            await ctx.on_log(
+                f"[HDMI] {tag}⚠️ xrandr 里没有与 {active['name']} 对应的输出口"
+                f"(现有: {[o['name'] for o in xr['outputs']]})"
+            )
+        elif state == "unavailable":
+            await ctx.on_log(
+                f"[HDMI] {tag}⚠️ 查不到当前分辨率 ({why}) —— 本次只按 EDID 判定"
+            )
+        elif state == "mismatch":
+            await ctx.on_log(
+                f"[HDMI] {tag}❌ sysfs 说 {sysfs_status}, 但 xrandr 报 "
+                f"{cand['name']} connected={cand['connected']} "
+                f"mode={cand['mode'] or '(无)'}"
+            )
+        else:
+            await ctx.on_log(
+                f"[HDMI] {tag}✓ 当前输出: {cand['name']} {cand['w']}x{cand['h']}"
+                f" @ {cand['refresh']:.2f}Hz (xrandr 真值, 屏 {xr['screen']})"
+            )
+    return {"state": state, "case": case, "xr": xr, "cand": cand, "why": why}
+
+
+async def _restore_output(xrandr_bin: str, out_name: str,
+                          saved_mode: str = "") -> tuple:
+    """尽力把输出恢复回来 —— 返回 (成功?, 用的哪条命令, 输出文本)。
+
+    为什么要「尽力」: **关屏成功而恢复失败 = 工人面前是一块黑屏**, 后面
+    什么测试都做不了, 产线只能找人去修显示器。所以这一段要多试几种:
+      ① `--auto`   —— 按 EDID 里的首选模式恢复(首选)
+      ② `--mode <断屏前的模式>` —— 按原样恢复(上面不行时的兜底)
+    每种再重试一次 —— 第一次可能是桌面还在处理关屏, 稍等一下就好。
+
+    ⚠️ `--auto` 恢复的是 EDID 的**首选**模式, 未必跟断屏前那个一模一样
+    (EDID 里首选模式不等于当前用的模式)。所以恢复后的实际模式要**重新读
+    一遍** xrandr, 不能拿断屏前的值充数。
+    """
+    attempts = [["--output", out_name, "--auto"]]
+    if saved_mode:
+        attempts.append(["--output", out_name, "--mode", saved_mode])
+    cmd = ""
+    last_out = ""
+    for args in attempts:
+        cmd = "xrandr " + " ".join(args)
+        for _ in range(2):
+            rc, out = await _run_xrandr_cmd(xrandr_bin, args)
+            last_out = out
+            if rc == 0:
+                return True, cmd, out
+            await asyncio.sleep(_RESTORE_RETRY_WAIT)
+    return False, cmd, last_out
+
+
+async def _replug_round(ctx: TestContext, result: TestResult, active: dict,
+                        prefix: str, xrandr_bin: Optional[str],
+                        base_cand: Optional[dict]) -> str:
+    """§6.7.3 断开→恢复一轮(**指令式**): `--off` → 等几秒 → `--auto`。
+
+    工人**全程不用动手** —— 不拔线、不用另开一台设备、不用配合。
+
+    返回: "restored" / "restored_degraded" / "off_failed" / "restore_failed" /
+          "mismatch" / "skipped" / "cancelled"
+
+    **判定完全沿用基线那套逻辑**(_probe_output + §6.7.2 三态表):
+      · 恢复之后 xrandr 必须重新报出当前模式 → 否则是**真故障**(failed);
+      · xrandr 读不到(unavailable) → 与基线同口径: 降级, 按 sysfs+EDID 判,
+        **不判失败**(拿判不准的读数杀好板子, 比不判更糟)。
+
+    ⚠️ **关屏命令失败不判失败**: `xrandr --off` 关不掉, 是**桌面/X 会话**
+    那边不支持(RANDR 没开、没有权限、只有一个屏不让关), 跟板子好坏无关 ——
+    判失败 = 把一块好板子送去返修。所以降级放行, 只记指标。
+    """
+    warn_sec = _num(_cfg(ctx, "replug_warn_sec", 5), 5)
+    dwell = _num(_cfg(ctx, "replug_off_dwell_sec", 3), 3)
+    restore_timeout = _num(_cfg(ctx, "replug_restore_timeout_sec", 10), 10)
+
+    # 连「关哪个口」都不知道 → 这一轮没法做(基线没读出当前输出)
+    if not base_cand or not base_cand.get("name"):
+        await ctx.on_log(
+            "[HDMI] 断开→恢复轮: 基线没读出当前输出 —— 跳过这一轮(不判失败)"
+        )
+        return "skipped"
+    out_name = base_cand["name"]
+    saved_mode = (f"{base_cand['w']}x{base_cand['h']}"
+                  if base_cand.get("w") and base_cand.get("h") else "")
+
+    # ── ① 提示: 让人知道马上要黑屏了(但**不用动手**) ──
+    #
+    # ⚠️ 提示**不能只写进日志**: 马上要黑屏的那一块, 就是工人正盯着的那
+    # 一块 —— 日志在屏幕最下面, 工人此刻的注意力在**进度条**上。所以同一句
+    # 话要**两个地方**都说: 界面上一条**显眼的大横幅**(on_alert, 大字+重色+
+    # 倒计时), 日志里再留一份(留档、复盘看)。
+    alert_text = (f"屏幕即将黑屏 —— 这块屏({out_name})会被自动关掉 {dwell:.0f} 秒, "
+                  f"属正常现象; 不用拔线、不用操作")
+    if getattr(ctx, "on_alert", None):
+        await ctx.on_alert(alert_text, "danger", warn_sec)
+    await ctx.on_log(
+        f"[HDMI] ⚠️ 接下来会**自动关掉这块屏**({out_name}) —— 黑屏约 {dwell:.0f} 秒, "
+        f"**属正常现象**; **不用拔线、不用操作**, 等它自己恢复就行。"
+    )
+    if await _sleep(ctx, warn_sec, "⚠️ 即将黑屏", 50):
+        # 被打断 → 横幅也得收起来(否则会一直挂在界面上)
+        if getattr(ctx, "on_alert", None):
+            await ctx.on_alert("", "warn", 0)
+        return "cancelled"
+
+    # 倒计时走完 → **收起横幅**, 紧接着就是真的关屏。
+    # (横幅留到黑屏之后没意义: 那会儿屏已经是黑的, 谁也看不见。)
+    if getattr(ctx, "on_alert", None):
+        await ctx.on_alert("", "warn", 0)
+
+    # ── ② 关屏 ──
+    await ctx.on_progress(60, "🔌 正在关闭输出")
+    rc, out = await _run_xrandr_cmd(xrandr_bin, ["--output", out_name, "--off"])
+    result.metrics["replug_off_cmd"] = f"xrandr --output {out_name} --off"
+    if rc != 0:
+        await ctx.on_log(
+            f"[HDMI] ⚠️ 关不掉输出(xrandr 返回 {rc}: {(out or '无输出')[:120]}) —— "
+            f"跳过这一轮(**不判失败**: 桌面/X 会话不支持这一操作, 与板子好坏无关)"
+        )
+        return "off_failed"
+    await ctx.on_log(f"[HDMI] ✓ 已关闭输出 {out_name} —— 这块屏现在是黑的")
+
+    turned_off = True
+    restored = False
+    t_black = time.monotonic()      # 黑屏窗口的起点
+    try:
+        # 确认一下是不是真的断了。⚠️ 注意: 这里 xrandr 说「这个口没输出」
+        # 是**预期之中**的 —— 线还插着, 只是我们让 X 别再驱动它了
+        # (sysfs 的 status 仍然是 connected)。所以这一段**只作记录**,
+        # 绝不能当成「矛盾」去判失败。
+        probe_d = await _probe_output(
+            ctx, active, prefix, xrandr_bin, tag="🔌 关屏后 · ", log=False,
+        )
+        if probe_d["state"] == "mismatch":
+            await ctx.on_log("[HDMI] ✓ xrandr 已确认这个口没有输出了(关屏生效)")
+        elif probe_d["state"] == "ok":
+            await ctx.on_log(
+                "[HDMI] · 关屏命令返回成功, 但 xrandr 仍报着旧模式 —— 仅记录"
+            )
+        else:
+            await ctx.on_log(
+                f"[HDMI] · 关屏后读不到当前输出({probe_d['why']}) —— 仅记录"
+            )
+
+        # 黑屏保持几秒
+        if await _sleep(ctx, dwell, "🔌 黑屏中", 70):
+            return "cancelled"
+
+        # ── ③ 恢复 ──
+        await ctx.on_progress(85, "🔌 正在恢复输出")
+        # 黑屏窗口有多长(从 --off 到 --auto 之间)—— 这是「断了多久」的事实
+        result.metrics["replug_off_sec"] = round(time.monotonic() - t_black, 2)
+        ok, cmd, out = await _restore_output(xrandr_bin, out_name, saved_mode)
+        result.metrics["replug_restore_cmd"] = cmd
+        if not ok:
+            await ctx.on_log(
+                f"[HDMI] ❌ 断开→恢复轮: 关屏之后**没能恢复**({cmd}: "
+                f"{(out or '无输出')[:160]}) —— 这块屏可能还是黑的, "
+                f"请**手动**接好显示器 / 重启桌面会话"
+            )
+            return "restore_failed"
+        restored = True
+        await ctx.on_log(f"[HDMI] ✓ 已恢复输出({cmd})")
+
+        # ── ④ 恢复之后, 还能不能点亮 ──
+        # 桌面要重新认屏(读 EDID、给 CRTC 配模式), 这要一会儿 → **轮询**
+        # xrandr, 直到它报出当前模式, 而不是读一次就下结论(读一次必然读不到)。
+        deadline = time.monotonic() + restore_timeout
+        probe_r = None
+        while True:
+            probe_r = await _probe_output(
+                ctx, active, prefix, xrandr_bin, tag="🔌 恢复后 · ", log=False,
+            )
+            if probe_r["state"] == "ok" or time.monotonic() >= deadline:
+                break
+            if await ctx.is_cancelled():
+                return "cancelled"
+            await ctx.on_progress(
+                90, f"🔌 等桌面重新认屏 (最多 {restore_timeout:.0f}s)"
+            )
+            await asyncio.sleep(_POLL_SEC)
+    finally:
+        # ⚠️ **兜底: 屏一定要恢复回来**。哪怕这一轮判失败、哪怕中途被
+        # 「停止」打断 —— 也不能把工人留在一块**黑屏**前面(那后面什么都
+        # 做不了, 只能找人去修)。所以只要关过, 就再补一次 `--auto`。
+        if turned_off and not restored:
+            await _run_xrandr_cmd(xrandr_bin, ["--output", out_name, "--auto"])
+
+    cand = probe_r["cand"]
+    if probe_r["state"] == "ok":
+        result.metrics["replug_resolution"] = f"{cand['w']}x{cand['h']}"
+        result.metrics["replug_refresh"] = cand["refresh"]
+        # 恢复之后的模式才是**最后**这块屏在显示的东西 —— 报告上的
+        # 「当前分辨率」得跟着改, 不然报告写的跟屏上实际显示的对不上。
+        result.metrics["current_resolution"] = f"{cand['w']}x{cand['h']}"
+        result.metrics["current_refresh"] = cand["refresh"]
+        await ctx.on_log(
+            f"[HDMI] ✓ 断开→恢复轮: 恢复后输出正常 —— {cand['name']} "
+            f"{cand['w']}x{cand['h']} @ {cand['refresh']:.2f}Hz"
+        )
+        if (base_cand.get("w"), base_cand.get("h")) != (cand["w"], cand["h"]):
+            await ctx.on_log(
+                f"[HDMI] · 恢复后的模式与断屏前不同"
+                f"({base_cand['w']}x{base_cand['h']} → {cand['w']}x{cand['h']}) "
+                f"—— 以恢复后的为准"
+            )
+        return "restored"
+    if probe_r["state"] == "mismatch":
+        # 恢复命令执行成功了, 桌面却说这个口没有输出 —— 与基线同口径的**真矛盾**
+        await ctx.on_log(
+            f"[HDMI] ❌ 断开→恢复轮: 恢复命令执行成功, 但 xrandr 报 {cand['name']} "
+            f"connected={cand['connected']} mode={cand['mode'] or '(无)'} —— "
+            f"断一下就点不亮了"
+        )
+        return "mismatch"
+    # unavailable: 与基线同口径 —— 读不准就不据此判失败
+    await ctx.on_log(
+        f"[HDMI] ⚠️ 断开→恢复轮: 恢复了, 但读不到当前输出({probe_r['why']}) —— "
+        f"按 sysfs+EDID 判定(不判失败)"
+    )
+    return "restored_degraded"
+
+
 @register
 class HDMITest(TestCase):
     name = "hdmi"
     display_name = "HDMI 输出"
-    description = "读 EDID 连接状态 + xrandr 读当前实际输出"
+    description = "读 EDID 连接状态 + xrandr 读当前实际输出 (+ 自动断开/恢复一轮)"
 
     # 📌 **没有 cancel() 覆盖**(2026-10-23): 以前覆盖它是为了杀掉 modetest 那个
     # 无限循环的 root 进程; 模式切换整块移除后, 本项**再没有长驻子进程** ——
     # 唯一的外部命令 xrandr 自带 5s 超时。留着 `self.proc` / `cancel()` 就是
     # 永远为 None 的死代码。基类默认实现是 `pass`, 不覆盖即可。
+
+    def expected_seconds(self, test_config: dict) -> Optional[float]:
+        """本项预计多少秒 —— 只有**开了断开→恢复那一轮**才算得出来。
+
+        没开那一轮时本项是纯读(毫秒级), 返回 None(界面不显示预计时间:
+        显示一个编出来的秒数比不显示更糟)。开了以后才有一个说得准的
+        上限: 提示几秒 + 黑屏几秒 + 等桌面重新认屏 + 一点余量。
+        """
+        if not _as_bool((test_config or {}).get("replug_check"), False):
+            return None
+        warn = _num((test_config or {}).get("replug_warn_sec"), 5)
+        dwell = _num((test_config or {}).get("replug_off_dwell_sec"), 3)
+        restore = _num((test_config or {}).get("replug_restore_timeout_sec"), 10)
+        return warn + dwell + restore + 10
 
     async def run(self, ctx: TestContext) -> TestResult:
         result = TestResult()
@@ -201,47 +605,25 @@ class HDMITest(TestCase):
         prefix = ("HDMI" if "HDMI" in active["name"].upper()
                   else "DP" if "DP" in active["name"].upper() else "")
         xrandr_bin = find_tool("xrandr")
-        xr = await _read_xrandr(xrandr_bin) if xrandr_bin else None
-        cand = None
-        if xr is None:
-            if not os.environ.get("DISPLAY", "").strip():
-                why = "服务无 DISPLAY 环境变量"
-            elif not xrandr_bin:
-                why = "未找到 xrandr"
-            else:
-                why = "xrandr 执行失败或超时"
-            result.metrics["current_resolution"] = "(未验证)"
-            await ctx.on_log(f"[HDMI] ⚠️ 查不到当前分辨率 ({why}) —— 本次只按 EDID 判定")
-            xr_state = "unavailable"
-        else:
+        await ctx.on_progress(10, "读 EDID + 当前实际输出")
+        probe = await _probe_output(
+            ctx, active, prefix, xrandr_bin,
+            sysfs_status=active["status"],
+        )
+        xr_state = probe["state"]
+        xr = probe["xr"]
+        cand = probe["cand"]
+        if xr is not None:
             result.metrics["screen"] = xr["screen"]
-            # sysfs 叫 `card0-HDMI-A-1`, xrandr 叫 `HDMI-1` —— 按前缀认, 别按全名
-            cands = ([o for o in xr["outputs"] if o["name"].upper().startswith(prefix)]
-                     if prefix else [])
-            cands.sort(key=lambda o: (not o["connected"], not o["primary"]))
-            cand = cands[0] if cands else None
-            if cand is None:
-                result.metrics["current_resolution"] = "(xrandr 无对应输出口)"
-                await ctx.on_log(
-                    f"[HDMI] ⚠️ xrandr 里没有与 {active['name']} 对应的输出口"
-                    f"(现有: {[o['name'] for o in xr['outputs']]})"
-                )
-                xr_state = "unavailable"
-            elif not cand["connected"] or not cand["mode"] or not (cand["w"] and cand["h"]):
-                result.metrics["current_resolution"] = f"({cand['name']} 无当前模式)"
-                await ctx.on_log(
-                    f"[HDMI] ❌ sysfs 说 connected, 但 xrandr 报 {cand['name']} "
-                    f"connected={cand['connected']} mode={cand['mode'] or '(无)'}"
-                )
-                xr_state = "mismatch"
-            else:
-                xr_state = "ok"
-                result.metrics["current_resolution"] = f"{cand['w']}x{cand['h']}"
-                result.metrics["current_refresh"] = cand["refresh"]
-                await ctx.on_log(
-                    f"[HDMI] ✓ 当前输出: {cand['name']} {cand['w']}x{cand['h']}"
-                    f" @ {cand['refresh']:.2f}Hz (xrandr 真值, 屏 {xr['screen']})"
-                )
+        if probe["case"] == "no_xrandr":
+            result.metrics["current_resolution"] = "(未验证)"
+        elif probe["case"] == "no_output":
+            result.metrics["current_resolution"] = "(xrandr 无对应输出口)"
+        elif probe["case"] == "no_mode":
+            result.metrics["current_resolution"] = f"({cand['name']} 无当前模式)"
+        else:
+            result.metrics["current_resolution"] = f"{cand['w']}x{cand['h']}"
+            result.metrics["current_refresh"] = cand["refresh"]
 
         # 解析目标分辨率验证
         tw, th = 1920, 1080
@@ -315,5 +697,46 @@ class HDMITest(TestCase):
                 "X 会话与 HDMI 实际输出不一致, 屏幕可能没真正点亮"
             )
             return result
+
+        # ── §6.7.3 断开→恢复一轮 (指令式: --off → 等几秒 → --auto) ──
+        # 放在**基线判完之后**: 基线已经 failed(真矛盾)就没必要再折腾一轮 ——
+        # 那一轮的结论不会把 failed 翻成 passed, 只是白折腾一块屏。
+        # 判定用**同一套逻辑**: _probe_output + §6.7.2 三态表, 一个字没改。
+        if not _as_bool(_cfg(ctx, "replug_check", False), False):
+            result.metrics["replug_check"] = "disabled"
+            await ctx.on_log(
+                "[HDMI] 断开→恢复轮: 未启用 (配置 defaults.hdmi.replug_check)"
+            )
+            await ctx.on_progress(100, "完成")
+            result.status = "passed"
+            return result
+        result.metrics["replug_check"] = "enabled"
+
+        # ⚠️ 只关**基线判定用的那个口**(授权范围): 那一轮判的就是这个口,
+        # 关别的口没有意义, 还会把没在用的输出口折腾坏。
+        round_state = await _replug_round(
+            ctx, result, active, prefix, xrandr_bin, cand,
+        )
+        result.metrics["replug_state"] = round_state
+        if round_state == "cancelled":
+            result.status = "stopped"
+            result.error = "断开→恢复那一轮等待期间被停止"
+            return result
+        if round_state == "restore_failed":
+            result.status = "failed"
+            result.error = (
+                f"{active['name']} 的输出关掉之后**没能恢复** —— "
+                "xrandr --auto / --mode 都失败, 这块屏可能还黑着, "
+                "请手动接好显示器或重启桌面会话"
+            )
+            return result
+        if round_state == "mismatch":
+            result.status = "failed"
+            result.error = (
+                f"{active['name']} 断开再恢复之后点不亮 —— "
+                "xrandr 说这个输出口没有当前模式, 与 sysfs 的 connected 矛盾"
+            )
+            return result
+        await ctx.on_progress(100, "完成")
         result.status = "passed"
         return result
