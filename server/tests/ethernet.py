@@ -29,7 +29,9 @@ import re
 import time
 from typing import List, Tuple
 
-from .base import TestCase, TestContext, TestResult, register
+from .base import (
+    TestCase, TestContext, TestResult, register, OPERATOR_WAIT_SHORT_SEC,
+)
 from ._tools import find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable
 
 # §11.3: 用精确正则而非 substring 模糊匹配 —— 宽松 in 匹配会被无关文本骗到
@@ -417,8 +419,20 @@ class EthTest(TestCase):
           · no_ip     —— 工位没 DHCP, 插一百根网线也没用, 停下来只是白等
           · no_egress —— 上游网络坏了, 那是工位的问题, 应该直接跳过往下走
         只有 unplugged 是「把网线插上就能继续」的物理动作, 值得等工人。
+
+        ⚠️ **只等 30 秒**(2026-11-09 工人要求): 插网线是「把东西插上就能
+        继续」的物理动作 —— 工人要么就在板子边上(几秒), 要么人根本不在
+        这一台跟前。⇒ 30 秒内插好并点「已插好重测」照旧重测; 没人管就
+        **直接跳过**, 整轮继续往下走(全局 `flow.operator_wait_sec`
+        仍是 300s, 给那些**真的需要人跑一趟**的项兜底)。
         """
         m = result.metrics or {}
         if result.status == "skipped" and m.get("skipped_reason") == "unplugged":
-            return {"text": "未插网线。请插上网线后选「已插好重测」, 或选「跳过」。"}
+            return {
+                "text": (
+                    "未插网线。请插上网线后选「已插好重测」, 或选「跳过」。"
+                    "(30 秒内没处理就自动跳过这一项)"
+                ),
+                "wait_sec": OPERATOR_WAIT_SHORT_SEC,
+            }
         return None

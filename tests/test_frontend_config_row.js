@@ -129,7 +129,7 @@ if (inlineOpts !== null) {
 section('【3】其余旋钮也**全都**搬到了右列(不许有漏在下面的)');
 /* 每一格: 输入框在、守卫在、范围没被改坏 */
 const KNOBS = [
-    { key: 'threads', model: 'threads', range: 'min="0" max="6"', label: '线程数' },
+    { key: 'threads', model: 'threads', range: 'min="0" max="8"', label: '线程数' },
     { key: 'rounds', model: 'rounds', range: 'min="1" max="20"', label: '轮次' },
     { key: 'scene_sec', model: 'scene_sec', range: 'min="0.5" max="60"', label: '每场景' },
     { key: 'cycles', model: 'cycles', range: 'min="1" max="50"', label: '轮转' },
@@ -188,10 +188,9 @@ section('【6】提示词: 项级别的那几条全删了, 只剩 GPU 那两条�
  *   TF 卡「运行时自动检测 · 未插弹提示」/ WiFi「4 步直测 · 不连 AP …」/
  *   蓝牙「只读探测 · 判定反过来: 关着才算合格」/ 网口「3 步 · 未插网线 …」/
  *   HDMI「含 1 轮自动断开/恢复 …」
- * ⚠️ CPU 的「默认 6 核(上限 6); 0 = 自动」是另一回事: 它不是**项**的说明,
- * 是**那个输入框**的说明(六核封顶, 拧到 8 会被夹回 6) ⇒ 版面上撤掉,
- * 但挪进了输入框的 title(悬停才看得到) —— 不能让工人以为拧 8 就真按
- * 8 核压。 */
+ * ⚠️ CPU 的「默认 4 核(上限 8); 0 = 自动(=8 满核)」是另一回事: 它不是**项**的说明,
+ * 是**那个输入框**的说明(上限 = 满核, 拧到 8 就真是 8 核的压) ⇒ 版面上撤掉,
+ * 但挪进了输入框的 title(悬停才看得到) —— 让工人知道拧 8 = 满核。 */
 const DEAD_HINTS = [
     ['运行时自动检测', 'TF 卡的「运行时自动检测 · 未插弹提示」'],
     ['4 步直测', 'WiFi 的「4 步直测 · 不连 AP · 无 AP 时降级通过」'],
@@ -204,14 +203,14 @@ for (const [needle, what] of DEAD_HINTS) {
     check(!htmlNoComment.includes(needle), `${what} 已经从配置页上删掉了`, { needle });
 }
 /* CPU 那句: **不能**作为可见的提示词回来, 但也不许整个消失 —— 它得在
- * 输入框的 title 里(悬停提示), 工人拧 8 的时候能想起来这是 6 核封顶。 */
-check(!/<span class="hint-tag">[^<]*默认 6 核/.test(htmlNoComment),
-      'CPU「默认 6 核…」不再作为可见的提示词摆在版面上');
+ * 输入框的 title 里(悬停提示), 工人拧 8 的时候能想起来这是满核。 */
+check(!/<span class="hint-tag">[^<]*默认 4 核/.test(htmlNoComment),
+      'CPU「默认 4 核…」不再作为可见的提示词摆在版面上');
 const threadsTag = htmlNoComment.match(/<input[^>]*tests\[t\.name\]\.threads[^>]*>/);
 check(!!threadsTag, '找得到「线程数」那个 input 标签');
 if (threadsTag) {
-    check(/title="默认 6 核\(上限 6\); 0 = 自动"/.test(threadsTag[0]),
-          '那六个字挪进了「线程数」输入框的 title(悬停提示, 版面上不占地方)',
+    check(/title="默认 4 核\(上限 8\); 0 = 自动\(=8 满核\)"/.test(threadsTag[0]),
+          '那几个字挪进了「线程数」输入框的 title(悬停提示, 版面上不占地方)',
           threadsTag[0]);
 }
 /* GPU 那两条**要留**, 而且要紧挨着自己那个输入框 */
@@ -222,8 +221,8 @@ check(roundsChunk !== null && roundsChunk.includes('每轮独立跑一遍, 能�
 check(sceneChunk !== null && sceneChunk.includes('33 个场景 × 这个值 = 一轮时长'),
       'GPU「每场景」紧挨着自己的提示「33 个场景 × 这个值 = 一轮时长」');
 
-section('【7】六核封顶那个旋钮没被改坏');
-check(/v-model\.number="tests\[t\.name\]\.threads" min="0" max="6"/.test(htmlNoComment),
-      '「线程数」还是 0~6(六核封顶那次的旋钮没被改坏)');
+section('【7】线程数那个旋钮没被改坏(上限放回 8 核 = 满核)');
+check(/v-model\.number="tests\[t\.name\]\.threads" min="0" max="8"/.test(htmlNoComment),
+      '「线程数」是 0~8(上限放回满核那次的旋钮没被改坏)');
 
 process.exit(finish());

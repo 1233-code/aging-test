@@ -313,6 +313,98 @@ U 盘版应用 —— 由 scripts/build_usb_image.sh 生成
 构建主机: $(uname -m) / python $PYV
 EOF
 
+# ── 版本戳 ───────────────────────────────────────────────────────────
+#   产线那边**分不清手上这根盘是哪一版** ⇒ 旧盘(满核 8 线程)一直流出去 ⇒
+#   板子成批硬复位。⇒ 这一份给工人/产线一个能看懂的答案 + **自查命令**。
+#
+#   ⚠️ **这里只读文本、只写文本**, 不执行镜像里的任何东西。
+_cfg_threads="$(grep -m1 -E '^[[:space:]]*threads:' "$OUT_DIR/config.yaml" 2>/dev/null \
+                | sed -e 's/#.*//' -e 's/[^0-9]*\([0-9]\+\).*/\1/')"
+_code_cap="$(grep -m1 -E '^MAX_STRESS_THREADS[[:space:]]*=' "$OUT_DIR/server/tests/cpu.py" 2>/dev/null \
+                | sed -e 's/[^0-9]*\([0-9]\+\).*/\1/')"
+_cfg_threads="${_cfg_threads:-0}"
+_code_cap="${_code_cap:-0}"
+# 旋钮能拧到几核 = 页面上那个输入框的 max(从镜像里的 index.html 读)
+# ⚠️ **2026-11-09 晚(更晚)加的**: 默认值从 8 改成 4 之后, 「满核警告」如果
+#   继续看**出厂默认**就永远触发不了(默认是 4)⇒ 而旋钮**照样能拧到 8**
+#   ⇒ 警告必须看**用户拧得到几核**(= min(旋钮 max, 代码硬上限))。
+_knob_max="$(grep -m1 -oE 'tests\[t\.name\]\.threads[^>]*max="[0-9]+"' \
+            "$OUT_DIR/static/index.html" 2>/dev/null \
+            | grep -oE 'max="[0-9]+"' | grep -oE '[0-9]+')"
+_knob_max="${_knob_max:-0}"
+_eff=99                        # 出厂默认(受硬上限夹住); 99 = 不设限
+if [ "$_cfg_threads" -gt 0 ] 2>/dev/null; then _eff=$_cfg_threads; fi
+if [ "$_code_cap" -gt 0 ] 2>/dev/null && [ "$_code_cap" -lt "$_eff" ]; then _eff=$_code_cap; fi
+_reach=99                      # 用户拧得到的上限(旋钮 max ∧ 代码硬上限)
+if [ "$_knob_max" -gt 0 ] 2>/dev/null; then _reach=$_knob_max; fi
+if [ "$_code_cap" -gt 0 ] 2>/dev/null && [ "$_code_cap" -lt "$_reach" ]; then _reach=$_code_cap; fi
+
+# ── 出厂断言: 这根盘**不许**能压到**超过核数** ──────────────────────
+#
+#   ⚠️ **2026-11-09 晚: 这条断言的口径改了(用户授权)** —— 原来是「不许能
+#   压到 7 核以上」(那时上限是 6 核, 满核 8 线程 = 过应力 ⇒ 板子成批硬
+#   复位, 「宁可打不出来, 也不打出一根满核 8 线程的盘」)。现在上限放回
+#   **8 核 = 满核**(用户决定: 「既然降到 5 核都还是会重启, 那就直接改回
+#   八核默认, 我可以手动降低核心 …… 我先找到一个平衡点再来修改默认
+#   参数」)⇒ 断言改成「**不许超过核数**」—— 它守的是「别做出一个能让
+#   板子压到比核数还多的盘」(那种是配置写坏了), 不再代替「不许满核」。
+#
+#   ⚠️ **满核 = 过应力这件事没消失** ⇒ 满核时**必须警告**, 让产线知道
+#   「开跑前先在页面上把『线程数』调低」。
+if [ "$_eff" -gt 8 ] 2>/dev/null; then
+    die "这镜像的出厂默认是 $_eff 核(>8 = 比核数还多 ⇒ 配置写坏了)
+     ⇒ 修法: ① config.yaml 的 cpu.threads 改成 ≤ 8(出厂默认建议 4)
+              ② 或在 server/tests/cpu.py 里保留 MAX_STRESS_THREADS = 8 这个硬上限"
+fi
+if [ "$_code_cap" -gt 8 ] 2>/dev/null; then
+    die "代码里的硬上限是 $_code_cap 核(>8 = 比核数还多 ⇒ 代码写坏了)
+     ⇒ 修法: server/tests/cpu.py 的 MAX_STRESS_THREADS 改回 8"
+fi
+if [ "$_code_cap" -eq 0 ] 2>/dev/null; then
+    warn "代码里没有 MAX_STRESS_THREADS 硬上限 —— 只靠 config.yaml 兜着
+     ⇒ 页面「线程数」旋钮一改就能压到 8 核 ⇒ 建议把硬上限加回去"
+fi
+# ⚠️ **2026-11-09 晚(更晚): 默认值定在 4 核, 上限仍是 8**(用户点名授权:
+#   「确定了, 默认四核, 但是像现在这样支持用户自己选择核数, 四核比较保险」)
+#   ⇒ **默认这一档现在是保险档**(4 核 + 应用自己的背景 ≈ 5.7 核, 离
+#     「整板 ≈ 7 核」的天花板有余量);
+#   ⇒ 但**旋钮照样能拧到 8** ⇒ 这条「满核 = 过应力」的警告**必须跟着
+#     「用户拧得到几核」走**(`$_reach` = min(旋钮 max, 代码硬上限)),
+#     **不能跟着出厂默认走** —— 默认改成 4 之后, 若还看 `$_eff`(那是 4),
+#     这条警告就**永远不会触发**了, 产线就收不到「别往上调」的提醒
+#     ⇒ **这条改动是让警告多触发, 不是让它少触发**。
+if [ "$_reach" -ge 8 ] 2>/dev/null; then
+    warn "这镜像的旋钮能拧到**满核 $_reach 线程**(出厂默认是 $_eff 核)
+     ⇒ 满核是过应力那一档(2026-11-04 实测会硬复位)
+     ⇒ **开跑前请确认页面上 CPU 的「线程数」**, 别往上调(填 0 = 满核)"
+fi
+log "   出厂断言: 出厂默认 $_eff 核 / 旋钮上限 $_reach 核(≤8)✓"
+
+_dead_guard="无"
+if grep -rq 'cpu_evidence_cut_short' "$OUT_DIR/server/" 2>/dev/null; then _dead_guard="有"; fi
+_git_ver="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo 无git)"
+cat > "$OUT_DIR/版本.txt" <<EOF
+老化测试 U 盘镜像 —— 版本戳
+============================
+构建时间: $(date '+%Y-%m-%d %H:%M:%S')
+代码版本: $_git_ver
+构建主机: $(uname -m) / python ${PYV:-未知}
+
+CPU 加压:
+  · 出厂默认线程数: $([ "$_cfg_threads" = 0 ] && echo "0(按核数)" || echo "$_cfg_threads")
+  · 代码硬上限: $([ "$_code_cap" = 0 ] && echo "无" || echo "$_code_cap 核")
+  · 旋钮上限  : $([ "$_reach" = 0 ] && echo "?" || echo "$_reach 核")
+  · 「死在加压途中 ⇒ 判 failed 不放行」的兜底: $_dead_guard
+
+怎么确认手上这根盘是哪一版(在盘根目录下跑):
+  grep -m1 "threads:" config.yaml
+      => 必须是  threads: 4
+      => 若是   threads: 8  = 旧盘(出厂默认满核 8 线程, 板子会成批硬复位)
+  grep -h "本轮加压峰值" logs/cpu_evidence_*.txt | tail -3
+      => 写「4 线程」= 这一版(出厂默认 4 核); 写「8 线程」= 有人把旋钮拧到满核了
+EOF
+log "   写了「版本.txt」(产线一眼能认出手上这根盘是哪一版)"
+
 cat > "$OUT_DIR/怎么启动.txt" <<'EOF'
 怎么启动老化测试
 =================
@@ -435,7 +527,18 @@ fi
 
 # 应用**不许**调 venv 里的 console script —— 它们的 shebang 写死构建路径。
 # (start.sh 已改成 `python3 -m uvicorn` / `python3 -m pip`; 这里防回退)
-if grep -n '"\$VENV_DIR"/bin/uvicorn\|"\$VENV_DIR"/bin/pip ' "$OUT_DIR/start.sh" 2>/dev/null | head -5; then
+#
+# ⚠️ **判据不能写成 `if grep ... | head -5; then`** (2026-11-09 修):
+#    管道的退出码取自**最后一个命令(head)**, 它**永远成功** ⇒
+#    **没匹配也会进 then 分支** ⇒ 这道闸门**恒为真** ⇒
+#    每次打包都在最后一步 die 掉(而镜像是好的、start.sh 是干净的)⇒
+#    **新镜像出不来 ⇒ 产线一直用旧盘 ⇒ 板子成批硬复位**。
+#    ⇒ 必须**先把匹配结果存进变量, 再判非空**。
+_bad="$(sed -e 's/#.*//' "$OUT_DIR/start.sh" 2>/dev/null \
+        | grep -nE '\$VENV_DIR"?/bin/' \
+        | grep -v '/bin/python' | head -5)"
+if [ -n "$_bad" ]; then
+    printf '%s\n' "$_bad"
     die "start.sh 里还在直接调 venv 的 console script ⇒ 换台设备必坏
      ⇒ 一律改成 \"\$VENV_DIR\"/bin/python3 -m <模块>"
 fi

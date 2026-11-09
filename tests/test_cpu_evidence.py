@@ -826,9 +826,11 @@ ctx = TestContext(
     config={},
     # 40s / 5s 一片 = 8 片 ⇒ 线程数 1 → 2 → 3 → 4 → 6 → 6 → 6 → 6
     #    (2026-11-02: 台阶补了一级 3 —— 见上面【1】)
-    #    ⚠️ 2026-11-04: 这里**故意填 8** —— 加压上限是 6 核(MAX_STRESS_THREADS),
-    #    填 8 也要只压 6 ⇒ 这一轮顺便把「上限真的夹住了」也验了。
-    test_config={"times": 1, "duration_sec": 40, "slice_sec": 5, "threads": 8},
+    #    ⚠️ 2026-11-09 晚: 这里**故意填 6** —— 加压上限放回 8 核(满核)之后,
+    #    填 6 就是 6 ⇒ 这一轮正好验「旋钮拧小了, 真的按小的压」;
+    #    (夹住的那条路由 tests/test_cpu_load_shape.py【9】验 —— 那里把板子
+    #     假装成 32 核, 专门验「上限还是硬的」)
+    test_config={"times": 1, "duration_sec": 40, "slice_sec": 5, "threads": 6},
     on_progress=_noop_progress,
     on_log=_noop_log,
     is_cancelled=_not_cancelled,
@@ -872,9 +874,9 @@ if path.exists():
     check("threads=2" in txt, "第 2 片爬到 2 线程", txt)
     check("threads=3" in txt, "第 3 片爬到 3 线程(2026-11-02 补的一级)", txt)
     check("threads=4" in txt, "第 4 片爬到 4 线程", txt)
-    check("threads=6" in txt, "第 5 片才到满载 **6 线程**(加压上限)", txt)
+    check("threads=6" in txt, "第 5 片才到满载 **6 线程**(这一轮配置填的就是 6)", txt)
     check("threads=8" not in txt,
-          "**没有 8 线程**(加压上限 6 核 —— 2026-11-04 定的天花板)", txt)
+          "**这一轮没到 8 线程**(填的是 6 —— 旋钮拧小了就得按小的压)", txt)
     check("cpub=60.0" in txt, "每个核区的温度都记下来了", txt)
     check(any("freq=" in l for l in sampler_lines),
           "频率也记下来了(采样行里就有, 不只是「起跑」那一行)", txt)
@@ -906,9 +908,25 @@ section("【8】加压封顶值可调(页面上的「线程数」旋钮) —— 
 # ⚠️ **2026-11-04: 那个前提被实测推翻了** —— 终端跑 8 线程**一样死**;
 #    真正测出来的是: 这块板子 **6 核稳、第 7 核档起手约 2 秒硬复位**
 #    (不是热), 同一批的好板 8 核没事 ⇒ **个体差异**, 不是应用的锅。
-#    ⇒ 旋钮照样有用(它是**唯一**能立刻把压力拧小的旋钮), 但现在还多
-#      了一层**加压上限 6 核**(MAX_STRESS_THREADS)—— 拧到 8 也会被夹回 6,
+#    ⇒ 旋钮照样有用(它是**唯一**能立刻把压力拧小的旋钮), 但当时还多
+#      了一层**加压上限**(MAX_STRESS_THREADS)—— 拧到 8 也会被夹回上限,
 #      免得有人拿满核去过应力、把日常用得好好的板子压死。
+#
+# ⚠️ **2026-11-09 白天: 上限从 6 降到 5** —— 板子上「整板天花板 ≈ 7 核」,
+#    而应用自己那点背景(X + x11vnc + chromium 开着老化页面)就吃 0.7~1.7 核
+#    ⇒ 应用声称的「6 线程」其实是**整板 6.7~7.7 核** ⇒ 过线。
+#
+# ⚠️⚠️ **2026-11-09 晚: 上限放回 8(满核)—— 「实验台」状态**(用户授权):
+#    · 5 核那个数**没有被验证过**(当天早上定, 当晚就发现「第二轮又挂」);
+#    · 而「第二轮」的变量**不是线程数**, 是**上一轮留下的热** ⇒
+#      **在热板子上量出来的 5 核不能当结论**;
+#    · ⇒ 用户决定: 「既然降到 5 核都还是会重启, 那就直接改回八核默认,
+#      我可以手动降低核心, 不用你改来改去, 这样我先找到一个平衡点
+#      再来修改默认参数」⇒ **上限放回 8(满核)**, 让工人自己在页面上
+#      拧线程数, 一次只动一个变量, 找到平衡点之后再定默认参数;
+#    · ⇒ 这一节改成**填 6**: 证明「旋钮拧小了, 真的按小的压」;
+#      「上限还在不在」由 tests/test_cpu_load_shape.py【9】验(那里把板子
+#      假装成 32 核, 专门验上限还夹得住)。
 #
 # 这一节守的是**后端这一半**: 旋钮拧小了, 真的就按小的压吗?
 # 证据落在三处: ① 真的发出去的命令行; ② 指标; ③ 现场记录的文件头。
@@ -937,7 +955,7 @@ sent_cpu = _sent_cpu_args()
 check(len(sent_cpu) == 8,
       "每一片的执行日志里都找得到 --cpu N(8 片)", sent_cpu)
 check(sent_cpu and max(sent_cpu) == 6,
-      "**最高只压到 6 线程**(配置填的 8 被加压上限夹住了)", sent_cpu)
+      "**最高只压到 6 线程**(这一轮配置填的就是 6)", sent_cpu)
 check(sent_cpu and sent_cpu[0] == 1,
       "起步还是 1 线程(缓启动 —— 板子死在起手一秒内, 起步必须轻)", sent_cpu)
 check(sent_cpu == [1, 2, 3, 4, 6, 6, 6, 6],
@@ -947,13 +965,14 @@ check(sent_cpu == [1, 2, 3, 4, 6, 6, 6, 6],
 check(result.metrics.get("peak_threads") == 6,
       "指标 peak_threads = 6(这一轮实际压到的线程数)",
       result.metrics.get("peak_threads"))
-check(result.metrics.get("peak_threads_configured") == 8,
-      "指标 peak_threads_configured = 8(页面/配置里填的原始值)",
+check(result.metrics.get("peak_threads_configured") == 6,
+      "指标 peak_threads_configured = 6(页面/配置里填的原始值)",
       result.metrics.get("peak_threads_configured"))
-check(result.metrics.get("max_stress_threads") == 6,
-      "指标里记着加压上限本身", result.metrics.get("max_stress_threads"))
-check(result.metrics.get("threads_capped") == "是",
-      "指标 threads_capped = 是(这一轮被夹过)",
+check(result.metrics.get("max_stress_threads") == 8,
+      "指标里记着加压上限本身(8 = 天花板, 这一轮没顶到它)",
+      result.metrics.get("max_stress_threads"))
+check(result.metrics.get("threads_capped") != "是",
+      "指标 threads_capped ≠ 是(这一轮填的 6 低于上限 8, 没被夹)",
       result.metrics.get("threads_capped"))
 
 # ③ 现场记录的文件头写着封顶值 —— 板子死在半路时, 这是唯一能回答

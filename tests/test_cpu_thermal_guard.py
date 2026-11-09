@@ -220,9 +220,11 @@ check(result.metrics.get("abort_temp_c", 0) > 85,
       result.metrics.get("abort_temp_c"))
 
 section("【6】逐级加压 (1 → 2 → 3 → 4 → 满载) —— 别一上来就满载")
-# ⚠️ 2026-11-04: 满载那一片现在是 **6 线程** —— 加压上限 6 核
-#    (MAX_STRESS_THREADS: 实测 6 核稳 / 第 7 核档起手约 2 秒硬复位,
-#    满核 8 线程是过应力, 会把「日常用得好好的」板子压死)。
+# ⚠️ 2026-11-09 晚: 满载那一片现在是 **8 线程** —— 加压上限放回 8 核(满核,
+#    用户授权的「实验台」状态: 让工人自己在页面上拧线程数找平衡点)。
+#    历史: 11-04 是 6 核(上限), 11-09 白天降到 5 核 —— 那个 5 **没被验证过**
+#    (「第二轮又挂」的变量是上一轮留下的热, 不是线程数)⇒ 撤回。
+#    ⚠️ 这一节跑的是**假** stress-ng(不起真进程) ⇒ 8 线程不会压到板子。
 # 2026-10-30 改过: 原来是「第一片用**一半**线程」(8 → 4) 后面的片满载 ——
 # 那是第一次加的缓解(新板「一启动就重启」), 但实测**连 4 线程都扛不住**
 # ⇒ 缓启动改成逐级爬: 1 → 2 → 4 → 8。板子在哪一级扛不住, 那级就是天花板。
@@ -246,10 +248,10 @@ first = next((l for l in logs if "执行:" in l), "")
 check("--cpu 1" in first, "第 1 片只有 1 个线程(逐级加压)", first)
 check(any("--cpu 2" in l for l in logs), "第 2 片爬到 2 个线程", logs)
 check(any("--cpu 4" in l for l in logs), "第 3 片爬到 4 个线程", logs)
-check(any("--cpu 6" in l for l in logs),
-      "第 4 片才到满载 —— **6 个线程**(加压上限 6 核, 填的 8 被夹住)", logs)
+check(any("--cpu 8" in l for l in logs),
+      "第 4 片才到满载 —— **8 个线程**(加压上限 8 核 = 满核)", logs)
 # 短跑也得**真的满载过一次** —— 台阶压缩了, 满载那一片不能被挤掉
-check(logs.index(next(l for l in logs if "--cpu 6" in l))
+check(logs.index(next(l for l in logs if "--cpu 8" in l))
       > logs.index(next(l for l in logs if "--cpu 4" in l)),
       "满载在最后, 不是一步跳过去", logs)
 

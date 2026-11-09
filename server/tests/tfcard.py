@@ -33,7 +33,7 @@ from typing import List, NamedTuple, Optional
 
 from .base import (
     TestCase, TestContext, TestResult, register,
-    TestCancelled, DeviceUnresponsive,
+    TestCancelled, DeviceUnresponsive, OPERATOR_WAIT_SHORT_SEC,
 )
 from ._tools import (
     is_sudo_password_error,
@@ -575,7 +575,17 @@ class TFCardTest(TestCase):
         ⚠️ 只有「卡槽真的空的」(metrics.no_card)才弹。卡在槽里但挂不上
         的那种是 error, 不弹 —— 弹了就是让工人去干一件没用的事(他插了
         也一样挂不上)。
+
+        ⚠️ **只等 30 秒**(2026-11-09 工人要求): 插卡是「把东西插上就能
+        继续」的物理动作 —— 工人要么就在板子边上(几秒), 要么人根本不在
+        这一台跟前(这台板子上压根没这个料)。⇒ 30 秒内插好并点「已插好
+        重测」照旧重测; 没人管就**直接跳过**, 整轮继续往下走 ——
+        不占着整轮等 5 分钟(全局 `flow.operator_wait_sec` 仍是 300s,
+        给那些**真的需要人跑一趟**的项兜底)。
         """
         if result.status == "skipped" and (result.metrics or {}).get("no_card"):
-            return {"text": "未检测到 TF 卡(卡槽是空的)。请插入 TF 卡后选「已插好重测」, 或选「跳过」。"}
+            return {
+                "text": "未检测到 TF 卡(卡槽是空的)。请插入 TF 卡后选「已插好重测」, 或选「跳过」。(30 秒内没处理就自动跳过这一项)",
+                "wait_sec": OPERATOR_WAIT_SHORT_SEC,
+            }
         return None

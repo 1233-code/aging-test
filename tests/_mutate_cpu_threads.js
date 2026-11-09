@@ -38,7 +38,7 @@ const MUTATIONS = [
         name: 'HTML: 「线程数」输入框整个没了 (旋钮不见了, 工人没法降压力)',
         file: 'index.html',
         from: `                            <span v-if="'threads' in tests[t.name]">
-                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="0" max="6" class="num-input" title="默认 6 核(上限 6); 0 = 自动">
+                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="0" max="8" class="num-input" title="默认 4 核(上限 8); 0 = 自动(=8 满核)">
                             </span>
 `,
         to: ``,

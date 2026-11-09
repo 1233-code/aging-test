@@ -789,12 +789,33 @@ class TestRunner:
         HDMI 的结果早就写进库了, 日志和画面自然对不上。
 
         超时是必须的: 没人操作时自动往下走, 不能把整轮挂死。
+
+        ⚠️ **等多久由提示自己说了算**(2026-11-09 工人要求):
+          · `prompt["wait_sec"]` 有值 → **用这一条自己的**(卡槽空 /
+            网线没插 = 30s: 工人 30 秒内插好就重测, 没插就**直接跳过**,
+            不占着整轮等 5 分钟);
+          · 没有 → 用全局 `flow.operator_wait_sec`(默认 300s, 给那些
+            **真的需要人跑一趟**的项兜底)。
+        ⚠️ **别用 int** —— 见下面那行注释(历史上 `int(0.5)` 被截成 0,
+        「停下来等」直接失效, 症状和没写这个功能一模一样)。
         """
         flow_cfg = Config.get("flow", {}) or {}
         # **用 float, 不要 int** —— int(0.5) 是 0, 超时一旦被截成 0,
         # wait_for 会立刻抛 TimeoutError, 这个「停下来等」就等于没写,
         # 而且症状和原来的 bug 一模一样 (界面自己往下跑), 极难联想到配置。
-        timeout = float(flow_cfg.get("operator_wait_sec", OPERATOR_WAIT_DEFAULT_SEC))
+        own = prompt.get("wait_sec")
+        if own is None:
+            timeout = float(flow_cfg.get("operator_wait_sec", OPERATOR_WAIT_DEFAULT_SEC))
+        else:
+            # 提示自己声明的等待上限 —— **只认正数**(0/负数当成没写,
+            # 免得一个手滑把「等操作员」变成「不等」)。
+            try:
+                own_f = float(own)
+            except (TypeError, ValueError):
+                own_f = 0.0
+            timeout = own_f if own_f > 0 else float(
+                flow_cfg.get("operator_wait_sec", OPERATOR_WAIT_DEFAULT_SEC)
+            )
 
         event = asyncio.Event()
         # 局部持有这个槽位对象的引用: finally 里会把 self._operator_wait

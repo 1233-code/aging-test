@@ -42,7 +42,10 @@ const html = fs.readFileSync(INDEX_HTML, 'utf8');
 
 /** 后端 /api/config 的载荷 —— 只留这个测试用得上的部分。
  *  defaults.cpu.threads 来自 config.yaml 的 `defaults.cpu`
- *  (现在是 **6** = 默认 6 核, 也是加压上限 —— 2026-11-04 改, 原来是 0 = 全部核),
+ *  (现在是 **4** = 默认 4 核「保险档」—— 2026-11-09 晚更晚定的: 「确定了,
+ *   默认四核, 但是像现在这样支持用户自己选择核数, 四核比较保险」;
+ *   ⚠️ **默认值 ≠ 上限**: 旋钮 max 仍是 8, 硬上限也仍是 8 ⇒ 用户照样能
+ *   自己拧到 8; 2026-11-09 白天是 5, 2026-11-04 是 6, 更早是 0 = 全部核),
  *  页面靠它把这个框**填上初值** —— 后端不下发, 框就是空的, 工人拧不动。 */
 const CONFIG_PAYLOAD = {
     defaults: {
@@ -50,7 +53,7 @@ const CONFIG_PAYLOAD = {
             enabled: true,
             times: 1,
             duration_sec: 60,
-            threads: 6,
+            threads: 4,
             max_temp_c: 85,
             abort_temp_c: 95,
             slice_sec: 5,
@@ -99,36 +102,36 @@ async function main() {
             '这个框用 \'threads\' in tests[t.name] 守卫 (只有带这键的项才显示)');
         check(/线程数/.test(html), '框旁边有「线程数」的字样 (工人认得出来)');
         // min="0": 0 = 自动 是合法值, 不许被浏览器的下界校验挡住。
-        // max="6": **加压上限 6 核**(2026-11-04)—— 输入框也得上限,
-        //   别让工人填 8 然后以为板子会挨 8 核的压(后端还会夹一道,
-        //   但框上写着 6 人才知道真实压力是多少)。
+        // max="8": **加压上限 8 核(满核)**(2026-11-09 晚放回; 当天白天是 5,
+        //   再之前是 6)—— 输入框的上限要跟后端那道夹子一致, 否则工人填 6
+        //   会被浏览器挡掉(上限 5 的时候他连 6 都试不了)。
         const m = html.match(/<input[^>]*v-model(?:\.number)?="tests\[t\.name\]\.threads"[^>]*>/);
         check(!!m, '找得到那个 input 标签');
         if (m) {
             check(/min="0"/.test(m[0]), 'min="0" (0 = 自动 是合法的起点)');
             check(/type="number"/.test(m[0]), '是 number 类型 (能填数字, 不填串)');
-            check(/max="6"/.test(m[0]),
-                'max="6" (加压上限 6 核 —— 别让人填 8 以为会挨 8 核的压)',
+            check(/max="8"/.test(m[0]),
+                'max="8" (加压上限 8 核 = 满核 —— 工人要自己拧线程数找平衡点)',
                 m[0]);
         }
-        // 2026-11-04: 「默认 6 核(上限 6); 0 = 自动」那句从**版面上**撤掉了
+        // 2026-11-04: 「默认 4 核(上限 8); 0 = 自动」那句从**版面上**撤掉了
         // (右列只摆旋钮) ⇒ 挪进了这个输入框的 title(悬停才看得到)。
-        // ⚠️ **不许整个消失** —— 六核封顶是反直觉的(框上写 6, 后端也只给
-        // 6), 工人拧 8 以为板子真挨 8 核的压就麻烦了。
-        check(!!m && /title="默认 6 核\(上限 6\); 0 = 自动"/.test(m[0]),
-            '「默认 6 核(上限 6); 0 = 自动」在那个输入框的 title 里(悬停提示)',
+        // ⚠️ **不许整个消失** —— 上限是反直觉的(框上写 8, 后端也只给 8),
+        // 工人得知道拧 8 = 满核、拧 0 也是满核。
+        check(!!m && /title="默认 4 核\(上限 8\); 0 = 自动\(=8 满核\)"/.test(m[0]),
+            '「默认 4 核(上限 8); 0 = 自动(=8 满核)」在那个输入框的 title 里(悬停提示)',
             m ? m[0] : '(没找到那个 input)');
     }
 
     // ══════════════════════════════════════════════════════════
-    section('【2】后端下发的默认值进到框里 (默认 6 核)');
+    section('【2】后端下发的默认值进到框里 (默认 4 核)');
     {
         const { app } = makeApp();
         await new Promise((r) => setTimeout(r, 0));
         await new Promise((r) => setTimeout(r, 0));
         check(!!app.tests.cpu, 'tests.cpu 拿到了');
-        check(app.tests.cpu && app.tests.cpu.threads === 6,
-            'tests.cpu.threads = 6 (来自后端 defaults.cpu.threads)',
+        check(app.tests.cpu && app.tests.cpu.threads === 4,
+            'tests.cpu.threads = 4 (来自后端 defaults.cpu.threads)',
             app.tests.cpu ? JSON.stringify(app.tests.cpu) : '(没有 tests.cpu)');
         check(app.tests.memory && app.tests.memory.threads === undefined,
             '没有 threads 键的项 (memory) 不带这个字段 —— 框不会误显示');
