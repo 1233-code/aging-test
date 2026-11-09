@@ -16,15 +16,20 @@
 
 这轮还顺手修掉了另一半: 用户中途停止时, 队列里**没跑**的项在 results 表里
 **连行都没有** —— 报告逐项段里看不见它们, 界面上显示成「⏳ 等待」,
-工人以为还在排队。现在给它们补 stopped 行。
+工人以为还在排队。现在给它们补行。
 
 这个测试验六件事:
     ① 一项都没实际执行 → 整轮判 **skipped**, 不是 passed
     ② total = passed + failed + error, skipped / stopped 不进 total
     ③ total 只数**实际执行**的项, 不是勾选数
-    ④ 中途停止 → 没跑的项补 stopped 行 (进库 + 进结果)
+    ④ 中途停止 → 没跑的项补 **skipped** 行 (进库 + 进结果)
     ⑤ stopped 与 skipped 分开数 (§9.3: 一个是用户主动跳, 一个是没跑到)
-    ⑥ 正在跑的那一项被停止 → 它自己判 stopped, 不是 passed
+    ⑥ 正在跑的那一项被停止 → 它自己判 skipped, 不是 passed
+
+⚠️ ④⑥ 的口径是 2026-10-29 改的: 工人按「停止」时, **当前项和后面所有项
+   都记 skipped**(用户主动让它别测), 而**不是** stopped。stopped 现在只
+   留给「服务中途夭折、那一项没跑完」。整轮仍然判 stopped —— 靠 summary 里
+   的 aborted 计数(见 tests/test_skip_next.py)。
 
 只碰内存里的假 Database / 假 report —— 不写生产库、不写 reports/pdf/。
 跑法: .venv/bin/python -m tests.test_summary_total
@@ -201,7 +206,7 @@ async def case3():
 
 
 async def case4():
-    print("\n【4】中途停止 → 没跑到的项补 **stopped** 行 (进库 + 进结果)")
+    print("\n【4】中途停止 → 没跑到的项补 **skipped** 行 (进库 + 进结果)")
     rn = R.TestRunner()
     rn.run_id = 1
     rn.status = "running"
@@ -222,20 +227,31 @@ async def case4():
     check(status == "stopped", "整轮判 stopped", status)
     check(len(rn.results) == 3,
           "三个项都有结果 (没跑的那两个也补上了)", list(rn.results))
-    check(rn.results.get("b") and rn.results["b"].status == "stopped",
-          "b 是 stopped", rn.results.get("b") and rn.results["b"].status)
-    check(rn.results.get("c") and rn.results["c"].status == "stopped",
-          "c 是 stopped", rn.results.get("c") and rn.results["c"].status)
+    check(rn.results.get("b") and rn.results["b"].status == "skipped",
+          "b 是 skipped (2026-10-29 新口径: 用户主动叫停 → 跳过)",
+          rn.results.get("b") and rn.results["b"].status)
+    check(rn.results.get("c") and rn.results["c"].status == "skipped",
+          "c 是 skipped", rn.results.get("c") and rn.results["c"].status)
     # 补的行必须真的进库 —— 报告是从库里读逐项结果的
-    stopped_rows = [f for (_rid, tn, f) in WRITTEN
-                    if tn in ("b", "c") and f.get("status") == "stopped"]
-    check(len(stopped_rows) == 2, "b / c 各补了一行进库", len(stopped_rows))
-    check(all(f.get("error") for f in stopped_rows),
+    skipped_rows = [f for (_rid, tn, f) in WRITTEN
+                    if tn in ("b", "c") and f.get("status") == "skipped"]
+    check(len(skipped_rows) == 2, "b / c 各补了一行进库", len(skipped_rows))
+    check(all(f.get("error") for f in skipped_rows),
           "补的行带原因 (报告上写得出为什么没测)",
-          [f.get("error") for f in stopped_rows])
-    check(summary.get("not_run") == 2, "not_run = 2 (未跑到单列)", summary.get("not_run"))
+          [f.get("error") for f in skipped_rows])
+    check(all((f.get("metrics") or {}).get("skipped_reason") == "aborted_by_user"
+              for f in skipped_rows),
+          "补的行带「中止整轮」的标记 (整轮判 stopped 就靠它)",
+          [f.get("metrics") for f in skipped_rows])
+    check(summary.get("not_run") == 0,
+          "not_run = 0 (「停止」跳掉的项记 skipped, 不是 stopped)",
+          summary.get("not_run"))
+    check(summary.get("skipped") == 2, "skipped = 2", summary.get("skipped"))
+    check(summary.get("aborted") == 2,
+          "aborted = 2 (整轮中止过 → 判 stopped, 不是 passed)",
+          summary.get("aborted"))
     check(summary.get("total") == 1,
-          "total = 1 (只算真跑过的那一项, stopped 不进 total)",
+          "total = 1 (只算真跑过的那一项, skipped 不进 total)",
           summary.get("total"))
 
 
@@ -255,7 +271,7 @@ async def case5():
 
 
 async def case6():
-    print("\n【6】正在跑的那一项被停止 → 它自己判 **stopped**, 不是 passed")
+    print("\n【6】正在跑的那一项被停止 → 它自己判 **skipped**, 不是 passed")
     rn = R.TestRunner()
     rn.run_id = 1
     rn.status = "running"
@@ -273,17 +289,26 @@ async def case6():
     summary = FINISHED[-1][2]
     status = FINISHED[-1][1]
 
-    check(rn.results.get("a") and rn.results["a"].status == "stopped",
-          "a 判 stopped (它没跑完, 不能算通过)",
+    check(rn.results.get("a") and rn.results["a"].status == "skipped",
+          "a 判 skipped (它没跑完, 不能算通过)",
           rn.results.get("a") and rn.results["a"].status)
+    check((rn.results.get("a") or TestResult()).metrics.get("skipped_reason")
+          == "aborted_by_user",
+          "a 带的是「中止整轮」的标记",
+          (rn.results.get("a") or TestResult()).metrics)
     check(status == "stopped", "整轮判 stopped", status)
     check(summary.get("total") == 0,
           "total = 0 (没有一项跑完出结论)", summary.get("total"))
-    # §9.3: 「当前正在进行这项 stopped, 其余未跑的项**也** stopped」——
-    # 所以 a (被停止的那项) 和 b (没轮到的项) 都算 not_run, 是 2 不是 1。
-    check(summary.get("not_run") == 2,
-          "not_run = 2 (a 是被停止的, b 是没跑到的 —— 两者都是 stopped)",
+    # 2026-10-29 新口径: 「停止」跳掉的项(当前的 a + 没轮到的 b) **都**记
+    # skipped, 整轮靠 aborted 计数判 stopped —— 不是靠 not_run。
+    check(summary.get("skipped") == 2,
+          "skipped = 2 (a 是被停止的, b 是没跑到的 —— 两者都是 skipped)",
+          summary.get("skipped"))
+    check(summary.get("not_run") == 0,
+          "not_run = 0 (stopped 现在只留给「服务中途夭折」)",
           summary.get("not_run"))
+    check(summary.get("aborted") == 2,
+          "aborted = 2 (整轮中止过)", summary.get("aborted"))
 
 
 async def main():

@@ -216,6 +216,41 @@ async def case_runner_backstop():
     res = await run_one("error", "sudo: a password is required")
     check(res.status == "error", "仍然是 error", res.status)
 
+    # ── §11.2 补充: sudo **不许执行这条命令**(白名单里没这条) ──
+    #
+    # 「U 盘版应用」特别容易撞上: 盘上的工具在 /mnt/aging/tools/bin/,
+    # 产线那条 sudoers 规则多半只写了 /usr/bin/fio ⇒ 免密是配了的, 但
+    # 这条命令没在白名单里。症状一样是 failed, 根因完全不同 ⇒ 文案也得
+    # 分开, 否则工人会把「权限配置没覆盖到」算成「板子坏了」。
+    print("\n【7】sudo「不许执行这条命令」也归 error, 文案要分开")
+    res = await run_one(
+        "failed",
+        "sudo: user aging is not allowed to execute "
+        "'/mnt/aging/tools/bin/fio'")
+    check(res.status == "error", "改判成 error (不是 failed)", res.status)
+    check("sudoers" in (res.error or ""), "文案点名 sudoers", res.error)
+    check("产线环境配置问题" in (res.error or ""),
+          "写明是产线环境配置问题, 不是设备不合格", res.error)
+    check("not allowed to execute" in (res.error or ""),
+          "带上了原始报错", res.error)
+
+    print("\n【7b】报错藏在**日志**里也一样认得出来")
+    res = await run_one("failed", "执行失败",
+                        log="sudo: user aging is not allowed to execute "
+                            "'/mnt/aging/tools/bin/fio'")
+    check(res.status == "error", "改判成 error", res.status)
+
+    print("\n【7c】跟「要密码」是两回事, 不能互相误认")
+    check(not T.is_sudo_not_allowed_error("sudo: a password is required"),
+          "「要密码」不被当成「不许执行」")
+    check(not T.is_sudo_password_error(
+              "sudo: user aging is not allowed to execute '/x'"),
+          "「不许执行」不被当成「要密码」")
+
+    print("\n【7d】普通 failed 依然不被误伤")
+    res = await run_one("failed", "fio 退出码 1")
+    check(res.status == "failed", "仍然是 failed", res.status)
+
 
 async def main():
     case_recognize()

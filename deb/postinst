@@ -1,0 +1,354 @@
+#!/bin/bash
+# aging-test 装机后 —— 装系统工具 / 建数据目录 / 建 venv / 装桌面图标 / 自检
+#
+# 设计原则:
+#   ① **全程不联网** —— 工具从随包的 deps/ 解出来, python 依赖从 wheels/ 离线装;
+#   ② **补缺不降级** —— 目标机上已经装好(且版本不低于随包这份)的工具一律跳过,
+#      绝不覆盖、更绝不降级人家的系统;
+#   ③ **缺件就大声报** —— 装不好要报错退出, 不能"装上了但跑不起来"蒙混过关(§11.7)。
+#
+# ⚠️ 为什么工具是「解包」而不是「dpkg -i」:
+#    dpkg 跑 postinst 时**持有 dpkg 库锁** (/var/lib/dpkg/lock), postinst 里
+#    再调 dpkg 会撞锁死锁 —— apt 那把 lock-frontend dpkg 自己不占, 但库锁
+#    它占着, 嵌套调用必然失败。所以这里把工具的文件铺到 /,
+#    **不进 dpkg 数据库**。
+#    ⚠️⚠️ 但**不能用 `dpkg-deb -x`** —— 那是裸 tar, 会把 usrmerge 的
+#       /lib /bin 软链换成真目录, 动态链接器当场消失, 板子就废了
+#       (详见下面第 3 节的大段注释)。用的是
+#       `dpkg-deb --fsys-tarfile | tar -x --keep-directory-symlink -C /`。
+#    代价: `dpkg -l` 里看不到这些工具 (装了什么全记在日志里, check_deps.sh
+#    会逐项复验); 好处: 绝对不会碰目标机上已有的包, 不会有降级/覆盖事故。
+#
+# 【授权范围】(用户 2026-10-29 点名授权)
+#   操作: 解包随包的 16 个工具 .deb / 离线 pip 装 wheels / 建数据目录与配置 /
+#         装桌面图标 / 跑一次包类自检
+#   目标: 产线 A527 板子 (出货镜像同款)
+#   边界: 全程不联网; 不碰 history.db 与 reports/pdf/; 不碰 chromium;
+#         不改 dpkg 数据库; 工具只解点名的那 16 个包
+set -u
+
+PREFIX="/usr/lib/aging-test"
+DATA_DIR="/var/lib/aging-test"
+DEPS_DIR="$PREFIX/deps"
+WHEELS_DIR="$PREFIX/wheels"
+STATE_FILE="$DATA_DIR/.installed-tools"
+#: 我们自己铺出去的文件清单 —— purge 时按图索骥收回 (postrm 会逐个问过
+#: dpkg 归属才删, 已被人 apt 正式装的绝不碰)
+FILES_FILE="$DATA_DIR/.installed-tools.files"
+
+log()  { echo "[aging-test] $*"; }
+warn() { echo "[aging-test] ⚠ $*" >&2; }
+die()  { echo "[aging-test] ✗ $*" >&2; exit 1; }
+
+#: 文件指纹 —— 装机时记下, 卸载时用来证明「磁盘上这份就是我们铺的那份」。
+#: 软链记链接目标, 普通文件记内容哈希 (跟 mtime 无关, 重装同版本也不怕)。
+HASH_TOOL="sha256sum"
+command -v sha256sum >/dev/null 2>&1 || HASH_TOOL="md5sum"
+
+# fingerprint <路径> → 打印 "<算法>:<值>"; 取不到就返回 1
+fingerprint() {
+    local f="$1" t
+    if [ -L "$f" ]; then
+        printf 'link:%s' "$(readlink "$f")"
+        return 0
+    fi
+    [ -f "$f" ] || return 1
+    t="$("$HASH_TOOL" "$f" 2>/dev/null | cut -d' ' -f1)"
+    [ -n "$t" ] || return 1
+    printf '%s:%s' "$HASH_TOOL" "$t"
+}
+
+# ═══════════════ 1. 认清「工人用户」═══════════════
+# 服务必须跑在**普通用户**名下 (§11.2: 不能是 root —— 提权由各测试项内部
+# `sudo -n <命令>` 取得; 也不能是系统用户 —— GPU/HDMI 项要图形会话)。
+OPERATOR="${AGING_USER:-${SUDO_USER:-}}"
+if [ -z "$OPERATOR" ] || ! id "$OPERATOR" >/dev/null 2>&1; then
+    # 退回: 第一个 uid>=1000 的账号
+    OPERATOR="$(awk -F: '$3>=1000 && $3<65534 {print $1; exit}' /etc/passwd)"
+fi
+[ -n "$OPERATOR" ] || OPERATOR="root"
+OPHOME="$(getent passwd "$OPERATOR" 2>/dev/null | cut -d: -f6)"
+log "工人用户 = $OPERATOR (家目录 ${OPHOME:-无})"
+
+# ═══════════════ 2. 数据目录 —— **必须先建好** ═══════════════
+# 代码在 /usr/lib/aging-test (root 所有), 工人在普通用户 —— 数据必须分家,
+# 否则 history.db 根本建不出来 (unable to open database file)。
+#
+# ⚠️ **顺序不能反**: 下面第 3 节要往 $DATA_DIR 里写清单 (.tmp), 目录不先
+#    建好就是 "No such file or directory" —— 清单写不出来, purge 时就永远
+#    收不干净 (新机首次装机必踩)。
+log "建数据目录 $DATA_DIR"
+install -d -m 0755 "$DATA_DIR" "$DATA_DIR/reports" "$DATA_DIR/reports/pdf" "$DATA_DIR/logs"
+if [ "$OPERATOR" != "root" ]; then
+    chown -R "$OPERATOR":"$OPERATOR" "$DATA_DIR" 2>/dev/null || true
+fi
+
+# ═══════════════ 3. 装系统工具 (离线, 补缺不降级) ═══════════════
+#
+# ⚠️⚠️ **解包必须保住 usrmerge 的软链** (2026-10-29 新机装机踩出来的):
+#
+#   Ubuntu 20.04 的 /lib → usr/lib、/bin → usr/bin、/sbin → usr/sbin
+#   **都是软链**。而 `dpkg-deb -x` 底下就是裸 tar —— 它遇到 tar 包里的
+#   `./lib/` 这种**目录成员**时, 会**把软链删掉、换成一个真目录**!
+#
+#   ⇒ `/lib/ld-linux-aarch64.so.1`(动态链接器)当场消失
+#   ⇒ **整台板子上所有动态链接的程序全部 execve 报 ENOENT**
+#     (bash 打印的是绝对路径: "/usr/bin/grep: No such file or directory")
+#   ⇒ 只有**已经在内存里**的 dpkg / bash 还能接着跑 —— 于是后面每个包
+#     都静默跳过 (`dpkg-deb -f` 读不到包名 ⇒ continue), 最后 postinst
+#     死在 `python3 -m venv` 上, dpkg 报:
+#       "post-installation script subprocess returned error exit status 1"
+#
+#   ⇒ 改用 `tar --keep-directory-symlink`: **软链留着**, 内容落到软链
+#     指向的地方 (fio 的 ./lib/systemd/system/fio.service ⇒ /usr/lib/systemd/…)
+#   ⇒ 再加一道**安全网**: 装之前记下这些软链, 每解一个包就**只读**核一遍
+#     —— 发现被踩坏就**立刻停手**, 把修复方法原样打给操作员。
+#     (脚本**不擅自**去删改 /lib /bin —— 那是操作员自己的地盘。)
+
+# usrmerge 软链 —— 装之前记下 (只记**当时确实是软链**的), 装完核一遍
+USRMERGE_LINKS=""
+for d in bin sbin lib lib64; do
+    [ -L "/$d" ] && USRMERGE_LINKS="$USRMERGE_LINKS /$d"
+done
+
+# 解一个 deb 到 / —— **保住 usrmerge 软链**
+#   GNU tar 的 --keep-directory-symlink: 目录成员碰到「指向目录的软链」时,
+#   **保留软链**, 把内容解到软链指向的地方 (而不是删掉软链建真目录)。
+extract_keep_links() {
+    dpkg-deb --fsys-tarfile "$1" 2>/dev/null \
+        | tar -x --keep-directory-symlink -C / 2>/dev/null
+}
+
+# 核一遍 usrmerge 软链 —— **只读检查**, 发现坏了就大声喊出来
+#   ⚠️ 这里**故意不去修复**: /lib /bin /sbin 是操作员自己的地盘, 脚本
+#      擅自删改它们的风险远大于「早点发现」的价值。发现异常就**停手**
+#      (die), 把修复方法原样打给操作员, 由人决定。
+check_usrmerge_links() {
+    local d bad=""
+    for d in $USRMERGE_LINKS; do
+        [ -L "$d" ] || bad="$bad $d"
+    done
+    # 探针: 跑一个**动态链接**的系统命令 —— 加载器没了的话它会 execve
+    # 报 ENOENT (bash 打印的是绝对路径, 看着像「文件不存在」)。
+    # ⚠️ 这条**独立于**上面那圈软链: 板子若**早就**被弄坏过 (/lib 已经是
+    #    真目录), 那时记下来的 USRMERGE_LINKS 就是空的 —— 只查软链查不出来,
+    #    得靠这个探针才认得出「板子已经废了」。
+    if ! ls / >/dev/null 2>&1; then
+        bad="$bad [动态链接器跑不起来]"
+    fi
+    USRMERGE_BROKEN="$bad"
+    [ -z "$bad" ]
+}
+
+# tar 成员路径 → 板上的**真实落点** (绝对路径)
+#   usrmerge 板子上 ./lib/xxx 实际落在 /usr/lib/xxx —— 清单里必须记
+#   **真实落点**, 不然 postrm 的白名单 (/usr/bin /usr/lib …) 一个都匹配不上,
+#   这些文件就永远收不回来。
+real_path() {
+    local p="$1" c rest t
+    p="${p#./}"
+    case "$p" in
+        bin/*|sbin/*|lib/*|lib64/*)
+            c="${p%%/*}"
+            rest="${p#*/}"
+            if [ -L "/$c" ]; then
+                t="$(readlink "/$c")"
+                case "$t" in
+                    /*) printf '/%s/%s' "${t#/}" "$rest" ;;
+                    *)  printf '/%s/%s' "$t" "$rest" ;;
+                esac
+                return 0
+            fi ;;
+    esac
+    printf '/%s' "$p"
+}
+
+if [ -d "$DEPS_DIR" ]; then
+    log "装随包带的系统工具 (离线, 不联网):"
+    # 前置检查: 这个 tar 认不认 --keep-directory-symlink? 不认就**宁可不装**
+    # —— 退回去用 `dpkg-deb -x` 等于拿板子的动态链接器赌一把。
+    if ! tar --keep-directory-symlink --version >/dev/null 2>&1; then
+        die "这个 tar 不支持 --keep-directory-symlink (GNU tar >= 1.15 才有)
+   —— 用 dpkg-deb -x 解包会把 usrmerge 的 /lib /bin 软链换成真目录,
+      动态链接器 (/lib/ld-linux-aarch64.so.1)当场消失, 板子就废了。
+      目标机的 tar 太老, 这批工具**不装** (相关测试项会判 error)。"
+    fi
+    # 板子**现在**就废了吗? —— 探针: 跑一个动态链接的系统命令。
+    # (新机首次装机一般是好的; 但换机/重装/上回装坏过没修的板子不是。)
+    if ! ls / >/dev/null 2>&1; then
+        die "板子的**动态链接器已经不在了** —— 连 ls 都跑不起来。
+   ⚠️ 别再往这台板子上装任何东西 (装什么都会跑不起来)。
+   先人工修好 (下面这段是给人看的, 本脚本**不擅自**改 /lib):
+        ls -ld /lib /bin /sbin /lib64      # 这四个都该是软链 (指向 usr/…)
+        # 若 /lib 变成了真目录:
+        mkdir -p /usr/lib/systemd/system
+        [ -f /lib/systemd/system/fio.service ] && \\
+            mv /lib/systemd/system/fio.service /usr/lib/systemd/system/
+        mv /lib /lib.broken && ln -s usr/lib /lib
+   修好后重装本包。"
+    fi
+    : > "$STATE_FILE.tmp"
+    : > "$FILES_FILE.tmp"
+    for deb in "$DEPS_DIR"/*.deb; do
+        [ -f "$deb" ] || continue
+        pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null)"
+        ver="$(dpkg-deb -f "$deb" Version 2>/dev/null)"
+        [ -n "$pkg" ] || continue
+        have="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+        if [ -z "$have" ]; then
+            log "    解包 $pkg ($ver) —— 目标机上没有"
+            if extract_keep_links "$deb"; then
+                # 每解一个包就核一遍 usrmerge 软链 —— **只读**, 发现坏了
+                # 就立刻停手 (见上面 check_usrmerge_links 的说明)。
+                if ! check_usrmerge_links; then
+                    die "解包 $pkg 之后, usrmerge 软链坏了:$USRMERGE_BROKEN
+   —— 动态链接器 (/lib/ld-linux-aarch64.so.1)可能已经不在原处, 板子上
+      所有动态链接的程序都会跑不起来。**先别再装任何东西**, 请人工修复:
+        ls -ld /lib /bin /sbin /lib64          # 这四个应当都是软链
+        # 若 /lib 变成了真目录, 把它挪回软链 (内容先并进 /usr/lib):
+        mkdir -p /usr/lib/systemd/system
+        [ -f /lib/systemd/system/fio.service ] && \\
+            mv /lib/systemd/system/fio.service /usr/lib/systemd/system/
+        mv /lib /lib.broken && ln -s usr/lib /lib
+      修好后重装本包。"
+                fi
+                echo "$pkg $ver" >> "$STATE_FILE.tmp"
+                # 记下铺出去的文件 —— purge 时好按图索骥收回。
+                # 每行记三样: **来自哪个包** + **内容指纹** + **路径**。
+                # 后两样是卸载时的判据 (见 postrm):
+                #   · 包名 → dpkg-query -W 查状态库, 可靠;
+                #   · 指纹 → 证明「磁盘上这份还是我们铺的那份」。
+                #     少了指纹这条, 光靠包状态是有洞的: 目标机上装的是**旧
+                #     版本**时我们照样会解包覆盖它, 那时包状态是
+                #     "ok installed" 但文件内容已经是我们的了。
+                #   · 路径 → 记**真实落点** (绝对路径), usrmerge 板子上
+                #     ./lib/xxx ⇒ /usr/lib/xxx —— 不然 postrm 的白名单
+                #     (/usr/bin /usr/lib …) 一个都匹配不上。
+                dpkg-deb --fsys-tarfile "$deb" 2>/dev/null \
+                    | tar -tf - 2>/dev/null \
+                    | grep -v '/$' \
+                    | while IFS= read -r p; do
+                          [ -n "$p" ] || continue
+                          rp="$(real_path "$p")"
+                          fp="$(fingerprint "$rp")" || continue
+                          printf '%s\t%s\t%s\n' "$pkg" "$fp" "$rp"
+                      done >> "$FILES_FILE.tmp" || true
+            else
+                warn "    ✗ $pkg 解包失败 —— 该工具对应的测试项会判 error"
+            fi
+        elif dpkg --compare-versions "$have" ge "$ver"; then
+            log "    跳过 $pkg —— 目标机已有 $have (不比随包的低)"
+        else
+            log "    跳过 $pkg —— 目标机已有 $have, 比随包的 $ver 新, 不降级"
+        fi
+    done
+    mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null || true
+    mv -f "$FILES_FILE.tmp" "$FILES_FILE" 2>/dev/null || true
+
+    # ── busybox 的 applet 链接: .deb 里没有, 是它**自己 postinst** 建的 ──
+    #
+    # busybox 这个包只装了 /bin/busybox 一个文件, `udhcpc` 之类的链接是
+    # postinst 跑 `busybox --install -s` 现场建的 —— 所以光 `dpkg-deb -x`
+    # 解包, **udhcpc 并不存在**, 网口项会直接判 error。
+    #
+    # ⚠️ 但我们**不跑** `busybox --install -s` —— 那会把几十个 applet 铺进
+    #    /usr/bin, 把系统自带的 ls/cat 全换成 busybox 版, 那是事故。
+    #    只补真正要用的那几个, 而且先查重。
+    if [ -x /bin/busybox ]; then
+        for applet in udhcpc; do
+            for dir in /usr/sbin /usr/bin /sbin /bin; do
+                [ -d "$dir" ] || continue
+                [ -e "$dir/$applet" ] && continue
+                ln -sf /bin/busybox "$dir/$applet" 2>/dev/null \
+                    && { log "    补 busybox applet 链接: $dir/$applet"; \
+                         printf 'aging-test-self\tlink:%s\t%s\n' \
+                                "/bin/busybox" "$dir/$applet" >> "$FILES_FILE"; }
+            done
+        done
+    fi
+
+    # 字体解出来了要重建字体缓存, 否则 §8.2.1 的 CJK 字形检查可能看不到新字体。
+    if command -v fc-cache >/dev/null 2>&1; then
+        fc-cache -f >/dev/null 2>&1 || true
+    fi
+fi
+
+# ═══════════════ 4. /etc/default/aging-test (start.sh 会 source 它) ═══════════════
+cat > /etc/default/aging-test <<EOF
+# 由 aging-test 包的 postinst 生成 —— start.sh 会 source 它。
+# 数据根: history.db / 报告 PDF / 服务日志都落这儿
+# (代码在 /usr/lib/aging-test 归 root, 普通用户写不进去)。
+AGING_DATA_DIR=$DATA_DIR
+EOF
+chmod 0644 /etc/default/aging-test
+
+# ═══════════════ 5. 配置 ═══════════════
+# config.yaml 是 conffile (dpkg 管的), 首次装机时它在 /etc/aging-test 下。
+install -d -m 0755 /etc/aging-test
+if [ ! -f /etc/aging-test/config.yaml ]; then
+    if [ -f "$PREFIX/config.yaml" ]; then
+        cp "$PREFIX/config.yaml" /etc/aging-test/config.yaml
+        chmod 0644 /etc/aging-test/config.yaml
+        log "装配置文件 /etc/aging-test/config.yaml"
+    else
+        die "包里没有 config.yaml —— 这是打包脚本的缺陷 (§11.7)"
+    fi
+fi
+
+# ═══════════════ 6. 虚拟环境 (离线, 用随包的 wheels) ═══════════════
+if [ ! -x "$PREFIX/.venv/bin/python" ]; then
+    log "建虚拟环境 (离线, 用随包的 wheels)..."
+    python3 -m venv "$PREFIX/.venv" \
+        || die "建 venv 失败 —— 目标机缺 python3-venv (出货镜像里是有的)"
+    "$PREFIX/.venv/bin/pip" install -q --no-index --find-links="$WHEELS_DIR" \
+        -r "$PREFIX/requirements.txt" \
+        || die "装 python 依赖失败 —— 随包的 wheels 不全, 这是打包脚本的缺陷 (§11.7)"
+fi
+# 验一下真的能用 (venv 存在 ≠ 能 import)
+if ! "$PREFIX/.venv/bin/python" -c "import fastapi, uvicorn, pydantic, yaml, aiosqlite, jinja2" 2>/dev/null; then
+    warn "虚拟环境不可用 —— 用 wheels 重建"
+    python3 -m venv --clear "$PREFIX/.venv" || die "重建 venv 失败"
+    "$PREFIX/.venv/bin/pip" install -q --no-index --find-links="$WHEELS_DIR" \
+        -r "$PREFIX/requirements.txt" \
+        || die "重建 venv 后仍装不上 python 依赖 (§11.7)"
+fi
+
+# ═══════════════ 7. 桌面图标 ═══════════════
+if [ -f /usr/share/applications/aging-test.desktop ]; then
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+    if [ -n "$OPHOME" ] && [ -d "$OPHOME/Desktop" ]; then
+        install -m 0755 /usr/share/applications/aging-test.desktop "$OPHOME/Desktop/aging-test.desktop"
+        if [ "$OPERATOR" != "root" ]; then
+            chown "$OPERATOR":"$OPERATOR" "$OPHOME/Desktop/aging-test.desktop" 2>/dev/null || true
+            # 标记为可信任, 否则 GNOME 会弹「不受信任的应用程序」
+            su -s /bin/sh - "$OPERATOR" -c \
+                "gio set '$OPHOME/Desktop/aging-test.desktop' metadata::trusted true" 2>/dev/null || true
+        fi
+        log "桌面图标已放到 $OPHOME/Desktop"
+    fi
+fi
+
+# ═══════════════ 8. sudo 自检 (只警告, 不阻断) ═══════════════
+if [ "$OPERATOR" = "root" ]; then
+    warn "没认出工人用户 —— 跳过 sudo 自检"
+elif su -s /bin/sh - "$OPERATOR" -c "sudo -n true" 2>/dev/null; then
+    log "sudo 免密可用 (以 $OPERATOR 身份) —— 需 root 的测试项能正常跑"
+else
+    warn "sudo 免密**不可用** —— 需 root 的测试项 (CPU/存储/网口/WiFi/GPU) 会判 error (§11.2)"
+    warn "  修复: usermod -aG sudo $OPERATOR   (改完要重新登录)"
+    warn "        并在 /etc/sudoers.d/ 里给 $OPERATOR 配 NOPASSWD"
+fi
+
+# ═══════════════ 9. 依赖自检 ═══════════════
+# 只跑「包类」检查 —— 逐台自检项 (图形会话/HDMI/GPIO) 要在**有会话的地方**
+# 才测得准, 那是点桌面图标启动时的活 (start.sh 末尾会跑完整自检)。
+if [ -x "$PREFIX/scripts/check_deps.sh" ]; then
+    log "依赖自检 (包类):"
+    su -s /bin/sh - "$OPERATOR" -c \
+        "AGING_CONFIG=/etc/aging-test/config.yaml bash $PREFIX/scripts/check_deps.sh --packages-only" \
+        2>&1 | sed 's/^/    /' || warn "包类自检有缺失 —— 见上面输出 (§11.7 缺一拒绝出货)"
+fi
+
+log "装好了 ✓  点桌面「工厂老化测试」图标启动"
+log "  数据: $DATA_DIR    日志: $DATA_DIR/logs/server.log"
+exit 0

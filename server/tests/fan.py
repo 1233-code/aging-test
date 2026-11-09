@@ -155,7 +155,7 @@ class FanTest(TestCase):
         if initial is None:
             result.status = "error"
             result.error = (
-                f"{path} 存在但读不出 '0'/'1' —— IO 路径在启动时就不���用 "
+                f"{path} 存在但读不出 '0'/'1' —— IO 路径在启动时就不可用 "
                 f"(内容畸形, 或节点权限被改)"
             )
             await ctx.on_log(f"[风扇] ✗ {result.error}")
@@ -270,20 +270,30 @@ class FanTest(TestCase):
         elif mismatch:
             bad_writes = [s for s in mismatch if s["read_back"] is None]
             bad_levels = [s for s in mismatch if s["read_back"] is not None]
-            result.status = "failed"
+            # ⚠️ 判 `error` 而不是 `failed` (2026-10-29 定): **风扇是外接负载**,
+            # 风扇转不转、坏不坏**都不会**改变 GPIO 的读回值 —— IO 层读出异常
+            # 说明的是**这条 IO 链路**有问题, **证明不了风扇不合格**。
+            # 判 failed = 冤枉被测设备(好板子被送去修); 判 error = 这一项
+            # 没测成(该查环境 / 重测), 这才是事实(§9.3)。
+            result.status = "error"
             result.error = (
-                f"{len(mismatch)}/{len(steps)} 步写后回读不一致, 控制链没闭环。\n"
+                f"{len(mismatch)}/{len(steps)} 步写后回读不一致 —— "
+                f"**IO 层不可信, 这一项没测成**。\n"
                 f"  读回失败 {len(bad_writes)} 步 (IO 层在运行中挂了), "
-                f"电平不符 {len(bad_levels)} 步 (驱动没执行写入, 或虚焊/接触不良)。\n"
+                f"电平不符 {len(bad_levels)} 步 (写入没生效)。\n"
+                f"  ⚠️ 风扇是**外接**负载: 风扇坏不坏**不会**改变 GPIO 读回 —— "
+                f"所以判 `error`(环境/IO 问题), **不判 `failed`(设备不合格)**。\n"
                 f"  详见 metrics.steps。"
             )
-            await ctx.on_log(f"[风扇] ❌ {result.error}")
+            await ctx.on_log(f"[风扇] ✗ {result.error}")
         else:
             result.status = "passed"
             await ctx.on_log(
                 f"[风扇] ✅ {cycles} 轮轮转全部闭环: 写 {inactive} 读回 {inactive}, "
                 f"写 {active} 读回 {active}, 共 {len(steps)} 步无一失配。\n"
-                f"[风扇]   风扇已确认能启停 —— 虚焊/不转这条被本项覆盖到了。"
+                f"[风扇]   这一项证明的是**控制链闭环**(写进去能读回来)。\n"
+                f"[风扇] ⚠️ 驱动只认电平变化、**不验证风扇真的转了** —— "
+                f"「虚焊/不转」这条**本项覆盖不到**, 仍靠工人目视/听声音确认。"
             )
 
         return result
@@ -334,14 +344,33 @@ class FanTest(TestCase):
             result.status = "error"
             result.error = f"{cycles}/{cycles} 次采样全部读失败 —— IO 路径挂了"
         elif bad > 0 or len(levels) > 1:
-            result.status = "failed"
+            # ⚠️ 同样判 `error` 不判 `failed` (2026-10-29 定): 读回不稳是
+            # **IO 层**的问题, 证明不了风扇不合格 —— 风扇是外接负载, 它坏不坏
+            # 都不改变 GPIO 读回。判 failed = 冤枉被测设备(§9.3)。
+            result.status = "error"
             result.error = (
-                f"{bad}/{cycles} 次读失败, 读出电平 {sorted(levels)} —— 读回不稳定"
+                f"{bad}/{cycles} 次读失败, 读出电平 {sorted(levels)} —— 读回不稳定 —— "
+                f"**IO 层不可信, 这一项没测成** (不判 failed: 风扇是外接负载, "
+                f"IO 异常证明不了风扇不合格)"
             )
+            await ctx.on_log(f"[风扇] ✗ {result.error}")
         else:
-            result.status = "passed"
+            # ⚠️ 判 `skipped` 不判 `passed` (2026-10-29 定): 只读模式**没让风扇
+            # 转过** —— 「风扇能不能启停」这件事**根本没测**。判 passed 等于
+            # 对没测过的事给结论, 是 §9.3 说的「静默的『通过』」。
+            # skipped 不计入 total(§9.2), 报告里作为「未测项」逐一列出,
+            # 质检看得见这一项没测。
+            level_val = sorted(levels)[0] if levels else None
+            result.status = "skipped"
+            result.metrics["skipped_reason"] = "readonly_no_drive"
+            result.metrics["readonly_level"] = level_val
+            result.error = (
+                f"只读模式 (fan.drive=false): {cycles}/{cycles} 次采样稳定在电平 "
+                f"{level_val} —— **风扇没有被拉起过**, 「能不能启停」没测"
+            )
             await ctx.on_log(
-                f"[风扇] ✅ 只读: {cycles}/{cycles} 次采样稳定在电平 {levels.pop()}\n"
+                f"[风扇] ⏭ 只读: {cycles}/{cycles} 次采样稳定在电平 {level_val} —— "
+                f"记 skipped (未做主动轮转, 风扇没被拉起过)\n"
                 f"[风扇] ⚠️ 未做主动轮转, 风扇没有被拉起过 —— 虚焊/不转靠工人目视。"
             )
         return result

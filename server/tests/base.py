@@ -1,8 +1,35 @@
-"""测试用例基类 - 所有 10 个测试项继承此类"""
+"""测试用例基类 - 所有 11 个测试项继承此类"""
 import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Type
+
+
+class TestCancelled(Exception):
+    """**用户中途按了「停止」** —— 不是测试失败。
+
+    §9.3: 用户中途停止 → 正在进行的那一项记 **stopped**(不计入 total),
+    其余没跑到的项也记 stopped。没跑完 ≠ 不合格 —— 所以这一项**不能**记
+    failed/error, 更不能把整轮判成 failed。
+
+    以前各项一律 `except Exception` 把取消也当成 error, 于是工人自己按的
+    暂停, 在报告里变成了「失败」, 整轮也跟着判成 failed(2026-10-28 实测)。
+    """
+
+
+class DeviceUnresponsive(Exception):
+    """被测设备(卡/eMMC)对读写**没有应答**, 一直不返回。
+
+    跟「跑失败」不是一回事, 判定也不同:
+      · 普通失败(failed) = 读出来的东西不合格(速度不达标之类);
+      · 没应答           = **设备卡死了** —— 这本身就是设备不合格
+        (这张卡坏了), 该判 failed 并明说「无响应」。
+
+    为什么非要把这两种分开: 以前两者混成一句
+    `RuntimeError("fio write 被中断 (取消或超时)")`, 工人看到的是「失败」,
+    分不清是**工具坏了**还是**卡坏了** —— 而这两种的产线动作完全相反
+    (前者修工具, 后者换卡)。
+    """
 
 
 @dataclass

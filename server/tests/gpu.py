@@ -65,10 +65,11 @@ import glob
 import os
 import re
 import time
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable
+from ._tools import (find_tool, kill_proc, run_cmd, sudo_hint_if_unavailable,
+                     with_sudo)
 from .gpu_benchmarks import (
     BENCHMARKS, build_bench_args, expected_identities, identity as scene_identity,
 )
@@ -148,22 +149,43 @@ _SCORE_RE = re.compile(r"glmark2 Score:\s*([\d.]+)")
 # 的 `timeout` 到点收尾, 窗口就一直占着屏幕到那一刻 (工人看着像工具卡死)。
 # 以 root 身份把整组一起杀掉, root 就能给 root 进程发信号, 这一下就干净了。
 #
-# 真机实测的进程树 (2026-10-26, 取消那一刻的实测日志; 注意 `timeout` 在
-# sudo **里面** —— 它是 root 的, 所以超时兜底本来就是 root 在收尾):
-#     pid    pgid   user    命令
-#     167798 167798 User    sudo -n env DISPLAY=… /usr/bin/timeout -k 5.0 305 \
-#                                  /usr/bin/glmark2-es2 --fullscreen -b …
-#            167798 root      timeout -k 5.0 305 /usr/bin/glmark2-es2 --fullscreen …
-#            167798 root        glmark2-es2 --fullscreen -b …   ← 真正占着屏幕的那个
-#   ① 整棵树在**同一个进程组**里 (我们用 start_new_session=True 建的);
-#   ② 服务自己在另一个组 —— 杀那一组不会误伤服务;
-#   ③ 组里那个 root 的 glmark2, 普通用户对它发信号必然 EPERM,
+# 真机实测的进程树 (2026-10-29 重新实测 —— **推翻 2026-10-26 那次的结论**;
+# 注意 `timeout` 在 sudo **里面** —— 它是 root 的, 所以超时兜底本来就是 root
+# 在收尾):
+#     pid    pgid   sid     user    命令
+#     21788  21788  21788   User    sudo -n env DISPLAY=… /usr/bin/timeout -k 5.0 305 \
+#                                        /usr/bin/glmark2-es2 --fullscreen -b …
+#     21794  21794  21788   root      timeout -k 5.0 305 /usr/bin/glmark2-es2 …
+#     21795  21794  21788   root        glmark2-es2 --fullscreen -b …  ← 真正占屏的那个
+#   ① 整棵树在**同一个会话**里 (我们用 start_new_session=True 建的) ——
+#      **会话才是这棵树的可靠标识**;
+#   ② ⚠️ **但不在同一个进程组**: GNU `timeout` 自己 `setpgid(0,0)` 另起了一组,
+#      所以 glmark2 的 pgid (21794) **不等于** sudo 的 pgid (21788)。
+#      2026-10-26 那次实测把 timeout/glmark2 的 pgid 记成了 167798(其实就是
+#      sudo 的 pid), 于是得出了「整棵树在一个组里、按 sudo 的组杀就够」这个
+#      **错误**结论 —— 实际打过去的是个空组, root 的 glmark2 根本收不到信号,
+#      而工具还会报「窗口应已消失」。2026-10-29 修: 按**会话**找到真正跑
+#      glmark2 的那一组, 杀**那一组**, 并用**同一组**验证它真的空了。
+#   ③ 服务自己在另一个会话 —— 杀我们那个会话里的组不会误伤服务;
+#   ④ 组里那个 root 的 glmark2, 普通用户对它发信号必然 EPERM,
 #      「以 root 身份按组杀」才能一次收干净。
 
 def _pgid_of(pid: int) -> Optional[int]:
     """取某进程的进程组 id (取不到就 None) —— 抽成函数是为了单测能替换。"""
     try:
         return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _sid_of(pid: int) -> Optional[int]:
+    """取某进程的**会话 id** (取不到就 None) —— 抽成函数是为了单测能替换。
+
+    会话才是「我们自己起的这棵进程树」的可靠标识 (2026-10-29): 进程组不行,
+    因为 GNU `timeout` 会自己另起一组 (见模块顶部「真机实测的进程树」)。
+    """
+    try:
+        return os.getsid(pid)
     except OSError:
         return None
 
@@ -176,17 +198,18 @@ def _own_pgid() -> int:
         return -1
 
 
-def _proc_group_members(pgid: int) -> List[Tuple[int, str, str, str]]:
-    """扫 /proc, 列出进程组 `pgid` 里的**活**进程。
+def _scan_proc() -> List[Tuple[int, str, str, int, int, str]]:
+    """扫 /proc, 把**所有活进程**列出来。
 
-    返回 [(pid, comm, state, cmdline), ...]。**僵尸 (state='Z') 不算** ——
-    僵尸已经不占 X 连接、不占屏幕, 只是还没被父进程收走, 没必要再杀。
+    返回 [(pid, comm, state, pgrp, session, cmdline), ...]。
+    **僵尸 (state='Z') 不算** —— 僵尸已经不占 X 连接、不占屏幕, 只是还没被
+    父进程收走, 没必要再杀。
 
     为什么扫 /proc 而不用 `os.killpg(pgid, 0)` 判断组还在不在:
     组里只要有一个 root 进程, 我们(普通用户)对那个组发信号就是 EPERM,
     `killpg(0)` 分不开「组空了」和「组里还剩个杀不动的」。/proc 扫一遍是实打实的。
     """
-    out: List[Tuple[int, str, str, str]] = []
+    out: List[Tuple[int, str, str, int, int, str]] = []
     try:
         entries = os.listdir("/proc")
     except OSError:
@@ -208,22 +231,48 @@ def _proc_group_members(pgid: int) -> List[Tuple[int, str, str, str]]:
         comm = data[lp + 1:rp]
         rest = data[rp + 1:].split()
         # stat 字段: pid (comm) state ppid pgrp session ...
-        if len(rest) < 3:
+        if len(rest) < 4:
             continue
         state = rest[0]
         try:
             pgrp = int(rest[2])
+            sid = int(rest[3])
         except ValueError:
             continue
-        if pgrp != pgid or state == "Z":
+        if state == "Z":
             continue
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 cmdline = f.read().decode("utf-8", "replace").replace("\0", " ").strip()
         except OSError:
             cmdline = ""
-        out.append((pid, comm, state, cmdline))
+        out.append((pid, comm, state, pgrp, sid, cmdline))
     return out
+
+
+def _proc_group_members(pgid: int) -> List[Tuple[int, str, str, str]]:
+    """列出进程组 `pgid` 里的**活**进程 → [(pid, comm, state, cmdline), ...]。"""
+    return [(pid, comm, state, cmdline)
+            for (pid, comm, state, pgrp, _sid, cmdline) in _scan_proc()
+            if pgrp == pgid]
+
+
+def _session_members(sid: int) -> List[Tuple[int, str, str, int, str]]:
+    """列出**会话** `sid` 里的活进程 → [(pid, comm, state, pgrp, cmdline), ...]。
+
+    ⚠️ **会话才是「我们自己起的这棵进程树」的唯一可靠标识** (2026-10-29 修):
+    我们用 `start_new_session=True` 建了一个**新会话**, 里面只有我们自己的
+    子孙进程 —— 别的进程进不来 (进会话要么 setsid 另开一个, 要么从会话内的
+    进程 fork 出来)。所以「会话 id 相同」= 「是我们自己起的」, 而且顺带
+    防掉了 pid 复用 (被复用的 pid 属于别的会话)。
+
+    而**进程组不行** —— GNU `timeout` 会自己 `setpgid(0,0)` 另起一组, 所以
+    「我们起的那个进程的组」里往往只有 `sudo` 一个, glmark2 在**另一组**里
+    (实测见模块顶部「真机实测的进程树」)。
+    """
+    return [(pid, comm, state, pgrp, cmdline)
+            for (pid, comm, state, pgrp, s, cmdline) in _scan_proc()
+            if s == sid]
 
 
 async def _sudo_kill_group(
@@ -231,30 +280,45 @@ async def _sudo_kill_group(
     sig: str = "TERM",
     timeout_sec: float = 8.0,
     expect_cmdline: Optional[str] = None,
+    session: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """**以 root 身份** (`sudo -n kill`) 杀掉整个进程组 (见上面授权范围)。
 
     ⚠️ **安全前提, 少一条都不许执行**:
-      ① `pgid` 必须是**我们自己起的**那个进程的组 (调用方用
-         `start_new_session=True` 建的新会话 → 组 id == 那个进程的 pid);
+      ① `session` 必须是**我们自己用 start_new_session=True 建的那个会话 id**
+         —— 组 id 会过期、会撞车, **会话 id 不会**: 会话里只有我们自己的
+         子孙进程, 别人进不来 (要进来只能 setsid 另开一个, 或者从会话内的
+         进程 fork 出来);
       ② `pgid` 不能是 0 / 1 (init 的组)、不能是**服务自己的组**
          (`os.getpgrp()`) —— 否则会连服务自己一起杀掉;
-      ③ 组里必须**确实有**活进程; 若指定了 `expect_cmdline`, 成员里还必须
-         **至少有一个**命令行含这个字符串 —— 防 pid 复用撞车(组 id 过期后
-         可能被系统分给毫不相干的新进程, 那时绝不能动手)。
+      ③ 组里必须**确实有**活进程;
+      ④ **组里每个进程都必须属于 `session` 那个会话** —— 这一条专门防
+         pid 复用: 组 id 过期后可能被系统分给毫不相干的新进程, 那种进程
+         属于别的会话, 撞上了就绝不能动手;
+      ⑤ 若指定了 `expect_cmdline`, 成员里还必须**至少有一个**命令行含这个
+         字符串 —— 再叠一道「确实是我们在跑的那个东西」。
 
     任何一条不满足 → **什么都不做**, 返回 (False, 原因)。
     """
     if not isinstance(pgid, int) or pgid <= 1:
         return False, f"pgid {pgid!r} 不合法, 拒绝"
+    if not isinstance(session, int) or session <= 1:
+        return False, "没说是哪个会话的进程组, 拒绝 (会话才是防 pid 复用的依据)"
     own_group = _own_pgid()
     if pgid == own_group:
         return False, f"pgid {pgid} 是服务自己的进程组, 拒绝 (否则等于自杀)"
 
-    members = _proc_group_members(pgid)
+    members = [(pid, comm, state, pgrp, sid, cmdline)
+               for (pid, comm, state, pgrp, sid, cmdline) in _scan_proc()
+               if pgrp == pgid]
     if not members:
         return False, "进程组里已经没有活进程了, 不用杀"
-    if expect_cmdline and not any(expect_cmdline in m[3] for m in members):
+    outsiders = [m for m in members if m[4] != session]
+    if outsiders:
+        names = ", ".join(f"{m[0]}({m[1]}, sid={m[4]})" for m in outsiders[:5])
+        return False, (f"组里有不属于我们会话 {session} 的进程 ({names}) —— "
+                       f"拒绝 (防 pid 复用撞车)")
+    if expect_cmdline and not any(expect_cmdline in m[5] for m in members):
         names = ", ".join(f"{m[0]}({m[1]})" for m in members[:5])
         return False, (f"组里的进程 ({names}) 不是我们要杀的那个, 拒绝 "
                        f"(防 pid 复用撞车)")
@@ -329,7 +393,7 @@ def _pick_variant(pref: str = "auto") -> Tuple[Optional[str], Optional[str], str
     return None, None, "glmark2-es2 与 glmark2-es2-wayland 都没找到"
 
 
-def _precheck_display() -> Tuple[bool, str]:
+async def _precheck_display() -> Tuple[bool, str]:
     """前置 ①: HDMI 显示器已连接.
 
     读 /sys/class/drm/*HDMI*/status, 只要有一个 connector == connected 即通过。
@@ -355,7 +419,7 @@ def _precheck_display() -> Tuple[bool, str]:
     return False, f"HDMI 未连接: {', '.join(connectors)}"
 
 
-def _precheck_wayland() -> Tuple[bool, str]:
+async def _precheck_wayland() -> Tuple[bool, str]:
     """前置 ②: Wayland 会话已启动 (WAYLAND_DISPLAY 非空 + compositor 进程在).
 
     compositor 进程检测: 扫 /proc/*/environ 找带同名 WAYLAND_DISPLAY 的进程;
@@ -389,7 +453,7 @@ def _precheck_wayland() -> Tuple[bool, str]:
     )
 
 
-def _precheck_dri() -> Tuple[bool, str]:
+async def _precheck_dri() -> Tuple[bool, str]:
     """前置 ③: DRM 节点存在 (/dev/dri/card* + /dev/dri/renderD*)."""
     cards = sorted(glob.glob("/dev/dri/card*"))
     renders = sorted(glob.glob("/dev/dri/renderD*"))
@@ -443,18 +507,25 @@ def _judge_round(
 
     返回 (status, error)。status ∈ {passed, failed, error, stopped}。
 
-    **三种「没跑完」必须分开判** (2026-10-26, 产线反馈「停掉的测试也记 pass」):
+    **几种「没跑完」必须分开判** (2026-10-26, 产线反馈「停掉的测试也记 pass」):
 
     | 情形                        | 判      | 依据                                  |
     |-----------------------------|---------|---------------------------------------|
     | 用户在页面上按了「停止」     | stopped | ctx.is_cancelled() —— 主动中止, 不算失败 |
-    | glmark2 自己退了 (exit 0)   | failed  | 场景数不足 —— 这一轮**没有结论**        |
+    | glmark2 自己退了 (exit 0)   | stopped | 场景数是清单的**前缀** —— 人误关窗口/按 Esc 打断了(2026-10-29 改) |
+    | **一个场景都没渲染出来**     | error   | 工具/环境没跑起来 —— 这一项没测成(2026-10-29 改) |
+    | 渲染过场景后异常退出         | failed  | 板子真的崩过 —— 真证据, 不冤枉也不放过 |
     | 挂钟到点被 timeout 杀掉     | error   | 超时 —— 没有结论, 且要披露跑了多少     |
 
-    以前第二种和第一种都记成了 **passed** —— 工人把全屏窗口关掉 / 按了 Esc,
-    工具照样报「GPU 通过」。历史 run 50/52/54/56/57/59/78/100/112/120/122/123/124
-    全是这样: 整轮 passed、GPU 项 passed、GPU 轮 passed, rc=0, 但只渲染了
-    1~26 个场景 (应该 33 个)。
+    以前「用户按停止」和「glmark2 自己退了」这两种都记成了 **passed** ——
+    工人把全屏窗口关掉 / 按了 Esc, 工具照样报「GPU 通过」。历史 run
+    50/52/54/56/57/59/78/100/112/120/122/123/124 全是这样: 整轮 passed、
+    GPU 项 passed、GPU 轮 passed, rc=0, 但只渲染了 1~26 个场景 (应该 33 个)。
+
+    ⚠️ **2026-10-29 再改两处判 `failed` → `error`/`stopped`**: 「工具没跑起来」
+    和「人误关了窗口」以前都算在板子头上 —— 前者是环境问题、后者是人为打断,
+    都不是设备不合格。判 failed = 冤枉被测设备(好板子被送去修), 这跟
+    §9.3 的「不冤枉被测设备」直接冲突。
     """
     if cancelled:
         if tree_killed:
@@ -480,6 +551,22 @@ def _judge_round(
             f"**这一轮没有结论**。输出末尾:\n{out}{extra}"
         )
 
+    # ── 工具根本没跑起来 → error (不是 failed) ──
+    #
+    # ⚠️ **一个场景都没渲染出来**, 说明 glmark2 压根没跑起来 (sudo 提权没成功 /
+    # 二进制起不来 / 图形会话连不上)。这跟「板子不合格」是两回事:
+    # 判 failed = **冤枉被测设备**(好板子被送去修); 判 error = 这一项没测成,
+    # 该查环境 / 重测(§9.3)。所以这一条排在 `rc != 0` **前面** —— 后者
+    # 判 failed 的前提是「它真的跑起来过、渲染过场景、然后崩了」(那是真证据)。
+    if not rendered and score is None:
+        return "error", (
+            f"{tag}glmark2 **一个场景都没渲染出来**就退出了 (exit code = {rc}) —— "
+            f"**工具/环境没跑起来, 这一项没测成**。\n"
+            f"常见原因: sudo 提权没成功 / 图形会话连不上 / 二进制起不来。\n"
+            f"**不是「板子不合格」** —— 不判 failed(§9.3: 不冤枉被测设备)。\n"
+            f"输出末尾:\n{out}"
+        )
+
     if rc != 0:
         return "failed", (
             f"{tag}glmark2 异常退出, exit code = {rc}。输出末尾:\n{out}"
@@ -498,15 +585,23 @@ def _judge_round(
             names = sorted({m.split("|")[0] for m in missing})
             if rendered == expected[:len(rendered)]:
                 # 跑的是清单的**前缀** → 中途被打断
-                return "failed", (
+                #
+                # ⚠️ 判 `stopped` 不判 `failed` (2026-10-29 定): exit code 0
+                # + 场景数正好是清单的**前缀** = 「按顺序渲染到第 N 个时被外力
+                # 打断」—— 产线上最常见的是**工人误关了全屏窗口 / 按了 Esc**。
+                # 那是**人打断了测试, 不是板子不合格** —— 判 failed = 冤枉被测
+                # 设备(好板子被送去修)。§9.3: stopped = 没跑完 ≠ 不合格,
+                # 而且 stopped 的项**能重测**(§7.7.0)。
+                return "stopped", (
                     f"{tag}glmark2 **提前退出了** (exit code 0), 只渲染了 "
                     f"{len(rendered)}/{len(expected)} 个场景 —— "
-                    f"**这一轮没有结论**, 判 failed。\n"
+                    f"**这一轮没有结论**, 记 `stopped` (不是 failed)。\n"
                     f"没跑到的场景: {', '.join(names)}\n"
-                    f"常见原因: 全屏渲染窗口被手动关掉 / 按了 Esc 中断了 glmark2; "
-                    f"或显卡驱动在渲染中途异常。\n"
-                    f"要主动中止请按页面上的「停止」按钮 —— 那样记成 stopped, "
-                    f"不会像现在这样留下一个「跑了半截」的糊涂账。\n"
+                    f"最常见的原因: 全屏渲染窗口被**手动关掉** / 按了 Esc "
+                    f"中断了 glmark2 —— **人打断了测试, 不是板子不合格**, "
+                    f"所以不判 failed。\n"
+                    f"要主动中止请按页面上的「停止」按钮; 这一项也能重测 "
+                    f"(§7.7.0: 没跑完的项补上料/复位之后就该能再测)。\n"
                     f"输出末尾:\n{out}"
                 )
             return "error", (
@@ -528,11 +623,256 @@ def _judge_round(
     return "passed", None
 
 
-def _precheck_x11() -> Tuple[bool, str]:
-    """前置 ② (x11 变体): X11 会话可用。
+# ══════════════════════════════════════════════════════════════════════
+# X11 会话探测 —— 「会话能不能用」得**真连一次**, 不是看某个文件在不在
+# ══════════════════════════════════════════════════════════════════════
+#
+# ⚠️ 2026-10-29 新板**第一轮** GPU 判 error 的真正原因(2026-11-02 查实):
+#
+#   当时的判据是「XAUTHORITY 指的那个文件存不存在」, 不存在就判「认证不过」。
+#   但那台板子上(老板子实测, 同一套镜像):
+#     · X server 是 `/usr/bin/X11/X -nolisten tcp -auth /var/run/slim.auth`
+#       —— 真正在用的 cookie 是 **/var/run/slim.auth**(root 独占 0600)
+#     · `~/.Xauthority` 是**另一份** cookie(不是 server 那份), 而且是厂商
+#       那套 x11vnc/xhost 启动脚本**开机十来秒之后**才建的
+#       ⇒ 第一轮跑的时候它压根还不存在
+#     · **拿一个假 cookie、甚至完全不设 XAUTHORITY, xdpyinfo 都照样连上**
+#       ⇒ 这个 X server 压根没强制 MIT cookie 认证
+#
+#   所以「找不到 cookie 文件」**不等于**「连不上」。拿路径存在与否当判据,
+#   等于拿一个跟「会话能不能用」毫无关系的事实去否决一台好板子 —— 于是
+#   GPU 项在好板子上判 error, glmark2 **一次都没起来过**(§6.3)。
+#
+#   改成: **真连一次**。有 xdpyinfo 就用 xdpyinfo 连(厂商 watchdog.sh 的
+#   real_display_available() 也是这么干的), 连上了就算数。
+#   顺带把 X server **自己命令行里的 -auth** 当成 cookie 的权威来源
+#   (厂商那招), 免得再去猜 ~/.Xauthority —— 猜的那份可能是**错的**。
+
+# X server 的可执行文件名 —— 取 /proc/<pid>/cmdline 的 argv[0] 的 basename
+_XSERVER_NAMES = ("X", "Xorg", "Xorg-server", "Xwayland", "Xephyr", "Xdummy")
+
+
+class _XAuth(NamedTuple):
+    """X 认证文件(cookie)的探测结果。"""
+    path: Optional[str]             # 找到的 cookie 路径(没找到就是 None)
+    source: str                     # 判据说明(报告里原样显示)
+    server_found: bool              # 有没有找到正在跑的 X server
+    server_has_auth: bool           # X server 启动时带没带 -auth
+    server_display: Optional[str]   # X server 自己声明的 display(没有就是 None)
+    tried: List[str]                # 试过的路径(报错时列出来让人自己看)
+
+
+def _xserver_argvs(proc_root: str = "/proc") -> List[List[str]]:
+    """把正在跑的 X server 的 argv **逐个参数**抓出来。
+
+    扫 `<proc_root>/<pid>/cmdline` —— 那是 NUL 分隔的**精确** argv(路径里有
+    空格也不会被切开), 而且 `/proc/<pid>/cmdline` 是 0444, 普通用户也读得到。
+    厂商 watchdog.sh 用的是 `ps -eo args=`(空格会被切开), 效果一样但粗。
+
+    认 X server 的办法: argv[0] 的 basename 在 `_XSERVER_NAMES` 里。
+
+    `proc_root` 是给测试用的 —— 指向一个假的 proc 根, 免得测到开发机上
+    真跑着的那个 X server。
+    """
+    argvs: List[List[str]] = []
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return argvs
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        if not argv:
+            continue
+        if os.path.basename(argv[0]) in _XSERVER_NAMES:
+            argvs.append(argv)
+    return argvs
+
+
+def _parse_xserver_argv(argv: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """从 X server 的 argv 里抠出两样东西。
+
+    返回 (`-auth` 指向的 cookie 路径, X server 自己声明的 display)。
+
+    **没有** `-auth` ⇒ 这个 server 启动时压根没开访问控制 ⇒ 不需要 cookie。
+    """
+    auth: Optional[str] = None
+    display: Optional[str] = None
+    for i, arg in enumerate(argv):
+        if arg == "-auth" and i + 1 < len(argv):
+            auth = argv[i + 1]
+        elif arg.startswith("-auth="):
+            auth = arg.split("=", 1)[1]
+        elif arg.startswith(":") and not arg.startswith("::"):
+            display = arg
+    return auth, display
+
+
+def _pick_xserver(argvs: List[List[str]],
+                  display: Optional[str]) -> Optional[List[str]]:
+    """从若干个 X server 里挑出跟 DISPLAY 对得上的那一个。
+
+    ⚠️ 这台板子上 X server 的 argv **没有** display 参数
+    (`/usr/bin/X11/X -nolisten tcp -auth /var/run/slim.auth`) —— display 号
+    是 X 自己按 `:0` 起的, 不写在命令行里。所以: 谁带 display 参数就按它
+    对, 谁都不带就取第一个(板上只跑一个 X server)。
+    """
+    if not argvs:
+        return None
+    if display:
+        want = display.split(".", 1)[0]
+        for argv in argvs:
+            _auth, tok = _parse_xserver_argv(argv)
+            if tok and tok.split(".", 1)[0] == want:
+                return argv
+    return argvs[0]
+
+
+def _discover_xauth(display: Optional[str] = None,
+                    runtime_dir: Optional[str] = None,
+                    home: Optional[str] = None,
+                    argvs: Optional[List[List[str]]] = None,
+                    proc_root: Optional[str] = None) -> _XAuth:
+    """找 cookie —— **X server 自己命令行里的 `-auth` 最权威**。
+
+    优先级:
+      ① X server 的 `-auth <路径>` —— 这是 server 本尊在用的那份, 别人
+         说什么都是二手的(2026-11-02 老板子实测: env 里的 ~/.Xauthority
+         跟 server 的 /var/run/slim.auth 是**两份不同的** cookie)
+      ② env 里的 XAUTHORITY
+      ③ ~/.Xauthority
+      ④ XDG_RUNTIME_DIR 及其 gdm/ 目录下的 X 认证文件
+
+    候选里**真的存在**的那一份就是它; 一个都不存在就返回 path=None,
+    但把试过的路径都带回来(报错时要让人自己看)。
+
+    `argvs` / `proc_root` 可以从外面塞进来 —— 测试用, 免得测到本机真跑着
+    的 X server。
+    """
+    if argvs is None:
+        argvs = _xserver_argvs(proc_root or "/proc")
+    picked = _pick_xserver(argvs, display)
+    server_found = picked is not None
+    server_auth: Optional[str] = None
+    server_display: Optional[str] = None
+    if picked is not None:
+        server_auth, server_display = _parse_xserver_argv(picked)
+    server_has_auth = bool(server_auth)
+
+    tried: List[str] = []
+
+    def _take(path: Optional[str], why: str) -> Optional[_XAuth]:
+        if not path or path in tried:
+            return None
+        tried.append(path)
+        if os.path.exists(path):
+            return _XAuth(path, why, server_found, server_has_auth,
+                          server_display, list(tried))
+        return None
+
+    # ① X server 自己的 -auth —— 最权威
+    if server_auth:
+        hit = _take(server_auth, "X server 自己命令行里的 -auth")
+        if hit:
+            return hit
+    # ② env 里的 XAUTHORITY
+    hit = _take(os.environ.get("XAUTHORITY", "").strip(), "env 里的 XAUTHORITY")
+    if hit:
+        return hit
+    # ③ ~/.Xauthority
+    if home is None:
+        home = os.path.expanduser("~")
+    if home:
+        hit = _take(os.path.join(home, ".Xauthority"), "~/.Xauthority")
+        if hit:
+            return hit
+    # ④ gdm / lightdm 把 cookie 放在 XDG_RUNTIME_DIR 底下(名字不一定叫 Xauthority)
+    if runtime_dir is None:
+        runtime_dir = (os.environ.get("XDG_RUNTIME_DIR", "").strip()
+                       or f"/run/user/{os.getuid()}")
+    if runtime_dir and os.path.isdir(runtime_dir):
+        for d in (runtime_dir, os.path.join(runtime_dir, "gdm")):
+            try:
+                names = sorted(os.listdir(d))
+            except OSError:
+                continue
+            for name in names:
+                if "xauthority" in name.lower():
+                    hit = _take(os.path.join(d, name), f"{d} 里的 {name}")
+                    if hit:
+                        return hit
+
+    return _XAuth(None, "候选路径里没有一份存在的", server_found,
+                  server_has_auth, server_display, list(tried))
+
+
+def _build_session_env(info: Optional[_XAuth] = None) -> dict:
+    """要透传给 sudo 的图形会话环境变量 (§11.2)。
+
+    sudo 默认 env_reset 会清掉这些变量 —— 没有 WAYLAND_DISPLAY /
+    XDG_RUNTIME_DIR, glmark2 在 root 环境下连不上 compositor 必挂。
+
+    ⚠️ X11 的 XAUTHORITY **不能原样透传**: env 里那个路径常常指向一个
+    不存在的文件(新板实测), 原样传下去 = 前置检查放行了、glmark2 照样
+    连不上。这里换成**探测到的**那份(优先用 X server 自己 `-auth` 的),
+    一个都探测不到就把这个不存在的路径**去掉** —— 传一个根本不存在的
+    路径, 只会让报告里出现一个误导人的路径。
+    """
+    keys = ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
+            "DISPLAY", "XAUTHORITY", "XDG_SESSION_ID")
+    env = {k: os.environ[k] for k in keys if os.environ.get(k)}
+    if info is None:
+        info = _discover_xauth(
+            display=os.environ.get("DISPLAY", "").strip() or None)
+    if info.path:
+        env["XAUTHORITY"] = info.path
+    else:
+        env.pop("XAUTHORITY", None)
+    return env
+
+
+async def _probe_x11(display: str, env: dict) -> Tuple[Optional[bool], str]:
+    """**真连一次** X server —— 「会话能不能用」的权威判据。
+
+    返回 (True/False/None, 说明):
+      True  —— 连上了, 会话可用
+      False —— 连不上, 说明里带 X server 自己的原话
+               (如 "No protocol specified" / "Authorization required")
+      None  —— 本机没有探测工具, 判不了(调用方退回静态判断)
+
+    **按 glmark2 实际的样子去连**: 同样提权、同样透传会话环境 ——
+    「前置检查放行、实际却连不上」是最坑人的一种错。
+    """
+    for tool, args in (("xdpyinfo", ["-display", display]),
+                       ("xset", ["-display", display, "q"])):
+        path = find_tool(tool)
+        if path is None:
+            continue
+        cmd = with_sudo([path, *args], env=env, timeout_sec=10)
+        try:
+            rc, out, err = await run_cmd(cmd, timeout=12)
+        except Exception as e:      # 探测失败不该掀翻整个测试项
+            return False, f"{tool} 探测出错: {e}"
+        if rc == 0:
+            return True, f"{tool} 实连成功({display})"
+        lines = (err or out).strip().splitlines()
+        tail = lines[0][:200] if lines else f"退出码 {rc}"
+        return False, f"{tool} 连不上 {display}: {tail}"
+    return None, "本机没有 xdpyinfo / xset, 探测不了"
+
+
+async def _precheck_x11() -> Tuple[bool, str]:
+    """前置 ② (x11 变体): X11 会话**真能用**。
 
     对应 `glmark2-es2` —— 该二进制 `ldd` 出来链的是 libX11, 不用 Wayland。
-    DISPLAY 形如 `:0.0` / `localhost:1.0`, 取显示号拼 socket 路径。
+
+    判据是**实连一次**(xdpyinfo), 不是「某个 cookie 文件在不在」——
+    理由见本节开头的注释(2026-10-29 新板第一轮就是这么被误判的)。
+    拿不准的时候, 实连说了算。
     """
     display = os.environ.get("DISPLAY", "").strip()
     if not display:
@@ -548,23 +888,51 @@ def _precheck_x11() -> Tuple[bool, str]:
     if os.path.exists(sock):
         detail += f" (socket {sock})"
 
-    xauth = os.environ.get("XAUTHORITY", "").strip()
-    if not xauth:
-        # 没设不一定坏 —— X server 未开访问控制时不需要 cookie
-        return True, detail + ", ⚠ XAUTHORITY 未设置(X server 若开访问控制会认证失败)"
-    if not os.path.exists(xauth):
+    info = _discover_xauth(display=display)
+    env = _build_session_env(info)
+    probed, why = await _probe_x11(display, env)
+    if probed is True:
+        tail = (f", XAUTHORITY={info.path}({info.source})" if info.path
+                else ", 未开访问控制, 不需要 cookie")
+        return True, detail + f", {why}" + tail
+    if probed is False:
+        hint = ""
+        if info.path:
+            hint = f"(用的 cookie: {info.path} —— {info.source})"
+        elif info.tried:
+            hint = "(试过的路径都不存在: " + ", ".join(info.tried) + ")"
+        return False, f"{detail}, 但**实连失败**: {why} {hint}".strip()
+
+    # 本机没有探测工具 ⇒ 退回静态判断
+    if info.path:
+        return True, detail + f", XAUTHORITY={info.path}({info.source})"
+    # ⚠️ 顺序要紧: X server 自己**没带 -auth** ⇒ 它压根没开访问控制 ⇒ 不需要
+    # cookie ⇒ env 里那个不存在的路径是**无害**的, 不能拿它判失败。
+    if info.server_found and not info.server_has_auth:
+        return True, (detail + ", X server 启动时没带 -auth ⇒ 没开访问控制, "
+                            "不需要 cookie(⚠ 本机没有 xdpyinfo, 连不了实)")
+    if info.server_found and info.server_has_auth:
         return False, (
-            f"DISPLAY={display} 但 XAUTHORITY={xauth} 不存在 —— 提权后的进程"
-            f"认证不过 X server, glmark2 会连不上。确认服务启动用户对该文件有读权限。"
+            f"DISPLAY={display} 但 X server 的 cookie 文件不存在"
+            f"(试过的: {', '.join(info.tried)}) —— 提权后的进程多半认证不过, "
+            f"glmark2 会连不上。确认服务启动用户对该文件有读权限。"
         )
-    return True, detail + f", XAUTHORITY={xauth}"
+    env_path = os.environ.get("XAUTHORITY", "").strip()
+    if env_path:
+        return False, (
+            f"DISPLAY={display} 但 XAUTHORITY={env_path} 不存在, 也没找到别的"
+            f"X 认证文件({info.source}) —— 提权后的进程认证不过 X server, "
+            f"glmark2 会连不上。确认服务启动用户对该文件有读权限。"
+        )
+    # env 里压根没有 XAUTHORITY —— 不一定坏: X server 未开访问控制时不需要 cookie
+    return True, detail + ", ⚠ 找不到 X 认证文件(X server 若开访问控制会认证失败)"
 
 
-def _precheck_session(variant: str) -> Tuple[bool, str]:
+async def _precheck_session(variant: str) -> Tuple[bool, str]:
     """前置 ②: 所选变体所需的图形会话可用。"""
     if variant == "x11":
-        return _precheck_x11()
-    return _precheck_wayland()
+        return await _precheck_x11()
+    return await _precheck_wayland()
 
 
 def _build_prechecks(variant: str) -> Tuple[Tuple[str, str, object], ...]:
@@ -572,6 +940,9 @@ def _build_prechecks(variant: str) -> Tuple[Tuple[str, str, object], ...]:
 
     ② 的标签和检查函数都跟着变体走: wayland 查 `WAYLAND_DISPLAY`,
     x11 查 `DISPLAY`。metric key 统一叫 `precheck_session`。
+
+    检查函数都是 **async** —— X11 那一项要**实连一次** xdpyinfo 才判得了
+    「会话能不能用」(2026-10-29 新板第一轮 GPU 误判的教训)。
     """
     _binname, envvar, label = _VARIANTS[variant]
     return (
@@ -596,9 +967,18 @@ class GPUTest(TestCase):
         self.scenes: int = 0
         self.scene_ids: List[str] = []      # 每个渲染出来的场景的身份
         self._tail: List[str] = []
-        # 本轮 glmark2 那一组进程的**进程组 id** (起进程时用 start_new_session
-        # 新建的会话, 组 id == 那个进程的 pid)。收尾时靠它整组收掉 ——
-        # 组里那个 root 的 glmark2, 我们(普通用户)直接发信号是 EPERM。
+        # 本轮 glmark2 那棵进程树的**会话 id** (起进程时用 start_new_session
+        # 新建的)。收尾时靠它认出「这棵树是我们自己起的」—— 然后按会话找到
+        # **真正跑着 glmark2 的那一组**, 整组收掉 (组里那个 glmark2 是 root
+        # 的, 我们普通用户直接发信号必然 EPERM)。
+        #
+        # ⚠️ **为什么记会话而不是记进程组** (2026-10-29): GNU `timeout` 会自己
+        # `setpgid(0,0)` 另起一组, glmark2 在 timeout 那一组里, 和 sudo 那一组
+        # **不是同一组** —— 原来按 sudo 的组杀, 打的是个空组, root 的 glmark2
+        # 收不到信号, 而工具还照样报「窗口应已消失」(撒谎)。详见模块顶部。
+        self.sid: Optional[int] = None
+        # sudo 自己那一组的组 id —— 只在「还没等它把 glmark2 拉起来」时作兜底
+        # (见 _kill_glmark_tree)。
         self.pgid: Optional[int] = None
         self._glmark_bin: str = ""        # 本轮用的 glmark2 二进制路径
         self._tree_killed: Optional[bool] = None   # 提权收尾的结果 (给提示语用)
@@ -622,11 +1002,12 @@ class GPUTest(TestCase):
     async def cancel(self):
         if self.proc and self.proc.returncode is None and not self.cancel_done:
             self.cancel_done = True
-            # ① 先杀我们自己起的这棵树的顶端 (`timeout` 进程, 我们的 uid, 杀得动)
+            # ① 先杀我们自己起的这棵树的顶端 (`sudo` 进程, 我们的 uid, 杀得动)
             await kill_proc(self.proc, wait_sec=2.0)
-            # ② 再**以 root 身份**把整组收掉 —— 组里那个 glmark2 是 root 的,
-            #    普通用户对它发信号必然 EPERM (with_sudo 的说明)。不收的话,
-            #    那个全屏窗口会一直占着屏幕到本轮超时上限, 工人看着像工具卡死。
+            # ② 再**以 root 身份**把真正占着屏幕的那一组收掉 —— 组里那个
+            #    glmark2 是 root 的, 普通用户对它发信号必然 EPERM (with_sudo
+            #    的说明)。不收的话, 那个全屏窗口会一直占着屏幕到本轮超时上限,
+            #    工人看着像工具卡死。
             #    授权范围见模块中部「提权收尾」—— 校验不过就绝不动手。
             self._tree_killed = await self._kill_glmark_tree("用户取消")
 
@@ -635,80 +1016,145 @@ class GPUTest(TestCase):
 
         区分它和同组的 `timeout` / `sudo`: 那两个是我们自己起的、正规退出的
         壳子, 留着无所谓; 只有 glmark2 本体活着才说明全屏窗口还占着屏幕。
+
+        ⚠️ **在会话里找, 不在进程组里找** (2026-10-29 修): 原来扫的是
+        `self.pgid` (sudo 那一组) —— 而 glmark2 在 `timeout` 另起的那一组里,
+        所以这个安全网**永远不可能触发**: root 的 glmark2 赖着不走时, 根本
+        没人去收它, 全屏窗口就一直占着屏幕。
         """
-        pgid = self.pgid
-        bin_path = self._glmark_bin
-        if not pgid or not bin_path:
+        if not self.sid or not self._glmark_bin:
             return False
-        for _pid, _comm, _state, cmdline in _proc_group_members(pgid):
+        bin_path = self._glmark_bin
+        for _pid, _comm, _state, _pgrp, cmdline in _session_members(self.sid):
             if cmdline.startswith(bin_path):
                 return True
         return False
 
-    async def _adopt_pgid(self, ctx: TestContext, tag: str = "") -> Optional[int]:
-        """确认这一组进程的组 id, 并校验它**确实是我们自己建的那一个**。
+    def _glmark_target_group(self) -> Optional[int]:
+        """找出**真正跑着 glmark2 的那个进程组**的 pgid (找不到就 None)。
 
-        返回可用的 pgid, 或 None —— 拿不准就不提权收尾:
+        ⚠️ **这里原来返回的是 `self.pgid`** —— 也就是 **sudo 那一组**。
+        而 GNU `timeout` 自己 `setpgid(0,0)` 另起了一组, glmark2 在**那一组**
+        里 (实测见模块顶部)。所以原来的「整组杀」打的是个**空组** —— root
+        的 glmark2 收不到信号, 而工具还会报「窗口应已消失」。
+
+        现在按**会话**找 (会话里只有我们自己起的子孙进程, 别人进不来):
+          ① 命令行**以** glmark2 二进制开头的那一个 —— 那就是本体, 它在哪
+             一组就杀哪一组;
+          ② 次选: 命令行**含** glmark2 路径、但不是 sudo 自己的那一个 ——
+             那就是 `timeout` 包装层, 它和 glmark2 在同一组, 而且它还在就
+             说明 glmark2 还能被拉起来, 得收;
+          ③ 都没有 → 还没起来 / 已经跑完了 → None。
+        """
+        if not self.sid or not self._glmark_bin:
+            return None
+        bin_path = self._glmark_bin
+        members = _session_members(self.sid)
+        # ① 本体: 命令行以 glmark2 二进制开头
+        for _pid, _comm, _state, pgrp, cmdline in members:
+            if cmdline.startswith(bin_path):
+                return pgrp
+        # ② timeout 包装层 (排除 sudo 自己 —— 它那一组是空壳)
+        for pid, _comm, _state, pgrp, cmdline in members:
+            if self.proc and pid == self.proc.pid:
+                continue
+            if bin_path in cmdline:
+                return pgrp
+        return None
+
+    async def _adopt_session(self, ctx: TestContext, tag: str = "") -> Optional[int]:
+        """记下这一轮**我们自己建的会话 id**, 并校验它确实是我们自己的。
+
+        为什么按**会话**认这棵进程树 (2026-10-29 修): GNU `timeout` 会自己
+        `setpgid(0,0)` 另起一组, glmark2 在 timeout 那一组里 —— 和 sudo 那一组
+        **不是同一组**。而会话是 `start_new_session=True` 建的, 里面**只有
+        我们自己的子孙进程** —— 别的进程进不来 (要进来只能 setsid 另开一个,
+        或者从会话内的进程 fork 出来)。所以「会话 id 相同」= 「是我们自己
+        起的」, 比「组 id 相同」强得多, 还顺带防掉了 pid 复用。
+
+        返回 sid, 或 None —— 拿不准就不提权收尾:
         **宁可让窗口多留一会, 也不能杀错组**。
         """
         pid = self.proc.pid if self.proc else None
         if not pid:
             return None
-        real = _pgid_of(pid)
-        if real != pid:
+        real_pgid = _pgid_of(pid)
+        real_sid = _sid_of(pid)
+        if real_pgid != pid or real_sid != pid:
             await ctx.on_log(
-                f"[GPU] {tag}⚠ 进程组不是预期的独立组 (pid={pid}, pgid={real}) —— "
-                f"收尾时不整组杀 (宁可窗口多留一会, 也不杀错组)"
+                f"[GPU] {tag}⚠ 进程没落在预期的独立会话里 "
+                f"(pid={pid}, pgid={real_pgid}, sid={real_sid}) —— "
+                f"收尾时不提权整组杀 (宁可窗口多留一会, 也不杀错组)"
             )
             return None
-        if real == _own_pgid():
+        if real_pgid == _own_pgid():
             await ctx.on_log(
                 f"[GPU] {tag}⚠ 进程组与服务自己的组相同 —— 拒绝整组杀"
             )
             return None
+        self.pgid = real_pgid
         await ctx.on_log(
-            f"[GPU] {tag}进程组: {real} (收尾时整组收, 含 root 那个 glmark2)"
+            f"[GPU] {tag}会话: {real_sid} (收尾时按会话找到真正占屏的那个"
+            f"进程组, 连 root 那个 glmark2 一起收掉)"
         )
-        return real
+        return real_sid
 
     async def _kill_glmark_tree(self, reason: str) -> bool:
-        """以 root 身份把 glmark2 那一组进程彻底收掉 (授权范围见模块中部)。
+        """以 root 身份把**真正占着屏幕的那一组**彻底收掉 (授权范围见模块中部)。
 
-        返回 True = 组里已经没有活进程了 (窗口应该已经消失)。
+        返回 True = 那一组里已经没有活进程了 (窗口应该已经消失)。
+
+        ⚠️ **2026-10-29 重写**: 原来杀的是 **sudo 那一组**(空的), root 的
+        glmark2 收不到信号, 而这里还照样报「窗口已消失」—— 撒谎。现在:
+          ① 先按**会话**找到真正跑 glmark2 的那一组 (见 _glmark_target_group);
+          ② 杀**那一组**, 并用**同一组**验证它真的空了;
+          ③ 收不掉就**如实说没收掉**, 绝不报「窗口应已消失」。
         """
         ctx = self.ctx
-        pgid = self.pgid
-        if not pgid:
-            return False
-        if not _proc_group_members(pgid):
-            return True                      # 已经没人了
-        # TERM → 等 → 不死就 KILL
-        ok, detail = await _sudo_kill_group(pgid, "TERM", expect_cmdline="glmark2")
-        if not ok:
+        if not self.sid:
             if ctx:
-                await ctx.on_log(f"[GPU] {reason}: 整组收尾(TERM)没成功 —— {detail}")
+                await ctx.on_log(
+                    f"[GPU] {reason}: 拿不到我们自己的会话 id —— 不提权收尾 "
+                    f"(宁可窗口多留一会, 也不杀错组)"
+                )
             return False
-        if ctx:
-            await ctx.on_log(f"[GPU] {reason}: {detail}")
-        for _ in range(10):                  # 最多等 2s
-            await asyncio.sleep(0.2)
-            if not _proc_group_members(pgid):
+        # TERM → 等 → 不死就 KILL; 每一轮**重新发现**目标组
+        for sig, wait_rounds in (("TERM", 10), ("KILL", 5)):
+            target = self._glmark_target_group()
+            if target is None:
+                # 找不到跑着渲染进程的组 —— 但我们的 sudo 可能还活着, 它随时
+                # 能把 glmark2 拉起来 (那就白收了) → 把 sudo 那一组也收掉。
+                if self.proc and self.proc.returncode is None and self.pgid:
+                    target = self.pgid
+                else:
+                    if ctx:
+                        await ctx.on_log(
+                            f"[GPU] {reason}: 已经找不到跑着的渲染进程, 无需收尾")
+                    return True
+            ok, detail = await _sudo_kill_group(
+                target, sig, expect_cmdline="glmark2", session=self.sid)
+            if not ok:
                 if ctx:
-                    await ctx.on_log(f"[GPU] {reason}: 全屏渲染进程已收掉, 窗口应已消失")
-                return True
-        # 还在 → KILL
-        ok2, detail2 = await _sudo_kill_group(pgid, "KILL", expect_cmdline="glmark2")
+                    await ctx.on_log(f"[GPU] {reason}: 整组收尾({sig})没成功 —— {detail}")
+                return False
+            if ctx:
+                await ctx.on_log(f"[GPU] {reason}: {detail}")
+            for _ in range(wait_rounds):
+                await asyncio.sleep(0.2)
+                if not _proc_group_members(target):
+                    if ctx:
+                        await ctx.on_log(
+                            f"[GPU] {reason}: 进程组 {target} 已清空 —— "
+                            f"全屏渲染进程不在了, 窗口应已消失")
+                    return True
+        # 两轮都没收干净 → 如实说
+        left = self._glmark_left_alive()
         if ctx:
             await ctx.on_log(
-                f"[GPU] {reason}: {detail2}" if ok2
-                else f"[GPU] {reason}: 强杀也没成功 —— {detail2}"
-            )
-        if ok2:
-            for _ in range(5):
-                await asyncio.sleep(0.2)
-                if not _proc_group_members(pgid):
-                    return True
-        return not _proc_group_members(pgid)
+                f"[GPU] {reason}: ⚠ 收尾没能收干净 —— "
+                + ("glmark2 还活着 (全屏窗口可能还占着屏幕)"
+                   if left else "已确认没有活着的渲染进程"))
+        return not left
 
     async def _pump_stdout(self, ctx: TestContext, tag: str = ""):
         """读 glmark2 输出: 逐行推日志 + 数渲染了几个场景.
@@ -805,7 +1251,7 @@ class GPUTest(TestCase):
         await ctx.on_log("[GPU] 前置检查...")
         failed: List[str] = []
         for key, label, checker in _build_prechecks(variant):
-            ok, detail = checker()
+            ok, detail = await checker()
             result.metrics[key] = ok
             await ctx.on_log(f"[GPU]   {'✓' if ok else '✗'} {label}: {detail}")
             if not ok:
@@ -946,12 +1392,14 @@ class GPUTest(TestCase):
         每轮独立进程、独立挂钟、独立超时 —— 不共享任何上下文,
         这样第 2 轮的分数才和第 1 轮可比 (能看出衰减趋势)。
         """
-        # 每轮重置 —— 上一轮的进程组/收尾结果不能带进这一轮
-        # (进程组是**每轮新建**的, 收尾时按组杀, 见模块中部「提权收尾」)
+        # 每轮重置 —— 上一轮的会话/收尾结果不能带进这一轮
+        # (会话是**每轮新建**的, 收尾时按会话找到那一组再整组杀,
+        #  见模块中部「提权收尾」)
         self.scenes = 0
         self.scene_ids = []
         self._tail = []
         self.cancel_done = False
+        self.sid = None
         self.pgid = None
         self._glmark_bin = glmark_bin
         self._tree_killed = None
@@ -976,13 +1424,15 @@ class GPUTest(TestCase):
 
         # ── 起进程 ──
         #
-        # `start_new_session=True`: 给这棵进程树 (timeout → sudo → glmark2)
-        # 建一个**属于我们自己的**新会话/进程组 (组 id == 这个进程的 pid)。
+        # `start_new_session=True`: 给这棵进程树 (sudo → timeout → glmark2)
+        # 建一个**属于我们自己的**新会话 (会话 id == 这个进程的 pid, 它同时
+        # 也是自己那一组的组长)。
         # 为什么要自己建: 收尾时我们要以 root 身份**整组**杀掉它 (组里那个
         # glmark2 是 root 的, 普通用户对它发信号必然 EPERM, 见 with_sudo)。
-        # 而组 id 必须**可预期** —— 否则「按组杀」就可能杀到别人的组。
-        # (GNU timeout 事后也会自己 setpgid, 但那是竞态: 早一步读到的是
-        #  服务自己的组, 那样整组杀会连服务一起杀掉 —— 所以这里自己建。)
+        # 而**会话 id 必须可预期** —— 否则「按会话找那棵树」就可能找到别人的。
+        # ⚠️ 注意: 建了会话**不等于**整棵树在一个进程组里 —— GNU `timeout`
+        # 自己还会 `setpgid(0,0)` 另起一组 (实测见模块顶部), 所以收尾时
+        # **不能**直接按 sudo 那一组杀, 得按会话找到真正跑 glmark2 的那一组。
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -996,7 +1446,7 @@ class GPUTest(TestCase):
                 "elapsed_sec": 0.0, "exit_code": -1, "tail": "",
                 "error": "启动 glmark2-es2 失败: FileNotFoundError",
             }
-        self.pgid = await self._adopt_pgid(ctx, tag)
+        self.sid = await self._adopt_session(ctx, tag)
 
         t0 = time.time()
         self._pump_task = asyncio.create_task(self._pump_stdout(ctx, tag))
@@ -1074,11 +1524,9 @@ class GPUTest(TestCase):
 
     @staticmethod
     def _session_env() -> dict:
-        """要透传给 sudo 的图形会话环境变量 (§11.2).
+        """要透传给 sudo 的图形会话环境变量 (§11.2) —— 见 `_build_session_env`。
 
-        sudo 默认 env_reset 会清掉这些变量 —— 没有 WAYLAND_DISPLAY /
-        XDG_RUNTIME_DIR, glmark2 在 root 环境下连不上 compositor 必挂。
+        cookie 那一份是**探测到的**(优先 X server 自己 `-auth` 的), 不是
+        env 里那个常常指向不存在文件的路径 —— 见 `_build_session_env`。
         """
-        keys = ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
-                "DISPLAY", "XAUTHORITY", "XDG_SESSION_ID")
-        return {k: os.environ[k] for k in keys if os.environ.get(k)}
+        return _build_session_env()

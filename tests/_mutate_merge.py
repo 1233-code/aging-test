@@ -25,8 +25,8 @@ TEST = "tests.test_history_retest_merge"
 MUTATIONS = [
     (
         "server/db.py",
-        '            elif total == 0:\n                status = "skipped"',
-        '            elif total == 0:\n                status = "passed"',
+        '    if total == 0:\n        return "skipped"',
+        '    if total == 0:\n        return "passed"',
         "DB: 一项都没实际执行 → 判 passed (§9.2 明令不许)",
     ),
     (
@@ -43,9 +43,15 @@ MUTATIONS = [
     ),
     (
         "server/db.py",
+        '                "UPDATE results SET status=\'stopped\', "\n'
+        '                "error=COALESCE(error, \'重测中途停止, 本项未跑完\') "\n'
         '                "WHERE run_id=? AND status=\'running\'",',
+        '                "UPDATE results SET status=\'stopped\', "\n'
+        '                "error=COALESCE(error, \'重测中途停止, 本项未跑完\') "\n'
         '                "WHERE run_id=? AND status=\'__never__\'",',
-        "DB: 不清残留的 running 行 (父轮计数会凭空少一项)",
+        "DB: 不清残留的 running 行 (父轮计数会凭空少一项) "
+        "[锚点带上下文 ⇒ 只改「重测中途停止」那处; 另有两条同款 WHERE 在"
+        "硬复位/软重启的收尾路径上, 那是另一回事, 不能一起改]",
     ),
     (
         "server/db.py",
@@ -98,7 +104,9 @@ MUTATIONS = [
         "server/templates/report.html.j2",
         "{% if c.attempt and c.attempt > 1 %}",
         "{% if false %}",
-        "TEMPLATE: 逐项不印「第 N 次测试通过」(返修过的项看不出来)",
+        "TEMPLATE: 逐项不印「第 N 次测试通过」(返修过的项看不出来) "
+        "[故意多改: 同一段模板有**两个布局分支**(有指标的走表格头, 没指标的"
+        "走独立块), 两处都得改 —— 少改一处, 报告会随机地一半标一半不标]",
     ),
     (
         "server/runner.py",
@@ -150,6 +158,60 @@ MUTATIONS = [
         '        run["retest_runs"] = await Database.get_retest_runs(run_id)',
         '        run["retest_runs"] = []',
         "DB: 详情里不带重测轮 (重测过程在界面上彻底看不见了)",
+    ),
+    # ── 2026-10-28: 假通过的两条路(见 test_history_retest_merge 第 8/17/18/19 节)
+    (
+        "server/db.py",
+        '    if not_run > 0 or aborted > 0:\n        return "stopped"',
+        '    if not_run > 0 or aborted > 0:\n        return "passed"',
+        "DB: 轮级「有没跑到的项 ⇒ 没结论」被改成 passed "
+        "(**假通过** —— 没测过的项合不合格谁也不知道)",
+    ),
+    (
+        "server/runner.py",
+        "                if (parent_prev_status in CONCLUSION_STATUSES\n"
+        "                        and result.status not in MEASURED_STATUSES):",
+        "                if False:",
+        "RUNNER: 重测那一轮「没测成」时照样覆盖父轮的结论 "
+        "(首测那条 failed 被洗掉 ⇒ 整轮判 passed ⇒ **假通过**)",
+    ),
+    (
+        "server/runner.py",
+        "            if parent_prev_status not in CONCLUSION_STATUSES:",
+        "            if True:",
+        "RUNNER: 重测开跑时把父轮的结论抹成 running "
+        "(中途夭折的话首测的结论就真没了)",
+    ),
+    # ── 2026-10-28(第二轮): 口径只留一处 + 合并后的报告不许自相矛盾
+    (
+        "server/db.py",
+        '    if failed or error:\n        return "failed"',
+        '    if False:\n        return "failed"',
+        "DB: 轮级判定里「有 failed/error 的项 → failed」被删掉 "
+        "(板子真不合格的结论被抹掉 = **放行坏板子**; "
+        "「工人按了暂停」也不许盖掉已测出来的失败)",
+    ),
+    (
+        "server/runner.py",
+        "        self.status = decide_run_status(summary)",
+        '        self.status = "passed"',
+        "RUNNER: 收尾时不用那个唯一口径(自己判一遍) "
+        "(两份口径迟早走歪 ⇒ 这一轮判 stopped、合并时又被重算成 passed)",
+    ),
+    (
+        "server/runner.py",
+        '            retest_tests_config[n] = {**pc, "enabled": True}',
+        "            retest_tests_config[n] = dict(pc)",
+        "RUNNER: 重测点名的项不再强制 enabled "
+        "(父轮配置里没有这一项 / 写着 enabled=false 时 ⇒ 那一项被**悄悄滤掉** "
+        "⇒ 重测一轮什么都没跑 ⇒ 界面永远停在「⏳ 等待」)",
+    ),
+    (
+        "server/templates/report.html.j2",
+        "{% if run.error and not summary.retest_count %}",
+        "{% if run.error %}",
+        "TEMPLATE: 被重测过的轮次也印「系统级错误」框 "
+        "(报告头写「✅ 全部通过」、底下挂着「系统级错误」= 同一页自相矛盾)",
     ),
 ]
 

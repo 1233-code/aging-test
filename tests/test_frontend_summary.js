@@ -5,7 +5,7 @@
  * 光看这三个数, 工人**分不清**这两种情况:
  *
  *     A: 勾了 8 项, 8 项全测过, 全通过
- *     B: 勾了 10 项, 只测了 8 项(2 项没测), 这 8 项全通过
+ *     B: 勾了 11 项, 只测了 8 项(3 项没测), 这 8 项全通过
  *
  * 两种情况下屏幕上都是「8 通过 / 0 失败 / 0 跳过」—— B 却是一台**没测全**
  * 的机器, 拿着它出货就是漏检。所以总结页必须自己把「已测 M / 共勾选 K」
@@ -330,34 +330,43 @@ async function main() {
     }
 
     // ══════════════════════════════════════════════════════════
-    section('【10】可重测的项 = 失败 + 出错 + **跳过** (总结页)');
+    section('【10】可重测的项 = 失败 + 出错 + **跳过** + **没跑到** (总结页)');
     /* 跳过的项也是「没测成」—— 没接显示器 / 没插网线 / 卡槽是空的。
      * 补上料、补上环境之后就该能重测, 所以跟失败项走**同一个**重测入口
-     * (§7.7)。stopped(用户中途叫停)不算: 那些项压根没轮到, 工人是主动
-     * 叫停的, 不该由这个入口接管。 */
+     * (§7.7)。**stopped(没跑到)也是**: 工人中途按了暂停(多半就是那一项
+     * 卡住了), 或者上一轮服务中途夭折(卡挂死把事件循环冻死) —— 两种都是
+     * 「结论没拿到」, 按完/重启之后他要的就是「再测一次」。 */
     {
         const a = await makeApp();
         a.applySnapshot(snap({
             status: 'running',
+            // 这一轮勾了 5 项(多一项 TF 卡: 卡挂死 → 工人按了暂停 → 没跑到)
+            test_queue: ['cpu', 'gpu', 'usb', 'wifi', 'tfcard'],
             results: {
                 cpu: { status: 'passed', metrics: {}, error: null },
                 gpu: { status: 'failed', metrics: {}, error: '渲染分数不达标' },
                 usb: { status: 'error', metrics: {}, error: '这一项没测成' },
                 wifi: { status: 'skipped', metrics: {}, error: '环境不具备条件' },
+                tfcard: { status: 'stopped', metrics: {}, error: '用户中途停止, 本项未执行' },
             },
         }));
         check(a.hasRetestableItems.value === true,
               '有可重测的项 → 按钮该出现', a.hasRetestableItems.value);
-        check(a.retestableCount.value === 3,
-              '可重测 3 项 (失败+出错+跳过)', a.retestableCount.value);
+        check(a.retestableCount.value === 4,
+              '可重测 4 项 (失败+出错+跳过+没跑到)', a.retestableCount.value);
         const names = a.retestableItemNames.value.slice().sort();
-        check(JSON.stringify(names) === JSON.stringify(['gpu', 'usb', 'wifi']),
-              '可重测的是 gpu / usb / wifi', JSON.stringify(names));
+        check(JSON.stringify(names)
+              === JSON.stringify(['gpu', 'tfcard', 'usb', 'wifi']),
+              '可重测的是 gpu / tfcard / usb / wifi', JSON.stringify(names));
         check(!names.includes('cpu'),
               '已经过了的不重测 (免得白跑一遍)', JSON.stringify(names));
     }
 
-    section('【11】stopped 的项**不**进重测清单');
+    section('【11】没跑到(stopped)的项**也**进重测清单, 还没到的(pending)不进');
+    /* 2026-10-28: 工人原话「既然重测一轮没通过, 那应该还是要保留重测按钮吧,
+     * 不然怎么测试」—— 重测轮开跑会把父轮对应项写成 `running`(从来不在重测
+     * 集合里), 重测那一轮没跑完 ⇒ 父轮那一项**永远重测不了**, 按钮直接消失。
+     * 收尾逻辑把 running 收成 stopped 之后, 按钮还得在 ⇒ stopped 必须能重测。 */
     {
         const a = await makeApp();
         a.applySnapshot(snap({
@@ -369,10 +378,16 @@ async function main() {
                 wifi: { status: 'pending', metrics: {}, error: null },
             },
         }));
-        check(a.retestableCount.value === 0,
-              '没跑到/还没到的项不算可重测', a.retestableCount.value);
-        check(a.hasRetestableItems.value === false,
-              '按钮不该出现', a.hasRetestableItems.value);
+        check(a.retestableCount.value === 1,
+              '没跑到的那一项可重测', a.retestableCount.value);
+        check(a.hasRetestableItems.value === true,
+              '按钮该出现', a.hasRetestableItems.value);
+        const names = a.retestableItemNames.value.slice().sort();
+        check(JSON.stringify(names) === JSON.stringify(['gpu']),
+              '挑中的是 gpu', JSON.stringify(names));
+        check(!names.includes('usb') && !names.includes('wifi'),
+              '还没到的(pending)不算 —— 那是「还没测」, 不是「没测成」',
+              JSON.stringify(names));
     }
 
     // ══════════════════════════════════════════════════════════
@@ -383,10 +398,12 @@ async function main() {
               '总结页按钮用 hasRetestableItems 当守卫');
         check(html.includes('retestableCount'),
               '按钮上的数字用 retestableCount');
-        check(html.includes('retestFailedOrSkipped'),
-              '按钮点的是 retestFailedOrSkipped');
-        check(/重测失败\/跳过项/.test(html),
-              '按钮上写着「重测失败/跳过项」(工人一眼知道跳过项也能重测)');
+        check(html.includes('retestNotPassed'),
+              '按钮点的是 retestNotPassed');
+        check(html.includes('🔂 重测失败/跳过/没跑到 ({{ retestableCount }})'),
+              '总结页按钮上写着「重测失败/跳过/没跑到」(工人一眼知道没跑到的也能重测)');
+        check(html.includes('🔂 重测失败/跳过/没跑到 ({{ historyRetestableNames(historyDetail).length }})'),
+              '历史页按钮上是同一套措辞(两个入口是同一个功能)');
     }
 
     return finish();

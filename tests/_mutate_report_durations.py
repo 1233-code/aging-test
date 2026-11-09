@@ -25,7 +25,7 @@ TEST = "tests.test_report_durations"
 MUTATIONS = [
     (
         "server/templates/report.html.j2",
-        "    <tr><td>总耗时</td><td>{{ total_duration }}</td></tr>\n",
+        '    <tr><td>总耗时</td><td>{{ total_duration }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.duration }}</span>{% endfor %}</td></tr>\n',
         "",
         "TEMPLATE: 报告头表里没有「总耗时」这一行了",
     ),
@@ -39,7 +39,9 @@ MUTATIONS = [
         "server/templates/report.html.j2",
         '<span class="case-meta">耗时 {{ c.duration }}</span>',
         '<span class="case-meta">{{ c.duration }}</span>',
-        "TEMPLATE: 逐项段里只有个孤零零的数, 没标「耗时」(读者不知道那是什么)",
+        "TEMPLATE: 逐项段里只有个孤零零的数, 没标「耗时」(读者不知道那是什么) "
+        "[故意多改: 同一段模板有**两个布局分支**(有指标的走表格头, 没指标的"
+        "走独立块), 两处都得改 —— 少改一处, 报告会随机地一半标一半不标]",
     ),
     (
         "server/templates/report.html.j2",
@@ -91,6 +93,75 @@ MUTATIONS = [
         '            "duration": "—",',
         "REPORT: 每一项的耗时都不填了",
     ),
+    # ── §7.8.6 重测轮的时间: 原值保留, 重测的接在后面 ──
+    (
+        "server/templates/report.html.j2",
+        '    <tr><td>开始时间</td><td>{{ started_at }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.started_at }}</span>{% endfor %}</td></tr>\n',
+        '    <tr><td>开始时间</td><td>{{ started_at }}</td></tr>\n',
+        "TEMPLATE: 开始时间那一行里没有重测轮的时间",
+    ),
+    (
+        "server/templates/report.html.j2",
+        '    <tr><td>结束时间</td><td>{{ finished_at }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.finished_at }}</span>{% endfor %}</td></tr>\n',
+        '    <tr><td>结束时间</td><td>{{ finished_at }}</td></tr>\n',
+        "TEMPLATE: 结束时间那一行里没有重测轮的时间",
+    ),
+    (
+        "server/templates/report.html.j2",
+        '    <tr><td>总耗时</td><td>{{ total_duration }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.duration }}</span>{% endfor %}</td></tr>\n',
+        '    <tr><td>总耗时</td><td>{{ total_duration }}</td></tr>\n',
+        "TEMPLATE: 总耗时那一行里没有重测轮的时间",
+    ),
+    (
+        "server/templates/report.html.j2",
+        '    {% for rt in retest_times %}<br><span class="rate-note">重测第 {{ rt.round }} 轮: {{ rt.duration }}</span>{% endfor %}\n',
+        "",
+        "TEMPLATE: 汇总段里没有跟着说重测轮的耗时 (读者第一眼看的那块看不到)",
+    ),
+    (
+        "server/templates/report.html.j2",
+        '    <tr><td>开始时间</td><td>{{ started_at }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.started_at }}</span>{% endfor %}</td></tr>\n',
+        '    <tr><td>开始时间</td><td>{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.started_at }}</span>{% endfor %}{{ started_at }}</td></tr>\n',
+        "TEMPLATE: 重测的时间排在**原值前面**(要求是「在原时间后面」)",
+    ),
+    (
+        "server/templates/report.html.j2",
+        '<span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.duration }}</span>',
+        '<span class="rt-line">重测轮: {{ rt.duration }}</span>',
+        "TEMPLATE: 重测那几行不带轮次号 (读者分不清是哪一轮)",
+    ),
+    (
+        "server/templates/report.html.j2",
+        '<span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.started_at }}</span>',
+        '<span>重测第 {{ rt.round }} 轮: {{ rt.started_at }}</span>',
+        "TEMPLATE: 开始时间那一行里重测的几行没有自己的样式 (印得跟主数一样大)",
+    ),
+    (
+        "server/templates/report.html.j2",
+        ".rt-line { font-size: 8.5pt; color: #546e7a; }",
+        "",
+        "TEMPLATE: CSS 里没有 .rt-line (重测那几行跟主数一样大)",
+    ),
+    (
+        "server/report.py",
+        "    for idx, mr in enumerate(retest_runs or [], 1):",
+        "    for idx, mr in enumerate([], 1):",
+        "REPORT: 重测轮的时间压根不收 (报告里查不到重测跑了多久)",
+    ),
+    (
+        "server/report.py",
+        '            "started_at": _fmt_time(ms),\n            "finished_at": _fmt_time(mf),',
+        '            "started_at": _fmt_time(mf),\n            "finished_at": _fmt_time(ms),',
+        "REPORT: 重测轮的起点和终点**写反了**",
+    ),
+    (
+        "server/report.py",
+        "            mdur = (float(mf) - float(ms)\n"
+        "                    if ms is not None and mf is not None else None)",
+        "            mdur = (float(mf) - float(ms)\n"
+        "                    if ms is not None and mf is not None else total_dur)",
+        "REPORT: 重测轮的耗时写成了整轮的耗时",
+    ),
 ]
 
 
@@ -114,6 +185,12 @@ def main():
     os.makedirs(os.path.join(tmp, "tests"), exist_ok=True)
     shutil.copy2(os.path.join(REPO, "tests", "test_report_durations.py"),
                  os.path.join(tmp, "tests", "test_report_durations.py"))
+    # ⚠️ **_pdftext.py 也要复制** —— 那个测试的第 8 个场景要**真导一份 PDF**
+    #   并从 PDF 字节里把字抠出来。漏了它的话, 测试一 import 就崩,
+    #   崩了也算「红」—— 那种红是**假的**(这个脚本自己会把它判成
+    #   「崩了, 不算数」, 但那样一个变异都测不了)。
+    shutil.copy2(os.path.join(REPO, "tests", "_pdftext.py"),
+                 os.path.join(tmp, "tests", "_pdftext.py"))
     # ⚠️ **fixtures/ 也要复制** —— 那个测试要读 tests/fixtures/duration_formats.json
     #   (前端和报告共用的那张对照表)。漏了的话, 测试跑到 case5 就崩,
     #   崩了也算「红」—— 那种红是**假的**, 跟断言咬不咬得住没关系。

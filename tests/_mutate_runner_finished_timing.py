@@ -25,15 +25,29 @@ TEST = "tests.test_runner_finished_timing"
 MUTATIONS = [
     (
         "server/runner.py",
-        '            "started_at": self.started_at,\n            "finished_at": self.finished_at,',
-        '            "finished_at": self.finished_at,',
-        "RUNNER: 正常收尾的 run_finished 不带 started_at (前端配不上起点)",
+        '            "started_at": self.started_at,\n            "finished_at": self.finished_at,\n'
+        '            "error": self.run_error,',
+        '            "finished_at": self.finished_at,\n            "error": self.run_error,',
+        "RUNNER: 正常收尾的 run_finished 不带 started_at (前端配不上起点) "
+        "[锚点带上下文 ⇒ 只改**正常收尾**那条广播; 状态快照和 report_dict "
+        "里也有一对 started_at/finished_at, 那是另外两回事]",
     ),
     (
         "server/runner.py",
-        '                "started_at": self.started_at,\n                "finished_at": self.finished_at,',
-        '                "finished_at": self.finished_at,',
-        "RUNNER: 出错收尾的 run_finished 不带 started_at",
+        '                "sn": self.sn,\n'
+        '                # 起点也得带上 —— 界面上的总耗时是「结束 − 起点」算的,\n'
+        '                # 只给结束时间的话前端配不上起点(见下面正常收尾那条的说明)。\n'
+        '                "started_at": self.started_at,\n'
+        '                "finished_at": self.finished_at,\n'
+        '                "error": self.run_error,',
+        '                "sn": self.sn,\n'
+        '                # 起点也得带上 —— 界面上的总耗时是「结束 − 起点」算的,\n'
+        '                # 只给结束时间的话前端配不上起点(见下面正常收尾那条的说明)。\n'
+        '                "finished_at": self.finished_at,\n'
+        '                "error": self.run_error,',
+        "RUNNER: 出错收尾的 run_finished 不带 started_at "
+        "[锚点带上下文 ⇒ 只改**异常收尾**那条; 「一项都没勾选」那条另有一"
+        "条变异盯着]",
     ),
     (
         "server/runner.py",
@@ -46,9 +60,12 @@ MUTATIONS = [
     ),
     (
         "server/runner.py",
-        '            "started_at": self.started_at,\n            "finished_at": self.finished_at,',
-        '            "started_at": 0,\n            "finished_at": self.finished_at,',
-        "RUNNER: run_finished 的起点写死成 0 (界面上的总耗时变成整轮时长)",
+        '            "started_at": self.started_at,\n            "finished_at": self.finished_at,\n'
+        '            "error": self.run_error,',
+        '            "started_at": 0,\n            "finished_at": self.finished_at,\n'
+        '            "error": self.run_error,',
+        "RUNNER: run_finished 的起点写死成 0 (界面上的总耗时变成整轮时长) "
+        "[锚点带上下文 ⇒ 只改**正常收尾**那条]",
     ),
 ]
 

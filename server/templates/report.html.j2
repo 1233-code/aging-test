@@ -66,6 +66,26 @@ th { background: #eceff1; text-align: left; font-weight: 600; }
     padding: 2.5mm 3mm; margin: 3mm 0; border-radius: 2px;
 }
 .warn-box .t { font-weight: 700; color: #e65100; }
+/* §9.3.4 时钟横幅: 里面的旁挂文件是**多行**的, 要保留换行。
+   ⚠️ **别在这条注释里写报告正文里会被断言的字样** —— CSS 注释是**留在
+   输出的 HTML 源串里**的, 写了横幅上的那句话就会让「没有这一节的报告」
+   也搜到它(用例就白测了)。 */
+.clock-skew .skew-detail {
+    margin: 1.5mm 0 0; padding: 0; background: none; border: none;
+    font-family: inherit; font-size: 9pt; line-height: 1.35;
+    white-space: pre-wrap; word-break: break-all; color: #4a3b12;
+}
+/* §9.3.1 重启现场: 一次重启的日志原文 —— 跟轮级错误框一样显眼,
+   但里面装的是日志, 用自己的框, 别跟警告框的配色搅在一起。
+   ⚠️ 用例是按 **HTML 源串** 断言的, 而这段 CSS 就在源串里 ——
+   别在 CSS 注释里写报告正文里会被断言的字样(否则用例会在"没有这一节"
+   的报告里也搜到它)。 */
+.boot-evidence {
+    border: 1.2pt solid #ef6c00; background: #fff8e1;
+    padding: 2.5mm 3mm; margin: 3mm 0; border-radius: 2px;
+}
+.boot-evidence .t { font-weight: 700; color: #e65100; break-after: avoid; }
+.boot-evidence pre.log { margin-top: 1.5mm; }
 
 /* 通过率行: 分子分母旁边必须跟一句"已测 N / 共勾选 M"。
    光印 "6/6" 的话, 读者不知道分母是 6 还是 9 —— 而这正是 §9.2 的要点。 */
@@ -74,6 +94,11 @@ th { background: #eceff1; text-align: left; font-weight: 600; }
 }
 .rate-line b { font-size: 13pt; }
 .rate-note { font-size: 9pt; color: #546e7a; }
+/* §7.8.6 重测轮的时间: 跟在原时间**后面**的一行。
+   字号小一号、颜色淡一点 —— 原值是**主数**, 重测的那些是补充说明;
+   两个印得一样大, 读者会以为是两行平级的「总耗时」, 反而不知道哪个是
+   这一轮真正的耗时了。 */
+.rt-line { font-size: 8.5pt; color: #546e7a; }
 .notice {
     border-left: 2.5pt solid #f9a825; background: #fffde7;
     padding: 2mm 3mm; margin: 3mm 0;
@@ -198,6 +223,17 @@ pre.log {
     生成时间 {{ generated_at }}　·　本报告由工厂老化测试工具自动导出, 不经人工编辑
 </div>
 
+{# ───────────── §9.3.4 时钟推算值横幅 ───────────── #}
+{# 板子硬复位过 ⇒ 系统时钟被退回「上次干净关机」那一刻(实测倒跳 42 天),
+   这一轮的时间戳是**推算值**。纸面归档的人必须知道这一点 ——
+   归档顺序可信, 但不能拿这些时间当准点用。 #}
+{% if has_clock_skew %}
+<div class="warn-box clock-skew">
+    <div class="t">⚠ 本报告的时间戳是推算值, 不是系统时钟的真实时间</div>
+    <pre class="skew-detail">{{ clock_skew }}</pre>
+</div>
+{% endif %}
+
 {# ───────────── 报告头 (§8.2) ───────────── #}
 <table class="kv">
     <tr><td>被测设备 SN</td><td>{{ run.sn or 'unknown' }}</td></tr>
@@ -208,19 +244,21 @@ pre.log {
        工号是人事系统的编号, 纸质报告上没人认。 #}
     <tr><td>测试人员</td><td>{{ run.operator or '未填写' }}</td></tr>
     <tr><td>批次号</td><td>{{ run.batch or '未填写' }}</td></tr>
-    <tr><td>开始时间</td><td>{{ started_at }}</td></tr>
-    <tr><td>结束时间</td><td>{{ finished_at }}</td></tr>
-    <tr><td>总耗时</td><td>{{ total_duration }}</td></tr>
+    {# §7.8.6 重测轮的时间: **原值保留**, 重测的那三项**接在原值后面**,
+       每一行都带「重测第 N 轮」的标签。
+       ⚠️ 不是「把重测的时间替换掉原值」—— 首测那一次是什么时候跑的,
+          那是**事实**, 改了等于篡改记录; 也不是「把两轮加起来」——
+          加起来的那个数既不是首测的、也不是重测的, 谁都对不上。
+          两条时间**并排放着**, 读者自己分得清哪条是哪轮的。 #}
+    <tr><td>开始时间</td><td>{{ started_at }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.started_at }}</span>{% endfor %}</td></tr>
+    <tr><td>结束时间</td><td>{{ finished_at }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.finished_at }}</span>{% endfor %}</td></tr>
+    <tr><td>总耗时</td><td>{{ total_duration }}{% for rt in retest_times %}<br><span class="rt-line">重测第 {{ rt.round }} 轮: {{ rt.duration }}</span>{% endfor %}</td></tr>
     {# 整体结论: 光印一个英文状态词, 纸面读者(质检/返修)未必知道 "skipped"
        是什么意思 —— 尤其 "skipped" 跟 "failed" 在他们眼里都像"没通过"。
-       这里给一句**中文结论**, 明确这轮能不能放行。 #}
-    {% set conclusion = {
-        'passed':  '✅ 已测项目全部通过',
-        'failed':  '❌ 存在失败/错误项 —— 不合格, 需返修',
-        'error':   '⚠ 本轮异常终止 —— 结果不作数, 需重跑',
-        'skipped': '⏭ 本次未实际执行任何测试项 —— 不构成合格判定',
-        'stopped': '🛑 用户中途停止 —— 已完成的项按自身判定, 未跑的不算数',
-    }.get(run.status, run.status) %}
+       这里给一句**中文结论**, 明确这轮能不能放行。
+       ⚠️ 这张表在 Python 侧(report.STATUS_CONCLUSION)—— 同一句话 U 盘上
+          的 INDEX.csv 也要用, 两处各写一份迟早走歪。 #}
+    {% set conclusion = status_conclusion.get(run.status, run.status) %}
     <tr><td>整体结论</td><td><span class="st st-{{ run.status }}">{{ run.status }}</span> {{ conclusion }}</td></tr>
     <tr><td>Run ID</td><td>{{ run.id }}{% if run.mini_of %}（记录 #{{ run.mini_of }} 的**重测轮** —— 本报告只含被重测的那几项; 完整报告见记录 #{{ run.mini_of }}）{% endif %}</td></tr>
 </table>
@@ -281,6 +319,10 @@ pre.log {
 <div class="rate-line">
     总耗时 <b>{{ total_duration }}</b>
     <span class="rate-note">(本轮从开始到结束 —— 与测试界面右上角的读秒同一个数)</span>
+    {# §7.8.6 重测轮的时间也在这里跟一句 —— 汇总段才是读者真正会盯的
+       那一块, 只在页眉的小表里写, 多数人翻过去根本看不见。跟头表一个
+       口径: 原值保留, 重测的接在后面, **不累加**。 #}
+    {% for rt in retest_times %}<br><span class="rate-note">重测第 {{ rt.round }} 轮: {{ rt.duration }}</span>{% endfor %}
 </div>
 
 {# §7.7 合并重测: 这一轮被重测过 —— 报告必须说清「这是合并后的最终结果」。
@@ -418,9 +460,74 @@ pre.log {
 </div>
 {% endfor %}
 
-{% if run.error %}
+{# ───────────── 轮级「系统级错误」(§9.3) ─────────────
+   ⚠️ **被重测过的轮次不印这一框**(2026-10-28 修)。
+   这一列记的是「这一轮**出过**系统级事件」—— 最常见的是收尾逻辑写的
+   「服务重启, 这一轮中途夭折(没跑完)」。可一旦这一轮被**重测过**, 它的
+   结论已经重新判过(没测成的项补测过了), 那句话就不再成立; 硬印出来的话,
+   报告头写「✅ 全部通过」、底下又挂一个「系统级错误」框 —— **同一页纸上
+   自相矛盾**, 归档的人不会知道该信哪个。
+   「这一轮被中断过、之后重测补齐」这件事, 报告头那句「本报告含 N 轮重测」
+   已经说清楚了(而且重测轮自己的那一轮也在库里, 查得到)。 #}
+{% if run.error and not summary.retest_count %}
 <div class="warn-box">
     <div class="t">系统级错误</div>{{ run.error }}
+</div>
+{% endif %}
+
+{# ───────────── 板子为什么死: 上一次启动的内核日志 (§9.3) ───────────── #}
+{# 板子重启时, 死因(kernel panic / thermal critical trip / watchdog reset)
+   **只留在上一次启动的日志里** —— 这一轮测试的日志跟死因一起没了。
+   所以启动时把上一轮的内核日志尾巴存成旁挂文件, 导出报告时带上这一节。
+   捞不到就**不画这一节** —— 编一段「疑似原因」比没有更糟, 会把排查
+   方向带偏(真凶是驱动 panic 时, 报告写「疑似过热」就是误导)。 #}
+{% if has_boot_evidence %}
+<div class="boot-evidence">
+    <div class="t">板子为什么死 —— 上一次启动的内核日志</div>
+    <p class="snapshot-note">这一轮测试是在板子重启（掉电 / 内核紧急关机）中夭折的。死因只留在<strong>上一次启动</strong>的日志里，下面是它的尾巴：</p>
+    {% if died_in_item %}
+        {% if died_hard_reset %}
+    <p class="snapshot-note"><strong>板子死在 {{ died_in_item }} 这一项上</strong> —— 上一次启动的日志里<strong>没有关机序列</strong>，说明它是被<strong>硬复位</strong>拉死的（掉电 / PMIC 复位 / 看门狗复位）：<strong>被测设备在这一项上不合格</strong>，不是工具没跑完。</p>
+        {% else %}
+    <p class="snapshot-note">板子死在 <strong>{{ died_in_item }}</strong> 这一项上（这一项在服务重启前还挂着「没跑完」）。</p>
+        {% endif %}
+    {% endif %}
+    <pre class="log">{{ boot_evidence }}</pre>
+</div>
+{% endif %}
+
+{# ───────────── 板子死在哪一级加压: 一句结论 (§9.3) ─────────────
+   下面那一节「加压现场记录」是**原始数据**(200ms 一行, 几十行) ——
+   读者得自己翻到最后一行、看线程数、看温度、再回头找「起跑 第 N/M 片」。
+   这里直接把结论摆出来: 死在第几级、起手后几秒、当时多热。
+   ⚠️ 只有「板子确实死在 CPU 这一项上」时才有这一节 —— 跑完了也有那个
+   记录文件, 那时候最后一行是「跑完了」而不是「死了」。 #}
+{% if has_cpu_death_summary %}
+<div class="boot-evidence">
+    <div class="t">板子死在哪一级加压 —— 结论</div>
+    <pre class="log">{{ cpu_death_summary }}</pre>
+</div>
+{% endif %}
+
+{# ───────────── 加压现场记录 (§9.3) ─────────────
+   「板子为什么死」是**内核视角**(板子死的时候内核说了什么)。
+   这一节是**我们自己的视角**: 加压过程中每 200ms 记下的温度/负载/频率/线程数。
+   为什么单独要一份 —— 这一项的指标是**跑完**才落库的, 板子死在加压
+   半路时那些数字跟着进程一起没了 ⇒ 报告上只剩一句「服务重启, 本项没
+   跑完」, **看不出死在第几秒、几线程、多少度**。落文件的那几行还在。 #}
+{% if has_cpu_evidence %}
+<div class="boot-evidence">
+    <div class="t">加压现场记录 —— 板子死前最后看到的画面</div>
+    <p class="snapshot-note">加压过程中<strong>每 200 毫秒</strong>记下的现场（经过秒数 / 线程数 / 各核区温度 / 负载 / 当时频率）。板子死在加压半路时，下面这些行就是当时留下的最后画面：</p>
+    <pre class="log">{{ cpu_evidence }}</pre>
+</div>
+{% endif %}
+{# ⚠️ 文件在、却是空的 —— **说清楚**, 别让读者以为「工具没记」而不知道
+   那一行到底发生了什么(2026-11-02 13:50 实测: 文件 0 字节)。 #}
+{% if has_cpu_evidence_note %}
+<div class="boot-evidence">
+    <div class="t">加压现场记录 —— 为什么这一节是空的</div>
+    <pre class="log">{{ cpu_evidence_note }}</pre>
 </div>
 {% endif %}
 

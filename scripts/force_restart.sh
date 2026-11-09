@@ -43,5 +43,5 @@ sudo bash start.sh start
 echo ""
 echo "==> 6. 验证"
 sleep 2
-curl -s http://localhost:8000/api/health
+curl -s --noproxy '*' http://127.0.0.1:8000/api/health
 echo ""

@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.tests import tfcard as F
 from server.tests.base import TestResult
+from tests._tmp import mkdtemp
 
 FAILS = []
 PASSES = 0
@@ -68,7 +69,7 @@ class FakeBoard:
     """
 
     def __init__(self, disks, parts=None, mounts=None, root=None):
-        self.root = tempfile.mkdtemp(prefix="tf_fake_")
+        self.root = mkdtemp(prefix="tf_fake_")
         self.disks = disks
         self.parts = parts or {}
         self.mounts = mounts or []
@@ -268,6 +269,12 @@ async def run_item(mount_info, disks=None):
     ⚠️ **不替换 `_unmount`** —— 那个函数自己就知道「用户自己挂的不卸」,
     把它换掉就等于把这个判断绕过去了。改成替换更底层的 `run_cmd`,
     记录真正发出去的命令 —— 这样验的是「到底有没有发卸载命令」。
+
+    ⚠️ **必须把假的 /sys/block 接上去** —— 不然 `_disk_partitions()` 会去读
+    **真机的** `/sys/block` —— 开发机上压根没有 `mmcblk1`(TF 槽没露出来),
+    分区表读出来是空的, 于是设备名退化成 `/dev/mmcblk1`(整盘)而不是
+    `/dev/mmcblk1p1`(分区) —— 卸载命令就发错了设备。
+    同一个测试在**产线板子上过、在开发机上挂**, 原因就在这儿。
     """
     if disks is None:
         disks = ["mmcblk1"]
@@ -286,15 +293,22 @@ async def run_item(mount_info, disks=None):
     async def _remove(ctx, path):
         removed.append(path)
 
-    with Patch(_ensure_mounted=_ensure, run_cmd=fake_run_cmd,
-               _remove_test_file=_remove, _wait_for_dev=fake_wait_for_dev,
-               _run_fio_test=fake_fio(),
-               sudo_hint_if_unavailable=lambda result, name: True):
-        # 探卡: 直接返回指定的盘 (不依赖真板子)
-        with Patch(_card_disks=lambda root_disk=None: list(disks)):
-            ctx = FakeCtx({"times": 1, "duration_sec": 10, "min_read_mbps": 10})
-            res = await TFC.run(ctx)
-            return res, ctx, cmds, removed
+    board = FakeBoard({d: "SD" for d in disks},
+                      parts={"mmcblk1": ["mmcblk1p1"]})
+    board.install()
+    try:
+        with Patch(_ensure_mounted=_ensure, run_cmd=fake_run_cmd,
+                   _remove_test_file=_remove, _wait_for_dev=fake_wait_for_dev,
+                   _run_fio_test=fake_fio(),
+                   sudo_hint_if_unavailable=lambda result, name: True):
+            # 探卡: 直接返回指定的盘 (不依赖真板子)
+            with Patch(_card_disks=lambda root_disk=None: list(disks)):
+                ctx = FakeCtx({"times": 1, "duration_sec": 10,
+                               "min_read_mbps": 10})
+                res = await TFC.run(ctx)
+                return res, ctx, cmds, removed
+    finally:
+        board.restore()
 
 
 # ① 卡槽是空的

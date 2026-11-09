@@ -16,6 +16,9 @@ from .config import Config
 from . import db
 from . import identity
 from . import report
+from . import boot_evidence
+from . import clock
+from . import usb_export
 from .runner import runner
 from .tests.registry import get_all_tests
 
@@ -29,13 +32,181 @@ PROJECT_ROOT = Config.project_root()
 async def startup():
     Config.load()
     await db.Database.init()
+    # §9.3.4 时钟: 先判一次「系统时钟是不是倒退过」(板子硬复位 ⇒ 时钟被
+    # 退回上次干净关机那一刻, 实测倒跳 42 天)。判完再起一个定期任务,
+    # 每分钟把「最近一次见到的墙钟」存进锚点文件 ⇒ 硬复位最多丢一分钟,
+    # 而不是 42 天。
+    try:
+        # ⚠️ 先开「维护锚点」再判定 —— 判定完要立刻把锚点写回去,
+        #    否则这一分钟里硬复位了, 下次开机拿到的还是旧锚点。
+        clock.enable_anchor()
+        st = clock.init()
+        if st["skew_detected"]:
+            print(f"[server] ⚠ 系统时钟倒退 {st['skew_days']:.1f} 天 ⇒ "
+                  "本轮时间戳用推算值(报告上会打横幅)")
+    except Exception as e:
+        print(f"[server] ⚠ 时钟判定失败(不影响测试): {e!r}")
+    asyncio.create_task(_clock_anchor_saver())
     # §4.4: 启动时读一次 SN 常驻内存, UI 顶部整个会话都显示它。读不到不阻断,
     # 记 unknown 转黄提示 (§2.2) —— 停机出货的后果远大于一次读不到。
     sn = identity.init()
     print(f"[server] 项目根目录: {PROJECT_ROOT}")
     print(f"[server] 被测设备 SN: {sn}" + ("  ⚠ 读不到, 报告中将记 unknown"
                                         if sn == identity.UNKNOWN else ""))
+    # §9.3: 上一轮服务若是**中途夭折**的(设备卡住把事件循环冻死 / 被 kill /
+    # 断电), 那一轮会永远停在「运行中」—— 历史列表一直显示有测试在跑, 明明
+    # 什么都没在跑(2026-10-28 实测: 挂了一整天, 工人以为测试还在跑)。
+    #
+    # ⚠️ **授权范围**(用户点名): 只处理 status='running' 的轮次, 以及它们
+    #   父轮里同样卡在 running 的那一行; 只写 status / summary_json / error /
+    #   updated_at 四个字段; **不删**任何数据、**不碰**已判定(passed/failed/
+    #   skipped/stopped/error)的轮次、**不动**任何 PDF。
+    #
+    #   父轮属于第二条(「它们父轮里同样卡在 running 的那一行」): 只收**那一行**,
+    #   父轮的轮级结论(status / error)一个字都不动 —— 夭折的是重测轮, 父轮
+    #   自己好好地跑完了, 把「服务重启, 这一轮中途夭折」盖到父轮头上是
+    #   **张冠李戴**; 父轮多半是**已判定**的轮次, 它的结论不该被顺手改掉。
+    fixed = []
+    try:
+        stuck = await db.Database.list_interrupted_runs()
+        if stuck:
+            print(f"[server] ⚠ 有 {len(stuck)} 轮卡在「运行中」"
+                  f"(上一轮服务中途夭折的) → 收尾")
+
+        # ① **先**取「上一次启动」的日志并判软/硬 —— 收尾要用它决定
+        #    「这一项是被板子硬复位打死的」还是「只是服务被人重启了」。
+        #    硬复位 ⇒ 正在跑的那一项判 **failed**(被测设备不合格);
+        #    软重启 / 看不出来 ⇒ 照旧 stopped(不冤枉板子, 也不冤枉工具)。
+        #    一定要**在收尾之前**取: 收尾完再取, 就分不清是硬是软了。
+        evidence_text = ""
+        hard_reset = False
+        if stuck and boot_evidence.capture_enabled():
+            try:
+                evidence_text = await boot_evidence.previous_boot_evidence()
+                kind = boot_evidence.classify_evidence_text(evidence_text)
+                if kind == "硬复位":
+                    # 「板子被硬拉死」还不够 —— 还得**死的时候我们的测试
+                    # 正在上面跑**。
+                    # 「服务自己死了、板子后来才被硬拉死」也是「没有关机
+                    # 序列」, 那种判成「板子不合格」就是冤枉好板子。
+                    if boot_evidence.our_run_at_death(evidence_text):
+                        hard_reset = True
+                        print("[server] 上一次是**硬复位**, 而且日志尾巴里看得见"
+                              "我们自己的测试 ⇒ 正在跑的那一项判 failed"
+                              "(板子被硬拉死的, 被测设备不合格)")
+                    else:
+                        # ⚠️ **journal 的尾巴认不出来时的第二条通道**
+                        # (2026-11-04 实测踩出来的):
+                        #   硬复位时 **journald 还没落盘的那几秒, 尾巴里是
+                        #   没有的** —— 而那几秒**正好**是「加压刚起手」的
+                        #   窗口(实测板子死在起手约 2 秒)⇒ 尾巴里连一条
+                        #   stress-ng 都没有 ⇒ 照旧 stopped ⇒ **不计入通过率
+                        #   分母** ⇒ 一块在满载下硬复位的板子, 只要其它项
+                        #   都过, 报告上看着像**合格**的 ⇒ 产线会放行它。
+                        # ⇒ 改看**加压现场记录**: 它逐行 fsync 落盘, 硬复位
+                        #   **带不走**; 「起跑」在、「加压结束」不在 ⇒ 加压
+                        #   **没跑完** ⇒ 板子死在加压途中 ⇒ 判 failed。
+                        cut = None
+                        for r in stuck:
+                            try:
+                                if boot_evidence.cpu_evidence_cut_short(r.get("id")):
+                                    cut = r.get("id")
+                                    break
+                            except Exception:
+                                continue
+                        if cut is not None:
+                            hard_reset = True
+                            print("[server] 上一次是**硬复位**, journal 尾巴里"
+                                  "看不见我们的测试(硬复位时最后几秒没落盘), "
+                                  f"但**加压现场记录**显示第 {cut} 轮的加压"
+                                  "起手了、没跑完 ⇒ 板子死在加压途中 ⇒ "
+                                  "正在跑的那一项判 failed(被测设备不合格)")
+                        else:
+                            print("[server] 上一次是**硬复位**, 但日志尾巴里看不见"
+                                  "我们自己的测试, 加压现场记录也看不出"
+                                  "「起手了没跑完」 ⇒ 不赖到板子头上, 照旧 stopped")
+                else:
+                    print(f"[server] 上一次是**{kind}** ⇒ 照旧 stopped"
+                          f"(不冤枉板子)")
+            except Exception as e:
+                print(f"[server] ⚠ 取上一次启动的日志失败(不影响收尾): {e!r}")
+
+        # ② 收尾(只动 status='running' 的轮次和它们父轮里同样 running 的那一行)
+        fixed = await db.Database.reconcile_interrupted_runs(hard_reset=hard_reset)
+        for f in fixed:
+            if f.get("is_parent"):
+                print(f"[server] ⚠ 收掉父轮 #{f['id']} 里卡在「运行中」的那一项"
+                      f"(重测轮中途夭折; 父轮自己的结论不动)")
+            else:
+                print(f"[server] ⚠ 收尾残留轮次 #{f['id']} → {f['status']} "
+                      f"(上一轮服务中途夭折, 没跑完)")
+
+        # ③ §9.3 板子重启的**死因**只留在「上一次启动」的日志里 —— 那一轮
+        #    测试的日志跟死因一起没了, 报告上只剩一句「中途夭折」。
+        #    这一步要去**读系统日志**, 所以得现场授权: config.yaml 里
+        #    `report.capture_boot_evidence: true` 才开(默认关)。
+        #    用**刚才取的那一份**, 不再捞第二次(捞两次内容可能不一样,
+        #    而且白白多跑一次 journalctl)。
+        if evidence_text:
+            _save_boot_evidence(fixed, evidence_text)
+        elif stuck and boot_evidence.capture_enabled():
+            print("[server] ⚠ 捞不到上一次启动的日志(板子上没有持久化的 journal?)"
+                  " —— 死因得自己上板子看: " + boot_evidence.evidence_hint())
+    except Exception as e:
+        print(f"[server] ⚠ 收尾残留轮次失败: {e!r}")
     asyncio.create_task(_idle_watchdog())
+
+
+async def _clock_anchor_saver():
+    """每分钟把「最近一次见到的墙钟」写进锚点文件; 每 5 分钟再让**板子
+    自己**存一次时间 (§9.3.4)。
+
+    **为什么必须定期存锚点**: 板子的系统时钟在硬复位后会被退回「上次干净
+    关机」那一刻 —— 不留锚点, 下次开机就完全不知道现在该是几点。留了锚点,
+    最坏只丢「关机前一分钟」那点时间。
+
+    **为什么还要 `fake-hwclock save`(A1)**: 锚点是我们自己的兜底(产品侧),
+    `fake-hwclock` 是**板子自己的**那份 —— 板子自己记住了, 开机时钟就不
+    用退回 42 天前。两者一起上才稳。
+
+    写失败就等下一轮 —— 锚点只是保险, 写不进去绝不能把服务搞挂。
+    """
+    tick = 0
+    warned = False
+    while True:
+        try:
+            await asyncio.sleep(60)
+            clock.save_anchor()
+            tick += 1
+            if tick % 5 == 0:
+                ok = await clock.save_hwclock()
+                if ok is False and not warned:
+                    warned = True
+                    print("[server] ⚠ 没能让板子存时间(fake-hwclock save 失败)—— "
+                          "多半是 sudoers 没给这条命令免密。板子硬复位后开机, "
+                          "时钟会退回上次关机那一刻(§9.3.4)", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+
+def _save_boot_evidence(fixed: list, text: str) -> None:
+    """把**已经取好的**「上一次启动」日志存成旁挂文件, 供报告渲染。
+
+    只存**真的收尾了残留轮次**的那些轮次 —— 没有夭折就没有「上一次启动」
+    的死因可存。
+
+    父轮和重测轮**共用同一份**证据(同一次重启), 但各存一份 —— 导出
+    哪一轮的报告就取哪一份, 不用去猜死的那一轮到底是哪一轮。
+    """
+    ids = [f["id"] for f in (fixed or []) if f.get("id")]
+    if not ids or not text:
+        return
+    for rid in ids:
+        path = boot_evidence.save_evidence(rid, text)
+        if path:
+            print(f"[server] 已存上一次启动的日志: {path}")
 
 
 # ==================== 静态资源 ====================
@@ -73,25 +244,38 @@ async def health():
         # sudo -n。sudo_available=false 时 UI 顶部红色 banner 阻断测试。
         "sudo_available": sudo_available(),
         "is_root": _os.geteuid() == 0,
+        # §9.3.4 时钟状态 —— 产线上看一眼就知道「这台板子的时间靠不靠谱」
+        "clock": clock.status(),
     }
+
+
+#: 探针用的参数 —— `--version` 不是所有工具都认(glmark2 认 `--help`)。
+_PROBE_ARGS = {
+    "fio": ["--version"],
+    "glmark2-es2": ["--help"],
+    "glmark2-es2-wayland": ["--help"],
+}
 
 
 @app.get("/api/deps/check")
 async def deps_check():
-    """检查系统工具是否齐全 (供 UI 在点开始前 preflight)"""
-    import shutil as _shutil
-    # 搜索多个路径 (普通用户 PATH 可能不含 /sbin /usr/sbin)
-    SEARCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    def _which(cmd: str) -> str:
-        p = _shutil.which(cmd)
-        if p:
-            return p
-        for d in SEARCH_PATH.split(":"):
-            import os
-            full = os.path.join(d, cmd)
-            if os.path.isfile(full) and os.access(full, os.X_OK):
-                return full
-        return ""
+    """检查系统工具是否齐全 (供 UI 在点开始前 preflight)
+
+    ⚠️ **必须用测试项同一套找工具的逻辑**(`find_tool`) ——
+    2026-11-06 踩过: 这里原来自己写了一套 `_which()`, **只看系统 PATH** ⇒
+    U 盘版里 fio / glmark2-es2 是**盘上**的(`tools/bin/fio`, 由
+    `scripts/build_usb_image.sh` 生成的 wrapper), 系统 PATH 里压根没有 ⇒
+    配置页一律报「缺失 fio」, 而测试项跑的时候用的是 `find_tool` ⇒ 找得到
+    ⇒ **「配置页说缺、实际不缺」的假警报**。
+
+    ⚠️ **「找到了」≠「起得来」** —— 盘上那份 fio 靠 LD_LIBRARY_PATH 找盘里的
+    .so; 依赖没带齐时它是 rc=127(`error while loading shared libraries`)。
+    所以对**盘上**的工具额外真跑一次探针: 起不来就在这里报出来, 而不是等
+    存储项跑到一半才 error(2026-11-06 那轮 0058 的 eMMC 项就是这么 error
+    的 —— fio 缺 `libceph-common.so.2`)。
+    设备版(deb 装)不走探针 —— apt 装的依赖是自洽的, 没必要多起进程。
+    """
+    from .tests._tools import find_tool, tool_dir
 
     # §11.7 打包必装清单 —— 缺任一即打包缺陷, 拒绝出货
     # §6.6 改版已删除 iperf3 测速, 网口只测 链路+DHCP+出网, 故不再列入
@@ -110,29 +294,90 @@ async def deps_check():
         "lsblk": "块设备枚举 (util-linux)",
         "xrandr": "HDMI 读当前实际输出 (x11-xserver-utils)",
     }
-    items = []
-    for cmd, label in REQUIRED.items():
-        path = _which(cmd)
-        items.append({
-            "name": cmd,
-            "label": label,
-            "ok": path != "",
-            "path": path,
-        })
-    all_ok = all(x["ok"] for x in items)
     CRITICAL_BINS = (
         "stress-ng", "glmark2-es2", "fio", "memtester", "ethtool",
         "ping", "udhcpc", "iw", "rfkill", "xrandr",
     )
+
+    tdir = tool_dir()
+    usb_mode = bool(tdir)
+
+    async def _probe(path: str, name: str) -> str:
+        """真跑一次工具 —— 返回空串 = 起得来; 否则返回起不来的原因。
+
+        ⚠️ 只用来抓「动态链接失败」这一类(rc=127 / 加载共享库报错),
+        别的失败(比如 `--help` 退出码非 0)一律当作「起得来」。
+        """
+        argv = [path] + _PROBE_ARGS.get(name, ["--version"])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            return ""      # 探针自己起不来 ≠ 工具坏了
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return ""      # 超时不算「起不来」(有些工具 --version 会等)
+        except Exception:
+            return ""
+        text = (err or b"").decode("utf-8", "replace")
+        rc = proc.returncode
+        if rc == 127 or "error while loading shared libraries" in text:
+            last = [ln for ln in text.strip().splitlines() if ln.strip()]
+            return last[-1].strip() if last else f"rc={rc}"
+        return ""
+
+    items = []
+    for cmd, label in REQUIRED.items():
+        path = find_tool(cmd)
+        on_stick = bool(tdir and path and str(path).startswith(str(tdir)))
+        item = {
+            "name": cmd,
+            "label": label,
+            "ok": bool(path),
+            "path": path or "",
+            # 这个工具是从哪儿来的: "stick"=U 盘上那份, "system"=板子出厂那份
+            "source": ("stick" if on_stick else "system") if path else "",
+        }
+        if path and on_stick:
+            reason = await _probe(path, cmd)
+            if reason:
+                item["ok"] = False
+                item["broken"] = True
+                item["broken_reason"] = reason
+        items.append(item)
+
+    all_ok = all(x["ok"] for x in items)
     critical_missing = [
         x["name"] for x in items
-        if not x["ok"] and x["name"] in CRITICAL_BINS
+        if not x["ok"] and x["name"] in CRITICAL_BINS and not x.get("broken")
+    ]
+    critical_broken = [
+        x["name"] for x in items
+        if not x["ok"] and x["name"] in CRITICAL_BINS and x.get("broken")
     ]
     return {
         "all_ok": all_ok,
         "critical_missing": critical_missing,
+        "critical_broken": critical_broken,
         "items": sorted(items, key=lambda x: (x["ok"], x["name"])),
-        "fix_command": "sudo bash scripts/install_deps.sh",
+        "mode": "usb" if usb_mode else "device",
+        # 设备版: 给命令; U 盘版: **别**再让工人去 apt 装(装到板子上,
+        # 拔盘就走, 白装) ⇒ 给一句人话。
+        "fix_command": "" if usb_mode else "sudo bash scripts/install_deps.sh",
+        "fix_hint": (
+            "U 盘版: 盘上自带 fio / glmark2-es2, 其余工具用板子出厂那份 ⇒ "
+            "缺工具或工具起不来, 说明这版出厂镜像没带齐, 请改用设备版(deb)安装。"
+            if usb_mode else ""
+        ),
     }
 
 
@@ -193,7 +438,14 @@ async def test_start(req: StartRequest):
 
 @app.post("/api/test/stop")
 async def test_stop():
+    """「停止」: 中止**整轮** —— 当前项和后面所有项都记「跳过」, 直接跳结果页。"""
     return await runner.stop()
+
+
+@app.post("/api/test/next")
+async def test_next():
+    """「下一项」: 只中止**当前这一项**(记「跳过」), 接着测下一项。"""
+    return await runner.skip_current()
 
 
 @app.get("/api/test/status")
@@ -220,8 +472,10 @@ async def test_operator(req: OperatorAnswer):
 # ==================== 关闭服务 (UI 按钮) ====================
 # 工人 / 非专业用户不会敲 `bash start.sh stop` —— 界面上必须有个能关服务的
 # 按钮, 否则服务会一直留着占住 8000 端口, 下次点桌面图标就打不开。
-_PID_FILE = PROJECT_ROOT / "logs" / "server.pid"
-_LOG_FILE = PROJECT_ROOT / "logs" / "server.log"
+#: PID / 日志 —— 落**数据根**下 (打包后 /var/lib/aging-test/logs/)。
+#: 服务是普通用户起的, 代码根(root 所有)写不进去。
+_PID_FILE = Config.data_root() / "logs" / "server.pid"
+_LOG_FILE = Config.data_root() / "logs" / "server.log"
 
 
 @app.post("/api/shutdown")
@@ -472,7 +726,17 @@ async def history_reexport_pdf(run_id: int):
     except report.ReportError as e:
         raise HTTPException(500, f"导出失败: {e}")
     await db.Database.set_pdf_path(run_id, path)
-    return {"ok": True, "path": path}
+    # §8.2.3 手动补导的**也**要同步到 U 盘 —— 自动导出失败(缺 chromium /
+    # 当时磁盘满)时, 工人装完依赖在这轮上补导, 报告同样该落到 U 盘上。
+    # 同一轮重导是同一份报告的另一个版本 ⇒ INDEX.csv 里那按「SN+开始时间」
+    # **替换**掉, 不会多出一行。
+    usb_info = {"ok": False, "path": "", "message": ""}
+    try:
+        res = await usb_export.export_report_to_usb(path, data)
+        usb_info = {"ok": res.ok, "path": res.directory, "message": res.message}
+    except Exception as e:
+        usb_info = {"ok": False, "path": "", "message": f"存 U 盘失败: {e!r}"}
+    return {"ok": True, "path": path, "usb": usb_info}
 
 
 # ==================== WebSocket ====================
@@ -481,37 +745,84 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     _touch(connected=True)   # 空闲自退的「有人在线」起点
     q = runner.subscribe()
-    # 先发一帧当前快照
-    await ws.send_json({"type": "snapshot", **runner.snapshot()})
     try:
-        while True:
-            # 同时检查 client 发来的消息 (心跳 ping / 停止)
-            send_task = asyncio.create_task(_drain_queue(ws, q))
-            recv_task = asyncio.create_task(ws.receive_text())
-            done, pending = await asyncio.wait(
-                [send_task, recv_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            for t in pending:
-                t.cancel()
-
-            if recv_task in done:
-                try:
-                    msg = json.loads(recv_task.result())
+        # 先发一帧当前快照
+        await ws.send_json({"type": "snapshot", **runner.snapshot()})
+        # ── 一个**常驻**的发送任务 ──
+        #
+        # ⚠️⚠️ **为什么不能每轮循环新建一个**: 上一轮那个发送任务在
+        # `send_json()` 写到一半时被 cancel 掉, **已经从队列里取出来的那条
+        # 事件就丢了** ⇒ 页面上偶尔少一条日志/一次进度。
+        # 固定一个常驻任务, 页面断了再一起收。
+        send_task = asyncio.create_task(_drain_queue(ws, q))
+        try:
+            while True:
+                # 同时检查 client 发来的消息 (心跳 ping / 停止)
+                recv_task = asyncio.create_task(ws.receive_text())
+                done, _pending = await asyncio.wait(
+                    [send_task, recv_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                if recv_task in done:
+                    # ⚠️⚠️⚠️ **页面断了, 这里必须让异常出去** ——
+                    #
+                    # 页面一断, `ws.receive_text()` 立刻抛
+                    # `WebSocketDisconnect`(starlette); 再下一轮它抛
+                    # `RuntimeError`("disconnect 之后再 receive")。
+                    # **两个都绝不能咽掉** —— 一旦咽掉, 这个 while 每一圈都
+                    # 「秒完」⇒ **空转** ⇒ 一个 handler 吃满一整核
+                    # (2026-11-02 实测: uvicorn 进程 99% CPU,
+                    #  `/proc/<pid>/syscall` 一直是 `running`),
+                    # 而且下面的 `finally: runner.unsubscribe(q)`
+                    # **永远也走不到** —— 订阅队列跟着一起漏,
+                    # 每断一次连接就多一个吃核的空转 handler。
+                    #
+                    # ⇒ 这就是「终端好好的, 一进应用就不行」的差别:
+                    #    终端没有服务在吃核; 应用已经占住 1~2 个核,
+                    #    CPU 项再加压时**整板满载** ⇒ 电流台阶 ⇒ 板子被拉死。
+                    raw = recv_task.result()
+                    try:
+                        msg = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue        # 页面发来一帧看不懂的 ⇒ 忽略, 别断连接
                     # 收到什么帧都算「页面还活着」, ping 只是为了在没有别的
                     # 消息流的时候 (比如盯着总结页发呆) 维持心跳。
                     _touch()
-                    if msg.get("type") == "stop":
-                        await runner.stop()
-                except Exception:
-                    pass
-            else:
-                # send_task 完成,继续循环
-                pass
+                    if isinstance(msg, dict) and msg.get("type") == "stop":
+                        try:
+                            await runner.stop()
+                        except Exception:
+                            pass
+                else:
+                    # 发送任务先结束 ⇒ 页面已经没了(推不出去)⇒ 收工。
+                    recv_task.cancel()
+                    await _quiet(recv_task)
+                    break
+        finally:
+            send_task.cancel()
+            await _quiet(send_task)
     except WebSocketDisconnect:
+        pass
+    except Exception:
+        # 页面断开时 starlette 抛的别的花样(RuntimeError / ClientDisconnected…)
+        # 一律当成「页面没了」—— **关键是别咽了还继续转圈**。
         pass
     finally:
         runner.unsubscribe(q)
+
+
+async def _quiet(task):
+    """把一个任务收干净: 取消它, 并等它真的结束。
+
+    **为什么**: 取消掉但不等它 ⇒ asyncio 会打印
+    「Task was destroyed but it is pending!」, 日志里全是这种噪音,
+    真正有用的报错反而被淹掉。
+    """
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 async def _drain_queue(ws: WebSocket, q: asyncio.Queue):

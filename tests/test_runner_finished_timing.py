@@ -174,10 +174,52 @@ async def case3():
           "带上了这一轮的起点", fin[0].get("started_at"))
 
 
+async def case4():
+    print("\n【4】外层护栏兜住的那种异常, 它广播的那条也得带 started_at")
+    """这一条是 2026-11-04 补上的**覆盖漏洞**。
+
+    【2】那个「会炸的项」是在 `_run_one` 里面炸的 ⇒ 被**逐项的** try 接住
+    ⇒ 走的是正常收尾那条广播。**外层护栏**(`_run_tests` 那个 except)
+    走的是**另一条**广播 —— 它接的是「`_run_tests_body` 里没接住的异常」
+    (最常见的是写库失败: 某项的 metrics 里混进一个 json 序列化不了的对象,
+    它发生在逐项 try 之外)。
+
+    以前**没人测过护栏那条** ⇒ 护栏把 started_at 删掉, 上面三条用例照样全绿
+    (实测: 删掉之后变异脚本报「测试还是绿的! 这个变异没被守住」)。
+    而护栏恰恰是**最该带上起点**的那条 —— 它是「无论如何都会发出 run_finished」
+    的最后一道保险, 前端拿到它就算没有 run_started 也能配上起点。
+    """
+    rn = R.TestRunner()
+    q = rn.subscribe()
+    rn.run_id = 1
+    rn.started_at = 4000.0
+
+    async def boom(*a, **kw):
+        raise RuntimeError("写库炸了(逐项的 try 接不住的那种)")
+
+    rn._run_tests_body = boom
+    await rn._run_tests([("fake", FakeTest)],
+                        {"tests": {}, "project_root": ""},
+                        write_to_parent=False)
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    fin = [e for e in events if e.get("type") == "run_finished"]
+    check(len(fin) == 1, "收到 1 条 run_finished", len(fin))
+    if not fin:
+        return
+    check(fin[0].get("started_at") == 4000.0,
+          "护栏那条也带上了这一轮的起点", fin[0].get("started_at"))
+    check("finished_at" in fin[0], "护栏那条也带结束时间", sorted(fin[0].keys()))
+    check(fin[0].get("finished_at", 0) >= 4000.0,
+          "结束时间不早于起点", fin[0].get("finished_at"))
+
+
 async def main():
     await case1()
     await case2()
     await case3()
+    await case4()
     print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))
     for f in FAILS:
         print("  - " + f)

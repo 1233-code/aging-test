@@ -20,6 +20,7 @@
 """
 import asyncio
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -190,7 +191,7 @@ async def case1():
     check(len(set(pcts)) >= 40, "进度真的在动 (不同取值 >= 40 个)",
           len(set(pcts)))
     check(pcts[0] == 0, "开头是 0%", pcts[0])
-    check("第 1/1 轮" in msgs, "文案写着第几轮", msgs[:3])
+    check(any("第 1/1 轮" in m for m in msgs), "文案写着第几轮", msgs[:3])
     # 本轮**真跑完之前**不许显示 100% —— 提前显示"完成"是骗人 (§9.3)
     first_done = next((i for i, m in enumerate(msgs) if "轮完成" in m), None)
     check(first_done is not None, "有轮次完成刻度", msgs[-3:])
@@ -220,9 +221,10 @@ async def case2():
     if i50 >= 0:
         check(max(pcts[:i50]) <= 49, "第 1 轮跑完前不许越过 50%",
               max(pcts[:i50]))
-        check("第 2/2 轮" in msgs[i50:], "50% 之后进入第 2 轮", msgs[i50:i50 + 3])
-    check("第 1/2 轮完成" in msgs, "第 1 轮有完成刻度")
-    check("第 2/2 轮完成" in msgs, "第 2 轮有完成刻度")
+        check(any("第 2/2 轮" in m for m in msgs[i50:]),
+              "50% 之后进入第 2 轮", msgs[i50:i50 + 3])
+    check(any("第 1/2 轮完成" in m for m in msgs), "第 1 轮有完成刻度")
+    check(any("第 2/2 轮完成" in m for m in msgs), "第 2 轮有完成刻度")
     check(len(set(pcts)) >= 60, "两轮下来进度一直在动", len(set(pcts)))
 
 
@@ -294,6 +296,73 @@ async def case5():
     check("轮完成" not in " ".join(msgs), "失败时没有「轮完成」的刻度", msgs)
 
 
+# 进度文案里的「已用 Ns / 预计 Ns」
+_TIME_RE = re.compile(r"已用\s*([\d.]+)s\s*/\s*预计\s*([\d.]+)s")
+
+
+async def case6():
+    print("\n【6】文案里必须带时间, 而且时间跟条上的百分比对得上")
+    # 产线原话(2026-11-06): 「内存测试的进度条不对, 没按照实际的进度百分比
+    # 和显示时间」⇒ 两件事:
+    #   ① **时间要显示出来** —— 以前这项的文案只有一句「第 1/1 轮」,
+    #      光秃秃一个百分比, 工人手里没有第二个数可以对;
+    #   ② **百分比和时间要是同一个比例** —— 「已用 30s / 预计 60s」⇒ 条
+    #      就该在 50%, 工人一比就知道条没骗人。
+    # 别的项(eMMC / CPU / GPU / USB / 风扇)文案里早就是带时间的, 只有内存
+    # 这一项不是 ⇒ 这就是「跟别的不一样」的地方。
+    #
+    # ⚠️ 时间必须是**整项**的尺度, 不能是本轮的: 本轮走完是 100%, 而条
+    #    才走了 1/times ⇒ 两个数对不上, 工人照样会怀疑条坏了。
+    clock = FakeClock()
+    patch(clock, [10])                      # 一轮 60s
+    ctx = FakeCtx({"times": 1, "size_mb": 1024, "timeout_sec": 60})
+    await mem.MemoryTest().run(ctx)
+    prog = ctx.progress
+    msgs = [m for _, m in prog]
+
+    # ① 开场就把整项的预计报出来; 其余每一条都带「已用 / 预计」
+    check("预计" in msgs[0], "开场就报整项的预计时长", msgs[0])
+    no_time = [m for m in msgs[1:-1] if not _TIME_RE.search(m)]
+    check(not no_time, "每一条进度文案都带「已用 Ns / 预计 Ns」", no_time[:3])
+    check("共" in msgs[-1] and "s" in msgs[-1], "收尾报这一项一共花了多久", msgs[-1])
+
+    # ② 时间换算出来的百分比 == 条上的百分比 (整数截断, 允许差 1)
+    bad = []
+    for pct, msg in prog:
+        mo = _TIME_RE.search(msg)
+        if not mo:
+            continue
+        used, total = float(mo.group(1)), float(mo.group(2))
+        if total <= 0:
+            bad.append((pct, msg, "预计是 0"))
+            continue
+        ratio = int(used / total * 100)
+        if abs(ratio - pct) > 1:
+            bad.append((pct, msg, f"按时间是 {ratio}%"))
+    check(not bad, "文案里的时间换算出来的百分比 == 条上的百分比", bad[:3])
+
+    # ③ 遍数 > 1 也一样对得上 (用整项的尺度, 不是本轮的)
+    restore()                      # 先还原, 别让第二次 patch 把假的当原版存起来
+    clock2 = FakeClock()
+    patch(clock2, [10, 10])                 # 两轮, 每轮 60s
+    ctx2 = FakeCtx({"times": 2, "size_mb": 1024, "timeout_sec": 60})
+    await mem.MemoryTest().run(ctx2)
+    bad2 = []
+    for pct, msg in ctx2.progress:
+        mo = _TIME_RE.search(msg)
+        if not mo:
+            continue
+        used, total = float(mo.group(1)), float(mo.group(2))
+        ratio = int(used / total * 100)
+        if abs(ratio - pct) > 1:
+            bad2.append((pct, msg, f"按时间是 {ratio}%"))
+    check(not bad2, "times=2 也对得上(整项的尺度, 不是本轮的)", bad2[:3])
+    # 第 1 轮走完时: 条在 50%, 文案也该是「已用 60s / 预计 120s」
+    half = [m for p, m in ctx2.progress if p == 50]
+    check(any("60s" in m and "120s" in m for m in half),
+          "第 1 轮走完: 条在 50%, 文案是「已用 60s / 预计 120s」", half[:2])
+
+
 async def main():
     try:
         await case1()
@@ -301,6 +370,7 @@ async def main():
         await case3()
         await case4()
         await case5()
+        await case6()
     finally:
         restore()
     print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))

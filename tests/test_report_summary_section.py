@@ -72,6 +72,16 @@ def summary_section(html: str) -> str:
     return html[i:j if j > 0 else len(html)]
 
 
+def not_tested_table(html: str) -> str:
+    """只截「未测项明细」那张表的 tbody —— 用来数行数。"""
+    i = html.find("未测项明细")
+    if i < 0:
+        return ""
+    j = html.find("<tbody>", i)
+    k = html.find("</tbody>", j)
+    return html[j:k] if j > 0 and k > 0 else ""
+
+
 def case1():
     print("【1】汇总表要把 已测 / 未测 / 未跑到 / 共勾选 分清楚")
     run = make_run(summary={"total": 2, "passed": 1, "failed": 1, "error": 0,
@@ -187,6 +197,83 @@ def case6():
     check("已测 3 项" in sec, "按可推的口径补出了勾选数", sec[:500])
 
 
+def case7():
+    print("\n【7】被重测过的轮次: 不印「系统级错误」框(免得跟结论自相矛盾)")
+    # 「服务重启, 这一轮中途夭折」那句话说的是**收尾那一刻**这一轮没跑完。
+    # 一旦这一轮被**重测过**, 它的结论已经重新判过了(没测成的项补测过了),
+    # 那句话就过期了 —— 硬印出来的话, 报告头写「✅ 全部通过」、底下挂着
+    # 一个「系统级错误」框, **同一页纸上自相矛盾**, 归档的人不知道该信哪个。
+    err = "服务重启, 这一轮中途夭折(没跑完) —— 不代表被测设备不合格"
+    results = [{"test_name": "cpu", "status": "passed", "duration_sec": 1.0,
+                "metrics": {}, "error": None, "log": "x"}]
+
+    run = make_run(status="stopped", error=err,
+                   summary={"total": 1, "passed": 1, "failed": 0, "error": 0,
+                            "skipped": 0, "not_run": 1, "planned": 2})
+    html = render(run, results)
+    check("系统级错误" in html,
+          "没被重测过的轮次照样印「系统级错误」(那是这一轮真出过的事)",
+          html[:200])
+
+    run2 = make_run(status="passed", error=err, retest_count=1,
+                    summary={"total": 1, "passed": 1, "failed": 0, "error": 0,
+                             "skipped": 0, "not_run": 0, "planned": 1})
+    html2 = render(run2, results)
+    check("系统级错误" not in html2,
+          "被重测过的轮次**不印**「系统级错误」框(结论已经重新判过了)",
+          html2[:400])
+    check("本报告含 1 轮重测" in html2,
+          "但「本报告含 N 轮重测」那行还在(这一轮被重测过这件事没丢)",
+          html2[:400])
+
+
+def case8():
+    print("\n【8】勾了但连行都没留下的项 → 也要点名进「未测项明细」")
+    #
+    # 2026-10-29 新板那轮: 板子跑崩重启, CPU 压力**压根没开始** ——
+    # results 表里**一行都没有**(连 running 那行都没写下来)。汇总段是
+    # 按算术印的「未跑到 1」, 但明细表**空的** —— 读者只看到一个数字,
+    # 查不出**是哪一项**没跑。纸面上看着像「这轮全测了」。
+    run = make_run(status="stopped",
+                   config={"tests": {"cpu": {"enabled": True, "duration_sec": 60},
+                                     "gpu": {"enabled": True}}},
+                   summary={"total": 1, "passed": 1, "failed": 0, "error": 0,
+                            "skipped": 0, "not_run": 1, "planned": 2})
+    results = [
+        {"test_name": "cpu", "status": "passed", "duration_sec": 1.0,
+         "metrics": {}, "error": None, "log": "x"},
+    ]
+    html = render(run, results)
+    sec = summary_section(html)
+    tbl = not_tested_table(html)
+    check("GPU" in tbl, "明细里点名了没跑到的 GPU", tbl[:600])
+    check("st-stopped" in tbl, "状态色块是 stopped", tbl[:600])
+    check("还没开始" in tbl, "写清了「连记录都没留下」", tbl[:600])
+    check(tbl.count("<tr>") == 1,
+          "明细表就 1 行 —— 跟汇总段「未测 0 + 未跑到 1」对得上",
+          tbl.count("<tr>"))
+    # 已经跑过的项不该被重复列进未测明细
+    check("CPU 压力" not in tbl, "跑过的 CPU 压力没被重复列进未测明细", tbl[:600])
+
+
+def case9():
+    print("\n【9】没勾的项不许出现在未测明细里 (不是没跑, 是没选)")
+    run = make_run(status="stopped",
+                   config={"tests": {"cpu": {"enabled": True},
+                                     "gpu": {"enabled": False},
+                                     "wifi": {"enabled": False}}},
+                   summary={"total": 1, "passed": 1, "failed": 0, "error": 0,
+                            "skipped": 0, "not_run": 0, "planned": 1})
+    results = [
+        {"test_name": "cpu", "status": "passed", "duration_sec": 1.0,
+         "metrics": {}, "error": None, "log": "x"},
+    ]
+    html = render(run, results)
+    tbl = not_tested_table(html)
+    check("WiFi" not in tbl and "GPU" not in tbl,
+          "没勾的项不在未测明细里", tbl[:600])
+
+
 def main():
     case1()
     case2()
@@ -194,6 +281,9 @@ def main():
     case4()
     case5()
     case6()
+    case7()
+    case8()
+    case9()
     print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))
     return 0 if not FAILS else 1
 

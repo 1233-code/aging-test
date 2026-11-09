@@ -44,6 +44,8 @@ import jinja2
 
 from .config import Config
 from .tests._tools import find_tool
+from . import boot_evidence as boot_evidence_mod
+from . import clock
 
 PROJECT_ROOT = Config.project_root()
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
@@ -54,6 +56,29 @@ _CHROMIUM_NAMES = ("chromium-browser", "chromium", "chromium-browser-chromium",
 
 #: 单轮导出超时。chromium 冷启动约 1~2s, 给 90s 足够, 又不至于卡死收尾流程。
 EXPORT_TIMEOUT_SEC = 90
+
+#: 轮级状态 → **中文结论**。
+#:
+#: 为什么在 Python 侧而不是写在模板里: 同一张表要出现在**两个地方** ——
+#: 报告 PDF 的「整体结论」那一行, 和 U 盘上 `INDEX.csv` 的「整体状态」那一列
+#: (§8.2.3)。两处各写一份, 改了一处忘了另一处 ⇒ 纸上写的和索引里写的
+#: 对不上, 工人对着看会以为有一份是错的。
+#:
+#: 光印一个英文状态词没用 —— 质检/返修的人未必知道 "skipped" 是什么意思,
+#: 尤其 "skipped" 跟 "failed" 在他们眼里都像"没通过"。所以给一句中文结论,
+#: 明确这轮能不能放行。
+STATUS_CONCLUSION = {
+    "passed": "✅ 已测项目全部通过",
+    "failed": "❌ 存在失败/错误项 —— 不合格, 需返修",
+    "error": "⚠ 本轮异常终止 —— 结果不作数, 需重跑",
+    "skipped": "⏭ 本次未实际执行任何测试项 —— 不构成合格判定",
+    "stopped": "🛑 用户中途停止 —— 已完成的项按自身判定, 未跑的不算数",
+}
+
+
+def status_conclusion(status: str) -> str:
+    """轮级状态的中文结论(认不出来就把原状态词原样返回)。"""
+    return STATUS_CONCLUSION.get(status, status or "")
 
 
 class ReportError(RuntimeError):
@@ -134,6 +159,15 @@ def _fmt_time(ts) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
     except (TypeError, ValueError):
         return "—"
+
+
+def fmt_time(ts) -> str:
+    """时间戳 → 'YYYY-mm-dd HH:MM:SS'。
+
+    公开出口 —— 报告之外的地方也要印同一个时间格式(比如 U 盘上那份
+    `INDEX.csv` 的「起止时间」列), 各写各的迟早对不上。
+    """
+    return _fmt_time(ts)
 
 
 def _round_half_up(x: float, nd: int = 1) -> float:
@@ -233,13 +267,29 @@ def _metric_views(metrics: dict) -> list:
 
 
 def render_html(run: dict, results: list, filename: str = "",
-                retest_runs: list = None) -> str:
+                retest_runs: list = None, boot_evidence: str = "",
+                cpu_evidence: str = "", clock_skew: str = None) -> str:
     """把一条 run + 它的逐项结果渲染成完整 HTML。
 
     `retest_runs` 是**重测轮**列表(§7.7), 由 `Database.get_retest_runs()` 给 ——
     里面的日志渲染成「重测日志附录」, 单独一节, 排在「日志附录」**后面**;
     前面的「日志附录」是首测原始日志, 一个字都不动。
+
+    `boot_evidence` 是**上一轮的内核日志尾巴**(板子为什么死), 由
+    `boot_evidence.read_evidence(run_id)` 给 —— 空串就不渲染那一节。
+    **捞不到就不画**: 编一段「疑似原因」比没有更糟(会把排查方向带偏)。
+
+    `cpu_evidence` 是**加压过程中的逐秒现场记录**(温度/负载/线程数), 由
+    `boot_evidence.read_cpu_evidence(run_id)` 给 —— 空串就不渲染那一节。
+    它跟 `boot_evidence` 是两回事: 前者是**内核视角**(板子死时内核说了什么),
+    后者是**我们自己的视角**(加压到哪一秒、几线程、多少度、负载多少)。
+
+    `clock_skew` 是 §9.3.4 的**时钟旁挂文件** —— 这一轮的时间戳是不是
+    「推算值」(板子硬复位过, 系统时钟被退回了上次干净关机那一刻)。
+    默认 None = 自己按 run_id 去读; 空串 = 明确表示「这一轮没有」(测试用)。
     """
+    if clock_skew is None:
+        clock_skew = clock.read_run_skew(run.get("id"))
     from .tests.registry import get_all_tests
     names = {t["name"]: t["display_name"] for t in get_all_tests()}
 
@@ -270,6 +320,7 @@ def render_html(run: dict, results: list, filename: str = "",
     for r in results:
         cases.append({
             "display_name": names.get(r.get("test_name"), r.get("test_name") or "?"),
+            "name": r.get("test_name") or "",
             "status": r.get("status") or "pending",
             "duration": _fmt_dur(r.get("duration_sec")),
             "metrics": _metric_views(r.get("metrics") or {}),
@@ -279,6 +330,83 @@ def render_html(run: dict, results: list, filename: str = "",
             # 这一项另有一轮重测的日志(在「重测日志附录」那一节里)。
             "retested": r.get("test_name") in retested_names,
         })
+    # ── §9.3「板子死在哪一项」 ──
+    #
+    # 服务(板子)重启时, **正在跑的那一项**在 results 表里留下的是
+    # `stopped` + 「服务重启, 本项没跑完」(db.finalize_interrupted_run
+    # 写的)。从这一行就能知道板子死在哪一项 —— **只读**, 不改任何历史。
+    #
+    # 为什么值得单独点出来: 2026-10-30 新板连着两次死在**同一个地方**,
+    # 但报告上从头到尾只写着「服务重启, 本项没跑完」 —— 读者要自己翻
+    # 逐项明细才能对上是 CPU 那一项。**写在死因那一节旁边**, 才看得出
+    # 「死在同一项上」。
+    died_in_item = ""
+    died_in_item_key = ""
+    died_hard_reset = False
+    for r in results:
+        err = r.get("error") or ""
+        if err.startswith(boot_evidence_mod.SOFT_ITEM_ERROR) or \
+                err.startswith(boot_evidence_mod.HARD_RESET_ITEM_ERROR):
+            died_in_item = names.get(r.get("test_name"),
+                                     r.get("test_name") or "?")
+            died_in_item_key = r.get("test_name") or ""
+            died_hard_reset = err.startswith(
+                boot_evidence_mod.HARD_RESET_ITEM_ERROR)
+            break
+
+    # ── 「板子死在哪一级加压」: 一句结论 ──
+    #
+    # 现场记录是**一屏原始数据**(200ms 一行) —— 读者得自己翻到最后一行、
+    # 看线程数、看温度、再回头找「起跑 第 N/M 片」那几行才能拼出结论。
+    # 这里直接给结论: 死在第几级、起手后几秒、当时多热/多少频率。
+    #
+    # ⚠️ **只在「板子确实死在 CPU 这一项上」时才给** —— 跑完了也有这个文件
+    # (那时最后一行是「跑完了」而不是「死了」), 硬套一句「板子死在第 N 片」
+    # 就是**编造**。
+    #
+    # ⚠️ **现场记录可能整个读不出来**(它是板子死的那一刻写的, 尾巴随时可能
+    # 只写了一半; 2026-11-02 实测: 新板死在 2 线程那片, 那一节整个不见了)
+    # ⇒ **兜底**: 从**上一次启动的日志**里读 `stress-ng --cpu N` 的命令行 ——
+    # 那是 sudo 记的, 板子死后还在 ⇒ 至少能说出「死在几线程那一片」。
+    cpu_death_summary = ""
+    if died_in_item_key == "cpu" and died_hard_reset:
+        cpu_death_summary = boot_evidence_mod.summarize_cpu_death(cpu_evidence)
+        if not cpu_death_summary:
+            cpu_death_summary = (
+                boot_evidence_mod.summarize_cpu_death_from_journal(
+                    boot_evidence or ""))
+
+    # ── 「现场记录文件在, 却是空的」: **说清楚**, 别静悄悄地不画 ──
+    #
+    # ⚠️ 2026-11-02 13:50 实测踩过的坑: 板子上 `cpu_evidence_run3.txt` 是
+    #    **0 字节**(文件建出来了, 一行数据都没落盘)⇒ 读出来是空串 ⇒ 报告
+    #    **分不清**「压根没有这份记录」和「有, 但被硬复位带走了」⇒ 什么
+    #    都不说 ⇒ 而这恰恰是最该有证据的一次。
+    #
+    # ⇒ 报告里**明写**这一节为什么是空的, 并指向「板子死在哪一级加压」
+    #   那节(它能从上一次启动的日志里读出结论)。
+    cpu_evidence_note = ""
+    if died_in_item_key == "cpu" and died_hard_reset:
+        state = boot_evidence_mod.cpu_evidence_state(run.get("id"))
+        if state == boot_evidence_mod.CPU_EVIDENCE_EMPTY:
+            cpu_evidence_note = (
+                "「加压现场记录」那个文件**存在, 但一个字节都没有** —— "
+                "板子被硬复位的时候, 还没写进存储的那几行**跟着内存一起没了**"
+                "(这一版之前只把数据交给内核缓存, 没强制刷进存储)。"
+                "⇒ **这一节没有现场数据**; "
+            )
+            if cpu_death_summary:
+                cpu_evidence_note += (
+                    "但板子死在第几片, 上一次启动的日志里还读得出来 "
+                    "⇒ 见上面「板子死在哪一级加压」。"
+                )
+            else:
+                cpu_evidence_note += (
+                    "而板子死在第几片**这次也没读出来**(上一次启动的日志里连 "
+                    "`stress-ng --cpu N` 都没有)⇒ 这一轮只能确定"
+                    "「板子死在 CPU 加压这一项上」, 死在几线程**不知道**。"
+                )
+
     # 「未测项」= skipped(用户主动跳/环境原因) + stopped(中途停止没跑到)。
     # §9.3 这两种都**没有实际执行**, 都不计入通过率, 都必须逐一列出让质检
     # 人工确认能不能放行 —— 只列 skipped 会漏掉"中途停止"那批, 纸面上
@@ -303,6 +431,14 @@ def render_html(run: dict, results: list, filename: str = "",
             body = "(本项被跳过, 未执行, 所以没有日志)"
         elif c["status"] == "stopped":
             body = "(本项未跑到 —— 中途停止, 未执行, 所以没有日志)"
+        elif died_hard_reset and c.get("name") == died_in_item_key:
+            # 板子在这一项上**硬复位** ⇒ 这一项的日志还**留在内存里**
+            # (日志是这一项跑完才落库的) ⇒ 跟着进程一起没了。
+            # 这不是「异常」, 是**板子把这一项打断了** —— 说清楚, 别让
+            # 读报告的人以为工具出了 bug。
+            body = ("(本项被板子硬复位打断 —— 这一项的日志还没来得及落库, "
+                    "跟着进程一起没了。死因看上面「板子为什么死」那两节: "
+                    "上一次启动的日志尾巴 + 加压现场记录。)")
         else:
             body = "(本项没有产生任何日志 —— 属异常: 跑过的项都该有日志)"
         m = r.get("metrics") or {}
@@ -370,6 +506,33 @@ def render_html(run: dict, results: list, filename: str = "",
             else ("(未记录配置快照)", "")
         ]
 
+    # ── 「勾了但连行都没有」的项, 也要进「未测项明细」 (§9.3) ──
+    #
+    # 为什么: 这类项在 results 表里**一行都没有** —— 服务(板子)重启前它
+    # 还没开始, 连 `running` 那行都没写下来。db 那边算 not_run 时是
+    # **算术补上去的**(`planned - 实际跑过的`), 所以汇总段会印「未跑到 1」;
+    # 但明细表里**没有这一行**, 读者只看到一个数字, 不知道**是哪一项**没跑。
+    #
+    # 2026-10-29 实测(新板子那轮): 板子跑崩重启, 报告上「未跑到 1」,
+    # 明细表却是**空的** —— CPU 压力压根没跑, 纸面上却查不到它。
+    #
+    # 补上之后: 明细表的行数 == 汇总段「未测 skipped + 未跑到 stopped」
+    # 两列之和(跳过 / 没跑到的项逐个点名, 谁没跑一眼看到)。
+    for tname, tv in test_cfgs.items():
+        if not isinstance(tv, dict) or not tv.get("enabled"):
+            continue
+        if tname in ran_names:
+            continue
+        not_tested_cases.append({
+            "display_name": names.get(tname, tname),
+            "status": "stopped",
+            "duration": _fmt_dur(None),
+            "metrics": {},
+            "error": "服务重启前这一项还没开始 —— 连记录都没留下",
+            "attempt": 1,
+            "retested": False,
+        })
+
     started, finished = run.get("started_at"), run.get("finished_at")
     # ⚠️ **判空要用 `is not None`, 不能用「是不是真的」** —— 原来写的是
     #    `if started and finished`, 结果 started_at 正好是 0.0 的时候
@@ -379,6 +542,34 @@ def render_html(run: dict, results: list, filename: str = "",
                      if started is not None and finished is not None else None)
     except (TypeError, ValueError):
         total_dur = None
+
+    # ── §7.8.6 重测轮的时间: 原时间**保留**, 重测的那三项**接在后面** ──
+    #
+    # 口径 (2026-10-28, 工人原话:「如果有重测的情况, 可以在报告的开始时间
+    # 结束时间和总耗时在**保留原先的数据的前提下**把重测的这三项时间填进去,
+    # 在原时间后面」):
+    #   · **父轮(首测)的时间一个字都不改** —— 那是「当初那一轮是什么时候
+    #     跑的」这个**事实**, 改了就等于篡改记录。
+    #   · 重测轮的「开始 / 结束 / 总耗时」**另起一行接在原值后面**, 每行
+    #     带「重测第 N 轮」的标签 —— 读者一眼分得清哪个是首测、哪个是返修。
+    #   · **不累加**。重测的时间不是"首测的补充", 是**另一轮**的独立时间;
+    #     把它加到首测上, 那个数就既不是首测的、也不是重测的, 谁都对不上
+    #     (跟 §7.8「每项之和 ≠ 总耗时」同一个道理)。
+    retest_times = []
+    for idx, mr in enumerate(retest_runs or [], 1):
+        ms, mf = mr.get("started_at"), mr.get("finished_at")
+        # 判空跟上面一样用 `is not None` —— 0.0 也是合法的起点。
+        try:
+            mdur = (float(mf) - float(ms)
+                    if ms is not None and mf is not None else None)
+        except (TypeError, ValueError):
+            mdur = None
+        retest_times.append({
+            "round": idx,
+            "started_at": _fmt_time(ms),
+            "finished_at": _fmt_time(mf),
+            "duration": _fmt_dur(mdur),
+        })
 
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(str(TEMPLATE_DIR)),
@@ -390,16 +581,33 @@ def render_html(run: dict, results: list, filename: str = "",
         title=_report_cfg().get("title", "工厂老化测试报告"),
         run=run,
         summary=summary,
+        # 轮级状态的中文结论 —— 唯一出处(报告 PDF 和 U 盘 INDEX.csv 共用)
+        status_conclusion=STATUS_CONCLUSION,
         cases=cases,
         not_tested_cases=not_tested_cases,
         config_items=config_items,
         full_log=full_log,
         retest_log=retest_log,
         has_retest_log=bool(retest_log),
+        boot_evidence=boot_evidence,
+        has_boot_evidence=bool(boot_evidence),
+        cpu_evidence=cpu_evidence,
+        has_cpu_evidence=bool(cpu_evidence),
+        cpu_evidence_note=cpu_evidence_note,
+        has_cpu_evidence_note=bool(cpu_evidence_note),
+        # §9.3.4 时钟推算值横幅 —— 纸面归档的人得知道这批时间戳不能当准点用
+        clock_skew=clock_skew,
+        has_clock_skew=bool(clock_skew),
+        died_in_item=died_in_item,
+        died_hard_reset=died_hard_reset,
+        cpu_death_summary=cpu_death_summary,
+        has_cpu_death_summary=bool(cpu_death_summary),
         started_at=_fmt_time(started),
         finished_at=_fmt_time(finished),
         total_duration=_fmt_dur(total_dur),
-        generated_at=_fmt_time(time.time()),
+        # §7.8.6 重测轮的那三项时间 —— 模板里接在原值**后面**。
+        retest_times=retest_times,
+        generated_at=_fmt_time(clock.now()),
         filename=filename or "(未导出)",
     )
 
@@ -409,16 +617,18 @@ def output_dir() -> Path:
     d = _report_cfg().get("output_dir") or "reports"
     p = Path(d)
     if not p.is_absolute():
-        p = PROJECT_ROOT / p
+        # 相对路径挂在**数据根**下 —— 打包后代码归 root, 报告写到代码根里
+        # 工人根本写不进去 (PDF 是产线天天要出的东西)。
+        p = Config.data_root() / p
     return p / "pdf"
 
 
 def _run_finished_ts(run: dict) -> float:
     """文件名时间戳优先用**结束**时间 —— 名字要对应报告真正成形的那一刻。"""
     try:
-        return float(run.get("finished_at") or time.time())
+        return float(run.get("finished_at") or clock.now())
     except (TypeError, ValueError):
-        return time.time()
+        return clock.now()
 
 
 async def _print_pdf(chromium: str, html_path: Path, pdf_path: Path) -> None:
@@ -466,16 +676,36 @@ async def _print_pdf(chromium: str, html_path: Path, pdf_path: Path) -> None:
     #   缺字形时 chromium 依然 rc=0 并输出合法 PDF。真判据在 verify_cjk()。
 
 
-async def export_pdf(run: dict, results: list, retest_runs: list = None) -> str:
+async def export_pdf(run: dict, results: list, retest_runs: list = None,
+                    boot_evidence: str = None,
+                    cpu_evidence: str = None,
+                    clock_skew: str = None) -> str:
     """导出一次 run 的 PDF, 返回最终文件路径。
 
     `retest_runs`: 可选, §7.7 重测轮列表 —— 它的日志会另起一节印在
     「日志附录」后面。传 None(默认)表示"这一轮没有重测", 报告里就不出现
     那一节。
 
+    `boot_evidence`: §9.3 板子重启的死因(上一次启动的内核日志尾巴)。
+    **默认 None = 自己按 run_id 去读旁挂文件** —— 自动导出、手动重导、
+    父轮合并重导三条路都拿得到同一份证据, 不会有一条路漏掉。
+    传空串 = 明确表示"这一轮没有证据"(测试用)。
+    **没有证据就不画那一节** —— 编一段「疑似原因」比没有更糟。
+
+    `cpu_evidence`: 加压现场的逐秒记录(温度/负载/线程数) —— 同样默认
+    自己按 run_id 去读旁挂文件。
+
+    `clock_skew`: §9.3.4 时钟推算值旁挂文件 —— 同样默认自己按 run_id 去读。
+
     任何一步失败都抛 `ReportError` —— **调用方负责降级**(§8.2: 结果已入库,
     PDF 失败不阻断, `pdf_path` 留空 + warning + UI 提示可手动重导)。
     """
+    if boot_evidence is None:
+        boot_evidence = boot_evidence_mod.read_evidence(run.get("id"))
+    if cpu_evidence is None:
+        cpu_evidence = boot_evidence_mod.read_cpu_evidence(run.get("id"))
+    if clock_skew is None:
+        clock_skew = clock.read_run_skew(run.get("id"))
     chromium = find_chromium()
     if not chromium:
         raise ReportError(
@@ -494,12 +724,15 @@ async def export_pdf(run: dict, results: list, retest_runs: list = None) -> str:
 
     # 临时名带点开头 + .pdf 后缀(chromium 靠后缀认格式): 半成品藏起来, 不会
     # 被归档脚本当成正式报告捡走。验过 CJK 才 replace 成正式名。
-    staging = out_dir / f".staging-{os.getpid()}-{int(time.time())}.pdf"
+    staging = out_dir / f".staging-{os.getpid()}-{int(clock.now())}.pdf"
     # HTML 写到系统临时目录, 用 run_id 命名 —— 同一个 run 重复导出会覆盖同一个
     # 文件, 不会攒垃圾。覆盖写不是删除, 不涉及清理。
     html_file = Path(tempfile.gettempdir()) / f"aging-report-{run.get('id', 'x')}.html"
     html_file.write_text(render_html(run, results, filename,
-                                     retest_runs=retest_runs),
+                                     retest_runs=retest_runs,
+                                     boot_evidence=boot_evidence,
+                                     cpu_evidence=cpu_evidence,
+                                     clock_skew=clock_skew),
                          encoding="utf-8")
 
     await _print_pdf(chromium, html_file, staging)

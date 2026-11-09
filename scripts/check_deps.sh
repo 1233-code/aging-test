@@ -1,21 +1,49 @@
 #!/bin/bash
 # 检查老化测试所需的依赖是否齐全 (只查不装)
-# 用法: bash scripts/check_deps.sh
+# 用法: bash scripts/check_deps.sh [--packages-only]
 #
 # 分三级 (依 docs/需求设计.md §11.7):
 #   ① 包类·关键     —— 缺 → 拒绝出货 (对应测试项直接判 error)
 #   ② 包类·备份     —— 缺 → 警告不阻断 (主路径另有实现)
 #   ③ 非包类逐台自检 —— 缺 → 拒绝出货 / 或该项判 error
 #
+# --packages-only: **只跑 ①②** —— 跳过 ③。
+#   ③ 里的东西 (图形会话、HDMI 已连接、/dev/dri、GPIO 节点、chromium headless
+#   真能起) 只有在**有图形会话的那台机器上**才测得准。装机时 postinst 跑的
+#   是这个模式 —— 那时可能连 X 都没有, 按 ③ 的标准判"拒绝出货"是胡判。
+#
 # 退出码: 0 = 可出货; 1 = 有阻断项缺失
 
 # 重要: 普通用户 PATH 不一定含 /sbin /usr/sbin, 这里强制加上
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+# --packages-only: 只查包类 (装机时用), 跳过逐台自检
+PACKAGES_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --packages-only) PACKAGES_ONLY=1 ;;
+        -h|--help)
+            sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *)
+            echo "未知参数: $arg (用法: bash $0 [--packages-only])" >&2
+            exit 2 ;;
+    esac
+done
+
 # 项目根目录 (config.yaml 的位置) —— 与 server/config.py 的 PROJECT_ROOT 一致
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-CONFIG_FILE="$PROJECT_ROOT/config.yaml"
+# 配置文件位置: 环境变量 > /etc/aging-test/config.yaml (打包安装后的位置)
+#              > 代码根下的 config.yaml (开发机)
+CONFIG_FILE="${AGING_CONFIG:-}"
+if [ -z "$CONFIG_FILE" ]; then
+    if [ -f "/etc/aging-test/config.yaml" ]; then
+        CONFIG_FILE="/etc/aging-test/config.yaml"
+    else
+        CONFIG_FILE="$PROJECT_ROOT/config.yaml"
+    fi
+fi
 
 # ── 读 config.yaml 里的点号路径 (如 defaults.gpu.variant) ──
 #
@@ -117,11 +145,16 @@ for cmd in "${!BACKUP[@]}"; do
 done
 
 # ─────────────────── ③ 非包类逐台自检项 (§11.7) ───────────────────
-echo ""
-echo "==> ③ 非包类逐台自检 (逐台验证, 不属于 apt)"
-
 _selfcheck_fail=0
 _selfcheck_warn=0
+
+if [ "$PACKAGES_ONLY" = "1" ]; then
+    echo ""
+    echo "==> ③ 非包类逐台自检 —— 跳过 (--packages-only: 逐台自检要在图形会话上才准)"
+else
+
+echo ""
+echo "==> ③ 非包类逐台自检 (逐台验证, 不属于 apt)"
 
 sc_block() {
     # $1=名称 $2=结果(ok/err) $3=说明
@@ -302,6 +335,8 @@ if [ -n "$SN" ]; then
 else
     sc_warn "被测设备 SN" err "提取失败, 记为 unknown —— 测试照常, 但需人工核对设备 (§2.2)"
 fi
+
+fi   # end of ③ —— --packages-only 时整块跳过
 
 # ───────────────────────── 汇总 ─────────────────────────
 echo ""

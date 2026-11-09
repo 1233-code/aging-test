@@ -5,12 +5,17 @@ import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple, Type
 
-from .tests.base import TestCase, TestContext, TestResult, TEST_REGISTRY
+from .tests.base import (
+    TestCase, TestContext, TestResult, TEST_REGISTRY, TestCancelled,
+)
 from .tests.registry import get_all_tests
-from .tests._tools import is_sudo_password_error, sudo_nopasswd_hint
-from .db import Database
+from .tests._tools import (is_sudo_not_allowed_error, is_sudo_password_error,
+                           sudo_not_allowed_hint, sudo_nopasswd_hint)
+from .db import Database, decide_run_status
 from .config import Config
 from . import identity, report
+from . import clock
+from . import usb_export
 
 
 def _report_cfg() -> dict:
@@ -20,14 +25,46 @@ def _report_cfg() -> dict:
 
 
 # §7.6 推荐执行顺序 - 4 阶段逐级加载,避免热累积污染轻量项
+#
+# ⚠️ 2026-11-04: **射频项(WiFi)从整轮最后挪回 GPU 之前**(用户定的):
+#   「wifi 还是放到 GPU 测试之前, 然后蓝牙放 wifi 后面」
+#   ⇒ 四阶段: 轻量 → 接口 → **射频** → 重载。
+#   ⇒ 蓝牙项就紧跟在 WiFi 后面(§6.4.1, 2026-11-04 实现)⇒ 两者一起在重载之前。
+#     蓝牙那一项是**只读探测**, 判定反过来(蓝牙不工作 = 合格)。
+#
+#   📌 **这不是新决定, 是「回到打包前那个位置」** —— HEAD(445986d, 打包前)
+#      本来就是 `..., fan, wifi, gpu, cpu`, 注释写的是
+#      「③ 射频 (**避免被 CPU/GPU 抖动干扰**)」; 打包后(2026-10-30)才被挪到
+#      最后(理由见下面)。⇒ 用户 2026-11-04 把位置摆回去了。
+#
+#   ⚠️ **代价明说(别把这条当成「无害的挪动」)**:
+#   2026-10-30 把射频项挪到**最后**, 理由是实打实的 —— 射频是**唯一一项会动
+#   整机全局状态**的(它要关掉再打开这块射频硬件), 而当时那块新板**两次都在
+#   射频项结束后 3~5 秒当场重启**(日志里没有 panic、没有 thermal 消息 ——
+#   板子是空载被硬复位的)⇒ 那时的想法是「万一它把板子带崩, 崩的也是最后
+#   一步, 内存/存储/CPU 压力这些真正的老化负载**早就跑完并落库了**」。
+#   ⇒ 挪到 GPU 之前 = **这个保护没有了**: 万一射频项把板子带崩, 后面
+#     GPU / CPU 这两项重载**一次都跑不到**, 这一轮就没有老化结论。
+#   ⇒ 这个取舍是用户 2026-11-04 认下的(板子在这块产线上的实际表现, 由用户
+#     判断为准)。**写在这儿是为了以后别把「挪到最后」当成默认再改回去。**
+#
+#   反过来, 有两条旧代价**反而变小**了:
+#     ① 射频项原先跑在板子最热的时候(温度高, 射频扫描会慢一点 —— 扫描有
+#        15s 超时 + 2 次重试)⇒ 现在挪到重载之前, 板子还凉着, 扫描更快更稳;
+#     ② 打包前那句「避免被 CPU/GPU 抖动干扰」重新成立 —— 射频项不再跑在
+#        满载抖动的后面。
 RECOMMENDED_ORDER: List[str] = [
     # ① 轻量优先 (内存 + 存储)
     "memory", "emmc", "tfcard",
     # ② 接口与外设
     "hdmi", "usb", "ethernet", "fan",
-    # ③ 射频 (避免被 CPU/GPU 抖动干扰)
-    "wifi",
-    # ④ 重载收尾 (产热最高,放最后)
+    # ③ 射频 (排在 GPU 之前 —— 2026-11-04)
+    #    wifi      —— **唯一会动整机全局状态的一项**(开关射频)
+    #    bluetooth —— **只读探测**(§6.4.1): 判定反过来, 蓝牙**不工作**才算
+    #                 合格。它排在 wifi 后面, 才看得到「WiFi 动完射频之后
+    #                 蓝牙还是不是关着的」这个**最终状态**。
+    "wifi", "bluetooth",
+    # ④ 重载收尾 (产热最高)
     "gpu", "cpu",
 ]
 # §7.6 静默期硬规则 - 每项结束后留 N 秒, 再开下一项。
@@ -35,7 +72,7 @@ RECOMMENDED_ORDER: List[str] = [
 # 2026-10-26: 5s → 3s(产线: 「五秒有点长了」)。这一段是**纯等待**, 不产出
 # 任何测试结论, 它的唯一作用是让 CPU / 温度 / 调度器复位一下 —— 3 秒够
 # 复位, 不够"让工人读完上一项结果"(要读结果有的是地方: 总结页、报告)。
-# 10 项 9 个间隔 = 整轮省 18 秒。
+# 11 项 10 个间隔 = 整轮省 20 秒。
 INTERVAL_BETWEEN_TESTS_SEC: int = 3
 
 # §7.3 等操作员: 卡槽空 / 网线没插 这类「料没到位」的结果, 整轮要**真停住**。
@@ -54,6 +91,22 @@ OPERATOR_MAX_RETEST: int = 3
 # 绝不悄悄少一段 —— 少了一段还看不出来, 那比超长糟糕得多。
 LOG_MAX_LINES: int = 10000
 
+# ──────────────── §7.7「结论只能被结论替换」 ────────────────
+#
+# 「结论」= 这一项测过了, **对被测设备有话可说**:
+#   passed(合格) / failed(不合格) / error(这一项没测成 —— 那也是一条记录)
+# 「真结论」= 只有关于**设备本身好坏**的判定: passed / failed
+# 「没测成」= skipped(用户主动跳) / stopped(中途没跑到) ——
+#   关于设备**没有任何**结论, 一句好话一句坏话都说不上。
+#
+# 合并重测(§7.7)时: 父轮那一项**已经有结论**的, 只许被另一个**真结论**
+# 换掉。重测那一轮要是「没测成」(skipped/stopped)或者「工具自己崩了」
+# (error), 父轮原来的结论**原样保留** —— 首测那条 failed 是**真证据**
+# (卡真的挂死过), 把它洗成「没测成」= 父轮不再有失败项 ⇒ 整轮判 passed ⇒
+# **假通过**: 坏板子被当合格品放行(§9.3: 静默的「通过」比明确的「失败」有害得多)。
+CONCLUSION_STATUSES = ("passed", "failed", "error")
+MEASURED_STATUSES = ("passed", "failed")
+
 
 class TestRunner:
     """单例 - 全局只有一个测试运行实例"""
@@ -61,6 +114,13 @@ class TestRunner:
     def __init__(self):
         self.run_id: Optional[int] = None
         self.cancelled = False
+        # 「下一项」(2026-10-29): 工人要求**跳过当前这一项**、直接进下一项。
+        #
+        # 与 `self.cancelled` 分开: cancelled = **整轮**中止(「停止」键),
+        # _skip_current = 只中止**当前这一项**。对**正在跑的这一项**来说两者
+        # 的动作一样(立刻停下), 区别在这一项**结束之后**: 「停止」整轮就
+        # 收尾, 「下一项」接着跑下一项。
+        self._skip_current: bool = False
         self.current_test: Optional[str] = None
         self.results: Dict[str, TestResult] = {}
         # 每一项的**完整**日志 (行列表) —— 报告「日志附录」的数据源。
@@ -135,6 +195,16 @@ class TestRunner:
             self.subscribers.remove(q)
 
     async def _broadcast(self, event: dict):
+        # ⚠️ **每条事件都带上后端自己的「现在」** (2026-11-06 实测):
+        #     前端的顶栏读秒要跟报告里的「总耗时」对得上, 就必须用**后端的
+        #     时间尺度**(推算模式下 = 锚点往后推的时间)。以前前端拿浏览器
+        #     的 `Date.now()`(系统时钟)去减后端的 `started_at` —— 跨时间
+        #     尺度相减, 板子的系统时钟歪着(硬复位后退回 51.8 天前)时结果
+        #     是负数 ⇒ 被 clamp 成 00:00:00(整轮冻住); 系统时钟被校正之后
+        #     又会跳成「2 个多小时」(实测)。
+        #     ⇒ 后端把 `server_now` 一起发下去, 前端拿它当基准、用**浏览器的
+        #     单调钟**往前推 ⇒ 不受系统时钟跳变影响。
+        event.setdefault("server_now", clock.now())
         for q in self.subscribers:
             try:
                 q.put_nowait(event)
@@ -145,6 +215,11 @@ class TestRunner:
         w = self._operator_wait
         snap = {
             "run_id": self.run_id,
+            # ⚠️ **快照也要带后端自己的「现在」** —— 页面刷新/WS 重连之后,
+            #     前端是从快照恢复计时的。没有它, 刷新一下读秒就又退回用
+            #     浏览器自己的系统时钟算 ⇒ 板子的时钟歪着时照样是 00:00:00
+            #     或「2 个多小时」(跟 `_broadcast` 里那条同一个道理)。
+            "server_now": clock.now(),
             "status": self.status,
             "current_test": self.current_test,
             # §7.5: 让刷新/重连后的页面把「本项计时」接上。不带这两个值的话,
@@ -211,7 +286,7 @@ class TestRunner:
         self._logs = {}          # 新的一轮, 日志留档从头开始
         self._log_truncated = {}
         self.current_test = None
-        self.started_at = time.time()
+        self.started_at = clock.now()
         self.finished_at = 0
         self.status = "running"
         self.mode = "full"
@@ -240,6 +315,9 @@ class TestRunner:
 
         # 创建 DB 记录
         self.run_id = await Database.create_run(config, self._run_meta())
+        # §9.3.4: 时钟是推算值时, 留一份**按轮**的旁挂文件 —— 报告据此打横幅。
+        # (时钟正常时这里什么都不写。)
+        clock.write_run_skew(self.run_id)
         await self._broadcast({"type": "run_started", "run_id": self.run_id,
                                "started_at": self.started_at})
 
@@ -292,8 +370,21 @@ class TestRunner:
         parent_config = parent.get("config") or {}
         parent_tests = parent_config.get("tests", {})
 
-        # 用父 run 中这些 test 的配置
-        retest_tests_config = {n: parent_tests.get(n, {}) for n in valid_names}
+        # 用父 run 中这些 test 的配置, 但**一律置 enabled=True**。
+        #
+        # 为什么不能照抄父轮那份 `enabled`: 那份 enabled 说的是「**首测那一轮**
+        # 勾没勾这一项」, 而重测的挑项是**工人当场点名**的 —— 照抄的话,
+        # 父轮那份配置里没有这一项(老库 / 配置结构变过)或者写着
+        # enabled=false 时, 这一项会被 _build_test_list **悄悄滤掉** ⇒
+        # 重测一轮**什么都没跑** ⇒ 没有任何结果合并回父轮 ⇒ 界面永远停在
+        # 「⏳ 等待」。**静默地什么都不做比报错糟糕得多** —— 工人以为在重测,
+        # 其实机器上什么都没发生。
+        retest_tests_config = {}
+        for n in valid_names:
+            pc = parent_tests.get(n)
+            if not isinstance(pc, dict):
+                pc = {}
+            retest_tests_config[n] = {**pc, "enabled": True}
 
         self.cancelled = False
         self.results = {}
@@ -307,7 +398,7 @@ class TestRunner:
             traceback.print_exc()
             self._parent_attempt = {}
         self.current_test = None
-        self.started_at = time.time()
+        self.started_at = clock.now()
         self.finished_at = 0
         self.status = "running"
         self.mode = "mini"
@@ -401,8 +492,15 @@ class TestRunner:
     async def _inter_test_interval(self, next_name: str, total_sec: int) -> bool:
         """§7.6 静默期 + 取消感知.
 
-        返回 True = 间隔正常完成, False = 用户在静默期中止.
-        前端监听 'between_tests' 事件后可显示「等待下一项...」提示.
+        返回 True = 间隔正常完成(可以进下一项), False = 用户在静默期中止
+        整轮. 前端监听 'between_tests' 事件后可显示「等待下一项...」提示.
+
+        ⚠️ 静默期里两个键的含义**不一样**(2026-10-29):
+          · 「停止」  = 整轮中止 → 返回 False, 后面所有项都跳过;
+          · 「下一项」= 别等了, 直接进下一项 → 返回 True。
+        ⚠️ 这里**不能**用 `self._is_cancelled()`: 它把「下一项」也算进去,
+        而「下一项」在这里的意思是「快进」, 不是「停」—— 用错了会让工人
+        按一下「下一项」把**整轮**停掉。
         """
         await self._broadcast({
             "type": "between_tests",
@@ -410,8 +508,10 @@ class TestRunner:
             "duration_sec": total_sec,
         })
         for _ in range(total_sec):
-            if await self._is_cancelled():
+            if self.cancelled:
                 return False
+            if self._skip_current:
+                return True       # 「下一项」→ 不用等了
             await asyncio.sleep(1)
         return True
 
@@ -452,6 +552,10 @@ class TestRunner:
         只留最后一次就等于把前几次的证据扔了。
         """
         self.current_test = name
+        # 「下一项」的请求标志在这里清零 —— 它只对**当前这一项**有效:
+        # 下一项开跑时不能还留着上一个的「跳过」, 否则新的一项刚开跑就被
+        # 判成跳过。
+        self._skip_current = False
         # 实例先建出来: 要问它「本项预计多少秒」(见 TestCase.expected_seconds)。
         # 放在 try 外面是有意的 —— 没有子类定义 __init__, 构造不会抛。
         instance: Optional[TestCase] = cls()
@@ -463,7 +567,7 @@ class TestRunner:
             traceback.print_exc()
             expected_sec = None
         self._current_expected_sec = expected_sec
-        self._current_started_at = time.time()
+        self._current_started_at = clock.now()
         await self._broadcast({
             "type": "test_started",
             "name": name,
@@ -475,15 +579,31 @@ class TestRunner:
         await Database.upsert_result(
             self.run_id, name,
             status="running",
-            started_at=time.time()
+            started_at=clock.now()
         )
-        # mini-run 模式下, 先在父 run 把对应行也设回 running (避免 UI 看到旧状态)
+        # mini-run 模式下, 父轮那一行也跟着动 —— 但**不许**把父轮原来的
+        # **结论**抹成 running(§7.7「结论只能被结论替换」)。
+        #
+        # 为什么: 父轮那一项判过 failed, 那是**真证据**(卡真的挂死过);
+        # 把它写成 running = 首测的结论当场蒸发, 而重测那一轮又完全可能
+        # 没测出结论(工人按了暂停 / 卡槽是空的 / 操作员超时没接话) ⇒
+        # 父轮那一项最后既不是 failed、也不是「没测成」, 整轮被判 passed ——
+        # **假通过**, 坏板子被当合格品放行。
+        #
+        # 所以: 父轮那一行**有结论时原样留着**(界面显示的是「最后一次结论」,
+        # 结论要等重测真的测出结论才换); 只在它本来就没有结论(没跑过/没跑到)
+        # 时才写 running —— 那时界面显示旧状态本来也没意义。
+        parent_prev_status = None
         if write_to_parent and self.parent_run_id:
-            await Database.upsert_result(
-                self.parent_run_id, name,
-                status="running",
-                started_at=time.time()
+            parent_prev_status = await Database.get_result_status(
+                self.parent_run_id, name
             )
+            if parent_prev_status not in CONCLUSION_STATUSES:
+                await Database.upsert_result(
+                    self.parent_run_id, name,
+                    status="running",
+                    started_at=clock.now()
+                )
 
         ctx = TestContext(
             run_id=self.run_id,
@@ -506,15 +626,40 @@ class TestRunner:
         try:
             self._current_instance = instance   # 供 stop() 拿到真实实例去 kill 子进程
             self.results[name] = TestResult(status="running")
-            t0 = time.time()
+            t0 = time.monotonic()   # §9.3.4: 时长用单调钟, 墙钟跳变算不出负数
             result = await instance.run(ctx)
-            result.duration_sec = time.time() - t0
+            result.duration_sec = time.monotonic() - t0
+            self.results[name] = result
+        except TestCancelled as e:
+            # 用户中途按了「停止」→ 这一项记 **stopped**(§9.3), 不是 error。
+            # 没跑完 ≠ 不合格: 记成 error 会把整轮判成 failed(2026-10-28)。
+            result = TestResult(status="stopped", error=str(e) or "用户中途停止")
             self.results[name] = result
         except Exception as e:
             result = TestResult(status="error", error=f"异常: {e!r}")
             self.results[name] = result
         finally:
             self._current_instance = None
+
+        # ── 工人主动打断了这一项 → 记 **skipped**(2026-10-29 新口径) ──
+        #
+        # 「停止」(整轮中止)和「下一项」(只跳当前项)在这一项上**结果一样**:
+        # 这一项没跑完、关于被测设备没有任何结论 ⇒ 记 skipped(没测成)。
+        # ⚠️ 但**已经测出来的结论不许改**: passed / failed 是**真证据**
+        # (§9.3: 静默的「通过」比明确的「失败」有害得多) —— 工人点按钮的
+        # 那一瞬间这一项刚好跑完了, 它的结论必须原样留着。
+        if self.cancelled or self._skip_current:
+            if result.status not in ("passed", "failed"):
+                by_stop = self.cancelled
+                result.status = "skipped"
+                # 标记**为什么**跳的 —— 整轮判「已停止」就靠它
+                # (db.decide_run_status 的 aborted 口径): skipped 也可能是
+                # 「TF 卡没插」那种环境原因, 那种**不该**把整轮判成 stopped。
+                result.metrics["skipped_reason"] = (
+                    "aborted_by_user" if by_stop else "skipped_by_user")
+                result.error = ("用户中止整轮测试, 本项未执行" if by_stop
+                                else "用户跳过此项, 直接进入下一项")
+                self.results[name] = result
 
         # 日志以**runner 留档的这份**为准。
         #
@@ -544,9 +689,24 @@ class TestRunner:
             result.status = "error"
             result.error = sudo_nopasswd_hint(result.error or result.log or "")
 
+        # ── §11.2 补充: sudo **拒绝执行这一条命令** (白名单里没这条) ──
+        # 跟上面那条是两回事: 免密是配了的, 但 sudoers 的命令白名单没覆盖到
+        # 这一条。症状一样是 failed, 根因不同 ⇒ 文案也得不同, 否则工人会把
+        # 「权限配置没覆盖到」算成「板子坏了」。
+        # ⚠️ 别以为「U 盘版应用」会在这里翻车 —— 不会 (2026-11-05 实测):
+        #   with_sudo() 一律先包一层 timeout, 而 sudo **只认最外层那条命令**
+        #   (盘上的 fio 只是它的参数) ⇒ 设备版和 U 盘版**被授权的命令完全一样**
+        #   ⇒ 产线现有的 sudoers 白名单继续有效, 不用为 U 盘版加任何东西。
+        #   详见 server/tests/_tools.py 里那同一段说明(两处别再写岔)。
+        if result.status == "failed" and is_sudo_not_allowed_error(
+            (result.error or "") + "\n" + (result.log or "")
+        ):
+            result.status = "error"
+            result.error = sudo_not_allowed_hint(result.error or result.log or "")
+
         common_fields = {
             "status": result.status,
-            "finished_at": time.time(),
+            "finished_at": clock.now(),
             "duration_sec": result.duration_sec,
             "metrics": result.metrics,
             "log": result.log,
@@ -574,9 +734,24 @@ class TestRunner:
                 # 失败原因当场蒸发。父轮只更新「结论」那几个字段。
                 parent_fields = {k: v for k, v in common_fields.items()
                                  if k != "log"}
-                await Database.upsert_result(
-                    self.parent_run_id, name, **parent_fields
-                )
+                # ⚠️ 而且: 重测这一轮**没测出结论**(skipped/stopped = 没测成)
+                #    或者**工具自己崩了**(error)时, **不许**拿它覆盖父轮原来
+                #    的结论 —— §7.7「结论只能被结论替换」。
+                #    父轮那一项判过 failed(卡真的挂死过), 重测时卡槽是空的
+                #    (操作员超时没接话 → 按跳过)就把 failed 洗成 skipped ⇒
+                #    父轮不再有失败项 ⇒ 整轮判 passed ⇒ **假通过**。
+                #    这种情况下父轮那一行**一个字都不改**: 状态/原因/日志/
+                #    次数全部原样留着; 「重测没测成」这件事记在**重测轮自己
+                #    那一行**里, 报告的「重测日志附录」里也印得出来。
+                if (parent_prev_status in CONCLUSION_STATUSES
+                        and result.status not in MEASURED_STATUSES):
+                    print(f"[runner] ⚠ 重测的 {name} 没测出结论({result.status}) —— "
+                          f"父轮那一项的结论({parent_prev_status})原样保留",
+                          flush=True)
+                else:
+                    await Database.upsert_result(
+                        self.parent_run_id, name, **parent_fields
+                    )
         except Exception as e:
             traceback.print_exc()
             await self._broadcast({
@@ -596,8 +771,9 @@ class TestRunner:
             }
         })
 
-        # 注意: failed/error **不在这里**置 any_failed —— §7.3 允许原地重测,
-        # 这一遍没过不代表最终没过。标志由主循环拿到最终结果后才算。
+        # 注意: 失败**不在这里**就定案 —— §7.3 允许原地重试,
+        # 这一遍没过不代表最终没过。轮级判定统一在收尾时按 summary 算
+        # (db.decide_run_status —— 唯一口径)。
         return result, instance
 
     async def _wait_for_operator(
@@ -700,7 +876,7 @@ class TestRunner:
             traceback.print_exc()
             print(f"[runner] 测试轮次异常终止: {e!r}", flush=True)
             self.status = "error"
-            self.finished_at = time.time()
+            self.finished_at = clock.now()
             self.current_test = None
             self.run_error = repr(e)
             try:
@@ -727,7 +903,7 @@ class TestRunner:
     async def _run_tests_body(self, enabled_tests, config: dict, write_to_parent: bool):
         if not enabled_tests:
             self.status = "error"
-            self.finished_at = time.time()
+            self.finished_at = clock.now()
             await Database.finish_run(
                 self.run_id, "error",
                 {"reason": "未选择任何测试"}
@@ -750,7 +926,6 @@ class TestRunner:
             "tests": [{"name": n, "display_name": c.display_name} for n, c in enabled_tests]
         })
 
-        any_failed = False
         # 操作员刚在弹框上拍过板 → 下一项**立刻**开始, 不再等静默期。
         # 静默期是给「结果出来没来得及看」的工人留的; 他已经看着结果点过
         # 「跳过」了, 再闷 5 秒正是「点了跳过却像没反应」的那种卡顿。
@@ -779,6 +954,12 @@ class TestRunner:
                     name, cls, config, write_to_parent, attempt=attempt
                 )
                 final_status = result.status
+
+                # 「下一项」: 工人明确说了「下一项」→ **不等静默期**
+                # (§7.6 的静默期是给「结果出来没来得及看」的人留的; 他已经
+                #  说了「下一项」, 再闷 5 秒正是「点了像没反应」的那种卡顿)。
+                if self._skip_current:
+                    immediate_next = True
 
                 # 这一步要不要停下来问人?
                 prompt = None
@@ -814,8 +995,6 @@ class TestRunner:
                     "max_retest": OPERATOR_MAX_RETEST,
                 })
 
-            if final_status in ("failed", "error"):
-                any_failed = True
             if self.cancelled:
                 break
 
@@ -830,7 +1009,7 @@ class TestRunner:
         #     四个数加起来只有 2, 纸面报告对不上账
         # 现在给它们补 stopped 行: 进报告、进未测项清单、也能在界面上看到。
         if self.cancelled:
-            await self._mark_not_run_stopped(enabled_tests)
+            await self._mark_remaining_skipped(enabled_tests)
 
         # ── 汇总 ──
         #
@@ -839,12 +1018,24 @@ class TestRunner:
         #
         # 以前 total 直接取 len(enabled_tests)(= 勾选数), 带来两个后果:
         #   ① 一轮全跳过 → total=10 而各状态计数加起来=0, 数字对不上
-        #   ② 全跳过时 any_failed 是 False → 整轮判 **passed** ——
+        #   ② 全跳过时判定落到「没有失败项」那一档 → 整轮判 **passed** ——
         #      一项都没测却给出「整体通过」的空报告, 而 §9.2 行 1587 明令
         #      「total=0 不得判 passed」。这是**假通过**, 比报错严重得多。
         # 现在 total = 实际执行并出结论的项数; 一项都没执行 → 整轮判 skipped。
         executed = [r for r in self.results.values()
                     if r.status in ("passed", "failed", "error")]
+        # 「因用户中止整轮而跳过」的项数 (2026-10-29)。
+        #
+        # 为什么单独数: skipped 也可能是「TF 卡没插」「网线没插」那种**环境
+        # 原因** —— 那种跳过**不该**把整轮判成「已停止」(那一项本来就没法测,
+        # 别的项测完了就是测完了)。而工人按「停止」时跳掉的那些项, 是**整轮
+        # 没跑完** —— 那些项**根本没测**, 不能因为别的项过了就宣布整体通过
+        # (§9.3: 静默的「通过」比明确的「失败」有害得多)。
+        aborted = sum(
+            1 for r in self.results.values()
+            if r.status == "skipped"
+            and (r.metrics or {}).get("skipped_reason") == "aborted_by_user"
+        )
         summary = {
             "total": len(executed),
             "passed": sum(1 for r in self.results.values() if r.status == "passed"),
@@ -855,26 +1046,38 @@ class TestRunner:
             # skipped 是**用户主动跳**的, stopped 是**没跑完**的, 两者含义
             # 不同(§9.3 行 1607 专门区分过)。
             "not_run": sum(1 for r in self.results.values() if r.status == "stopped"),
+            # 「用户中止整轮」而跳掉的项数 (2026-10-29) —— 整轮判「已停止」
+            # 靠它 (db.decide_run_status)。它是 skipped 的**子集**, 不是
+            # 另一个桶: 数字对账 (各状态加起来 == 勾选数) 仍然成立。
+            "aborted": aborted,
             # 勾选总数 —— 供界面/PDF 印「已测 M / 共勾选 K」(§9.2 行 1595)
             "planned": len(enabled_tests),
         }
 
         # 状态判定要在 summary 之后 —— 「一项都没执行」这件事只有算完
         # summary 才知道(total == 0)。
-        if self.cancelled:
-            self.status = "stopped"
-        elif any_failed:
-            self.status = "failed"
-        elif summary["total"] == 0:
-            # §9.2 行 1585-1589: total=0 **不得判 passed** ——
-            # 否则工人把所有项都选「跳过」就能拿到一份「100% 通过」的空报告。
-            self.status = "skipped"
-        else:
-            self.status = "passed"
+        #
+        # ⚠️ 口径**只有一处**: `db.decide_run_status()` —— 跟重测合并
+        # 时重算父轮用的是**同一个函数**(§7.7.2 第 2 条)。以前这里是**另写
+        # 的一份**, 两份迟早走歪: 走歪的后果是「这一轮判 stopped, 重测合并
+        # 时又被重算成 passed」—— 界面和报告当场打架。
+        #
+        # 「工人中途按了停止」也在这个口径里: 队列里没跑到的项都记 `stopped`
+        # ⇒ not_run > 0 ⇒ 判 `stopped` ✓(§9.3)。
+        #
+        # ⚠️ 而「已经测出来的 failed/error」排在**最前面**(口径里的 ①):
+        # 工人按了暂停**不许**把已经测出来的失败抹掉 —— 抹掉 = 坏板子被当成
+        # 「没失败」放行(§9.3: 静默的「通过」比明确的「失败」有害得多)。
+        # 2026-10-28 修: 以前 `self.cancelled` 排在最前面, 于是「测出失败
+        # 之后工人按了暂停」那一轮判的是 stopped —— 板子真不合格的结论被
+        # 工具的死盖住了。
+        self.status = decide_run_status(summary)
 
-        self.finished_at = time.time()
+        self.finished_at = clock.now()
         self.current_test = None
         await Database.finish_run(self.run_id, self.status, summary)
+        # §9.3.4: 收尾再落一次 —— 这一轮**从头到尾**用的都是推算值。
+        clock.write_run_skew(self.run_id)
 
         # §8.2 收尾导出。**放在 finish_run 之后**: 万一导出卡住/失败, 库里
         # 这一轮已经是完整的 finished 状态, 历史页随时能看, 不受影响。
@@ -928,16 +1131,23 @@ class TestRunner:
             self.mode = "full"
             self.parent_run_id = None
 
-    async def _mark_not_run_stopped(self, enabled_tests):
-        """把队列里**没跑**的项标成 stopped, 并补上结果行。
+    async def _mark_remaining_skipped(self, enabled_tests):
+        """把队列里**没跑**的项标成 **skipped**, 并补上结果行。
 
-        §9.3 行 1607: 用户中途停止时, 「当前正在进行这项 stopped, 其余未跑的
-        项**也** stopped(区别于 skipped, 后者是用户主动跳)」。
+        2026-10-29 新口径: 工人按「停止」时, **当前项和后面所有项都记跳过**
+        (skipped = 用户主动让它别测)。以前这里记的是 stopped —— 现在
+        「用户主动叫停」统一记 skipped; `stopped` 只留给「服务中途夭折、
+        那一项没跑完」(§9.3)。
 
         为什么非补不可: 这些项以前在 results 表里**连行都没有**, 于是
           · 报告逐项段里没有它们 → 纸面看不出这轮到底测了什么
           · 界面把它们显示成「⏳ 等待」→ 工人以为还在排队
         补上之后, 它们既进报告的逐项段, 也进「未测项明细」清单。
+
+        ⚠️ 每行都带 `metrics.skipped_reason = "aborted_by_user"` ——
+        整轮判「已停止」就靠这个标记 (db.decide_run_status 的 aborted 口径):
+        skipped 也可能是「TF 卡没插」那种环境原因, 那种**不**该把整轮判成
+        stopped。
 
         ⚠️ 只在**用户主动停止**时补 —— 正常跑完的轮次, 每一项都跑过了,
         这里一个都不会动。
@@ -946,16 +1156,17 @@ class TestRunner:
         for name, cls in enabled_tests:
             if name in done:
                 continue
-            r = TestResult(status="stopped", error="用户中途停止, 本项未执行")
+            r = TestResult(status="skipped", error="用户中止整轮测试, 本项未执行")
+            r.metrics["skipped_reason"] = "aborted_by_user"
             self.results[name] = r
             try:
                 await Database.upsert_result(
                     self.run_id, name,
-                    status="stopped",
-                    started_at=time.time(),
-                    finished_at=time.time(),
+                    status="skipped",
+                    started_at=clock.now(),
+                    finished_at=clock.now(),
                     duration_sec=0.0,
-                    metrics={},
+                    metrics={"skipped_reason": "aborted_by_user"},
                     log="",
                     error=r.error,
                 )
@@ -1025,6 +1236,12 @@ class TestRunner:
                 await Database.set_pdf_path(parent_id, pdf_path)
                 print(f"[runner] 父轮 #{parent_id} 报告已合并重导: {pdf_path}",
                       flush=True)
+                # §8.2.3 父轮这一份**也要**同步到 U 盘 —— 不然盘上留着的是
+                # 重测**之前**那份(判 failed 的旧版), 而库里已经是合并后的
+                # passed ⇒ 盘上那份跟库里那份对不上, 工人对着看会以为有一份
+                # 是错的。父轮的 finished_at 没变 ⇒ 文件名一样 ⇒ **原地覆盖**,
+                # INDEX.csv 里那一行也按「SN+开始时间」替换掉。
+                await self._export_to_usb(pdf_path, run_for_pdf)
         except Exception as e:
             # §8.2 硬规则: 报告导出失败**不阻断**结果 —— 状态已经更新了,
             # 报告可以在历史页手动重导。绝不能因为导不出 PDF 就把整个合并掀翻。
@@ -1067,7 +1284,14 @@ class TestRunner:
             # 被重测的那几项, 留着它的话, 之后任何一次按当前状态导报告都会
             # 只印得出那几项的参数。
             self.run_config = parent_run.get("config") or self.run_config
-            self.run_error = parent_run.get("error")
+            # 父轮那一列「系统级错误」在这一轮合并完就**过期**了 ——
+            # 最常见的来源是收尾逻辑写的「服务重启, 这一轮中途夭折(没跑完)」。
+            # 合并之后这一轮的结论已经重新判过(没测成的项补测了), 那句话
+            # 不再成立; 留着的话, 总结页会「✅ 整体通过」和「⚠ 本轮异常终止」
+            # **同时**摆出来 —— 同一屏上自相矛盾, 工人不知道该信哪个。
+            # (库里那一列留着不动 —— 那是「这一轮确实被中断过」的历史事实;
+            #  报告里也照样按「未被重测过」处理, 见 report.html.j2。)
+            self.run_error = None
 
         # ⑥ 通知前端: 历史列表刷新(父轮跳到最上面)、展开的详情刷新
         await self._broadcast({
@@ -1157,6 +1381,37 @@ class TestRunner:
             "path": path,
             "run_id": self.run_id,
         })
+        # §8.2.3 报告自动存 U 盘 —— **在 PDF 导出成功之后**。
+        # 插了 U 盘就自动放进去, 不问工人。
+        await self._export_to_usb(path, self._report_dict(summary))
+
+    async def _export_to_usb(self, pdf_path: str, run: dict):
+        """§8.2.3 把报告拷到 U 盘(插了的话), 并更新盘上的 INDEX.csv。
+
+        **绝不抛异常** —— 拷贝失败只记一条 warning + 推一条事件给界面。
+        §8.2 的硬规则: 报告是**附加产物**, 它出问题**不许**改写测试结论。
+        """
+        try:
+            res = await usb_export.export_report_to_usb(
+                pdf_path, run,
+                log=lambda m: print(f"[runner] {m}", flush=True),
+            )
+        except Exception as e:
+            # usb_export 自己已经兜住了, 这是最后一道保险 —— 收尾流程
+            # (已经入库、已经广播)绝不能被「拷 U 盘」这件事掀翻。
+            print(f"[runner] ⚠ 存 U 盘失败 (不影响测试结果): {e}", flush=True)
+            return
+        if res.ok:
+            print(f"[runner] {res.message}", flush=True)
+        else:
+            print(f"[runner] ⚠ {res.message} (不影响测试结果)", flush=True)
+        await self._broadcast({
+            "type": "usb_report_saved" if res.ok else "usb_report_missing",
+            "path": res.directory,
+            "filename": res.filename,
+            "message": res.message,
+            "run_id": self.run_id,
+        })
 
     async def _on_progress(self, name: str, pct: float, msg: str):
         await self._broadcast({"type": "progress", "name": name, "pct": pct, "msg": msg})
@@ -1192,6 +1447,12 @@ class TestRunner:
         })
 
     async def stop(self):
+        """「停止」: **中止整轮** —— 当前项和后面所有项都不跑了。
+
+        2026-10-29 新口径: 当前项和后面所有项都记 **skipped**(用户主动让它
+        别测), 整轮收尾后直接跳结果页。已经测出来的 passed / failed
+        **原样保留**(真证据不许被「按了停止」盖掉, §9.3)。
+        """
         if self.status != "running":
             return {"ok": False, "error": "没有正在运行的测试"}
         self.cancelled = True
@@ -1213,8 +1474,54 @@ class TestRunner:
                 pass
         return {"ok": True}
 
+    async def skip_current(self):
+        """「下一项」: 中止**当前这一项**, 记 skipped, 然后接着测下一项。
+
+        2026-10-29 新增(与「停止」分开):
+          · 「停止」  = 整轮中止 —— 当前项 + 后面所有项都不跑, 跳结果页;
+          · 「下一项」= 只跳当前这一项 —— 后面**照常跑**。
+
+        两种情况下**当前这一项**都记 skipped(没测成, 关于设备没有任何结论),
+        区别只在后面那些项。
+
+        两种现场:
+          ① 正卡在「等操作员」(弹框问「插好了吗」)→ 那就是「跳过此项」
+             这个决定本身(§7.3 的 skip), 唤醒等待即可;
+          ② 有一项正在跑 → 打断它(杀子进程), 它自己会停下来。
+        """
+        if self.status != "running":
+            return {"ok": False, "error": "没有正在运行的测试"}
+        # ① 等操作员: 「跳过此项」= 进下一项 —— 跟弹框上那个按钮是一回事
+        w = self._operator_wait
+        if w is not None:
+            if w.get("decision") is not None:
+                return {"ok": False, "error": "已经选择过了"}
+            w["decision"] = "skip"
+            w["event"].set()
+            return {"ok": True, "mode": "operator_skip"}
+        # ② 有一项正在跑 → 打断它
+        inst = self._current_instance
+        if inst is None:
+            # 没有正在跑的项 —— 多半是卡在两项之间的**静默期**。
+            # 这时按「下一项」= 「别等了, 直接进下一项」: 记下标志,
+            # 静默期会立刻结束 (见 _inter_test_interval)。
+            self._skip_current = True
+            return {"ok": True, "mode": "skip_wait"}
+        self._skip_current = True
+        try:
+            await inst.cancel()
+        except Exception:
+            pass
+        return {"ok": True, "mode": "skip_current"}
+
     async def _is_cancelled(self) -> bool:
-        return self.cancelled
+        """当前这一项要不要停下来。
+
+        ⚠️ 两个来源: 「停止」(整轮中止) 和「下一项」(只跳当前项) ——
+        对**正在跑的这项**来说两者的动作是一样的(立刻停下)。区别在这一项
+        **结束之后**: 「停止」整轮收尾, 「下一项」接着跑下一项。
+        """
+        return self.cancelled or self._skip_current
 
 
 # 单例

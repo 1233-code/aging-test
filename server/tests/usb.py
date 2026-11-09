@@ -4,13 +4,15 @@ import os
 import time
 import re
 import subprocess
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import (
     find_tool, with_sudo, sudo_hint_if_unavailable,
     run_proc_with_progress, fio_runtime_args, fio_timeout_sec,
+    loader_error_message,
 )
+from .. import storage
 
 
 def _list_usb_block_devices() -> List[str]:
@@ -55,6 +57,89 @@ def _list_usb_block_devices() -> List[str]:
             pass
 
     return devices
+
+
+def _protected_disks() -> Dict[str, str]:
+    """**正在被系统用着的**那些盘 —— 绝不能拿它们当 fio 的目标。
+
+    返回 {盘名: 为什么不能碰}。
+
+    ⚠️ **§8.2.3 之后多了一个真会咬人的场景**: 报告(乃至整个应用)可以
+    **放在 U 盘上** ⇒ U 盘写测试如果还拿那块盘往死里写, 就等于
+    **一边写报告、一边把报告所在的盘擦掉** —— 自己砸自己的脚。
+    (报告是 copy 过去的, 但 fio 是**裸块设备**写 ⇒ 盘上已有的东西,
+     包括刚拷过去的报告和整个应用, 全被覆盖。)
+
+    要排除的四样:
+      ① 应用代码所在的盘   —— 方案三: 整个应用装在 U 盘上跑;
+      ② 数据根所在的盘     —— history.db / 报告 / 日志;
+      ③ 报告输出目录所在的盘 —— output_dir 被指到别处时(§8.2.3 的场景);
+      ④ 根文件系统所在的盘 —— 万一是从 U 盘启动的。
+
+    认不出来(读不到 /proc/mounts 等)就**返回空表** —— 宁可少排除一个,
+    也不要因为探测失败把全部 USB 盘都放过(那才是真危险)。
+    """
+    try:
+        from ..config import Config
+    except Exception:
+        return {}
+    try:
+        from .. import report as report_mod
+    except Exception:
+        report_mod = None
+
+    mounts = storage.read_mounts()
+    out: Dict[str, str] = {}
+
+    def _add(path, why: str):
+        try:
+            d = storage.disk_for_path(str(path), mounts)
+        except Exception:
+            d = None
+        if d:
+            out.setdefault(d, why)
+
+    try:
+        _add(Config.project_root(), "应用代码所在")
+        _add(Config.data_root(), "数据根(history.db / 报告 / 日志)")
+        if report_mod is not None:
+            try:
+                _add(report_mod.output_dir(), "报告输出目录")
+            except Exception:
+                pass
+        _add("/", "根文件系统")
+    except Exception:
+        return out
+
+    # 根盘走 mountinfo 单独认(/proc/mounts 里的根是 '/dev/root', 认不出)
+    try:
+        rd = storage.root_disk()
+        if rd:
+            out.setdefault(rd, "根文件系统")
+    except Exception:
+        pass
+    return out
+
+
+def _split_protected(devices: List[str],
+                     protected: Dict[str, str]) -> tuple:
+    """把「正在被系统用着的盘」从 USB 块设备列表里剔掉。
+
+    返回 (保留的设备, 被剔掉的设备)。**纯函数** —— 好测。
+
+    ⚠️ 认盘名认不出来(`/dev/xxx` 不像块设备名)的**一律保留** —— 宁可漏剔
+    一个(那样顶多是这次没测到写测试), 也不能因为解析失败把**全部**盘都
+    剔掉(那这一项就永远是「没有块设备」, 静悄悄地什么都不测)。
+    """
+    kept: List[str] = []
+    dropped: List[str] = []
+    for d in devices:
+        disk = storage.disk_name(d)
+        if disk and disk in protected:
+            dropped.append(d)
+        else:
+            kept.append(d)
+    return kept, dropped
 
 
 @register
@@ -137,9 +222,41 @@ class USBTest(TestCase):
         block_devs = _list_usb_block_devices()
         await ctx.on_log(f"[USB] USB 块设备: {block_devs}")
 
+        # ⚠️ **把「板子自己正在用的盘」剔掉** —— §8.2.3 之后报告(乃至整个
+        # 应用)可以放在 U 盘上; 拿那块盘往死里写 = 自己砸自己的脚。
+        protected = _protected_disks()
+        if protected:
+            # ⚠️ **安全闸门**: 下面这些盘是**板子自己正在用的**(应用代码 /
+            #    数据根 / 报告目录 / 根文件系统)。fio 是**裸块设备写** ——
+            #    拿它们当目标就是把正在用的数据写坏(报告、history.db、
+            #    甚至整个应用)。所以这里**只从目标列表里剔掉**, 一个字节
+            #    都不往它们上面写。
+            kept, dropped = _split_protected(block_devs, protected)
+            for d in dropped:
+                disk = storage.disk_name(d)
+                await ctx.on_log(
+                    f"[USB] ⚠ 跳过 {d} —— 那是{protected.get(disk, '正在被系统用着的盘')}"
+                    f"(往它上面写会把正在用的数据写坏)"
+                )
+            if dropped:
+                await ctx.on_log(
+                    f"[USB] 剔除在用盘之后: {kept or '(无)'}"
+                )
+            block_devs = kept
+
         if not block_devs:
             # 没块设备也算通过(可能是 HUB/鼠标/键盘)
             await ctx.on_log("[USB] ⚠️ 没有可写的 USB 块设备,跳过读写测试")
+            if protected:
+                # ⚠️ **要说清楚是「被剔掉了」而不是「压根没有」** —— 这两种
+                # 看着一样的日志, 但排查方向完全不同(前者: 应用/报告就装在
+                # U 盘上; 后者: 插的是鼠标键盘)。§9.3: 说不清楚的事不许
+                # 静悄悄地判通过。
+                await ctx.on_log(
+                    "[USB]   ↳ 盘是有的, 但都是**正在被系统用着的盘**"
+                    "(应用/报告/数据根在上面) ⇒ 跳过写测试, 不碰它们"
+                )
+                result.metrics["write_skipped_in_use"] = True
             result.status = "passed"
             return result
 
@@ -195,15 +312,25 @@ class USBTest(TestCase):
                         f"第 {round_idx}/{times} 轮 · 写 {e:.0f}s / {duration:.0f}s",
                     )
 
-                rc, text, killed = await run_proc_with_progress(
+                out = await run_proc_with_progress(
                     proc, duration, ctx=ctx, on_tick=tick, hard_limit_sec=tmo + 30,
                 )
+                rc, text, killed = out.rc, out.text, out.killed
                 elapsed = time.time() - t0
                 if killed:
                     await ctx.on_log("[USB] ⚠ 写测试被中断 (取消或超时)")
                     result.status = "stopped"
                     return result
                 if rc != 0:
+                    # ⚠️ 「工具起不来」(rc=127 / 缺共享库) ≠ 「盘写坏了」——
+                    #    前者是**这根 U 盘里的 fio 没带齐依赖**, 不是板子/盘坏了
+                    #    (2026-11-06 实测: 缺 libceph-common.so.2)
+                    loader_msg = loader_error_message(rc, text)
+                    if loader_msg:
+                        await ctx.on_log(f"[USB] ❌ fio 起不来: {loader_msg}")
+                        result.status = "error"
+                        result.error = loader_msg
+                        return result
                     await ctx.on_log(f"[USB] ❌ fio 写失败 rc={rc}")
                     await ctx.on_log(text[-500:])
                     all_passed = False

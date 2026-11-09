@@ -75,6 +75,18 @@ class FakeDb:
             PARENT_LOGS[(run_id, test_name)] = fields.get("log")
 
     @staticmethod
+    async def get_result_status(run_id, test_name):
+        """那一行当前的状态; 压根没写过这一行 → None(跟真库一样)。
+
+        合并重测时用它判「父轮那一项**有没有结论**」(§7.7「结论只能被结论
+        替换」): 有结论就不许被重测那一轮的「没测成」覆盖掉。
+        """
+        for rid, tn, fields in reversed(WRITTEN):
+            if rid == run_id and tn == test_name and "status" in fields:
+                return fields.get("status")
+        return None
+
+    @staticmethod
     async def get_result_log(run_id, test_name):
         return PARENT_LOGS.get((run_id, test_name))
 
@@ -217,6 +229,10 @@ async def case4():
     # log 压根不参与写回 —— 冲掉原始失败原因, 或者把两轮混进同一段,
     # 都是把「事后申诉要的两段证据」毁掉。
     PARENT_LOGS[(10, "fake")] = "父轮原来的日志"
+    # 父轮那一行**本来就有结论**(首测判 failed) —— 真实库里就是这个样子。
+    # (runner 靠它判断「父轮有没有结论要保住」, 见 §7.7「结论只能被结论替换」。)
+    await R.Database.upsert_result(10, "fake", status="failed",
+                                    log="父轮原来的日志")
 
     class Simple(TestCase):
         name = "fake"

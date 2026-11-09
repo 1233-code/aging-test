@@ -70,6 +70,16 @@ function loadApp(opts) {
     const src = fs.readFileSync(APP_JS, 'utf8');
     let app = null;
     const sockets = [];
+    /* ⚠️ **系统时钟可以在这儿换掉** (opts.dateNow) —— 产线板子的系统时钟
+     *    被硬复位后退回几十天前, 前端要是拿它去减后端的推算时间戳, 读秒
+     *    就是「整轮 00:00:00」或「2 个多小时」(2026-11-06 实测)。
+     *    要验「前端不用本机墙钟」, 就得**把本机墙钟换成歪的**再看结果。
+     *
+     *    opts.perfNow 换的是浏览器的**单调钟** (performance.now) —— 它
+     *    不受系统时钟跳变影响, 是前端推进读秒该用的那个。 */
+    const DateStub = opts.dateNow
+        ? class extends Date { static now() { return opts.dateNow(); } }
+        : Date;
     const ctx = {
         Vue: makeVue((a) => { app = a; }, sockets, opts.mount),
         // window / document 只提供 app.js 在**启动流程**里用到的那几个空壳方法
@@ -93,9 +103,12 @@ function loadApp(opts) {
             this.readyState = 1;
             sockets.push(this);
         },
-        JSON, Math, Date, Object, Array, Map, Set, String, Number, Boolean,
+        JSON, Math, Date: DateStub, Object, Array, Map, Set, String, Number, Boolean,
         Promise, Error, isNaN, parseInt, parseFloat,
     };
+    if (opts.perfNow) {
+        ctx.performance = { now: () => opts.perfNow() };
+    }
     ctx.WebSocket.OPEN = 1;
     ctx.__alerts = [];
     ctx.globalThis = ctx;

@@ -6,14 +6,34 @@ Schema:
 """
 import aiosqlite
 import json
-import time
 from pathlib import Path
 from typing import Any, Optional
 
 from .config import Config
+from . import boot_evidence
+from . import clock
 
 
-DB_PATH = Config.project_root() / "reports" / "history.db"
+#: 历史库位置 —— 落**数据根**下, 不是代码根。
+#: (打包成 deb 后代码归 root、工人写不动, 数据根才是 /var/lib/aging-test/)
+DB_PATH = Config.data_root() / "reports" / "history.db"
+
+#: 导入时算出来的那个值 —— 用来分辨「这个路径是**我们**算的」还是
+#: 「**有人**(回归测试)改过的」⇒ 只在是我们算的时候才让它跟着数据根走。
+_AUTO_DB_PATH = DB_PATH
+
+
+def _db_path() -> Path:
+    """当前该用的库路径。
+
+    - **回归测试会直接把 `DB.DB_PATH` 改成临时路径**(隔离真库 ——
+      产线在跑的那份历史一个字都不许碰)⇒ 被人改过就**以人为准**, 绝不顶掉;
+    - 否则按数据根**实时**算 ⇒ U 盘挂载点漂移了能跟上
+      (数据根会按设备重新定位, 见 `Config.rebind`)。
+    """
+    if DB_PATH != _AUTO_DB_PATH:
+        return DB_PATH
+    return Config.data_root() / "reports" / "history.db"
 
 
 SCHEMA = """
@@ -64,8 +84,8 @@ async def _ensure_column(db, table: str, column: str, typedef: str):
 
 
 async def init():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
+    _db_path().parent.mkdir(parents=True, exist_ok=True)
+    async with aiosqlite.connect(_db_path()) as db:
         # 1. CREATE TABLE (对老 DB 是 no-op)
         await db.executescript(SCHEMA)
         # 2. Migrations: 补加老 DB 缺的列
@@ -91,6 +111,68 @@ async def init():
         await db.commit()
 
 
+def decide_run_status(summary: dict) -> str:
+    """轮级状态判定 —— **唯一**口径(§9.2 + §9.3)。
+
+    口径跟 runner 算 summary 时**完全一致**(同一个定义, 不许各算各的):
+      ① 有 `failed` / `error` 的项 → `failed`
+         —— **排在最前面**: 已经测出来的失败是**真证据**(卡真的挂死过),
+         工具自己的死(服务中断 / 工人按了暂停)**不许**把它抹掉 ——
+         抹掉 = 坏板子被当成「没失败」放行(§9.3)。
+      ② 有没跑到的项(`not_run > 0`) → `stopped`
+         —— 没测过的项合不合格谁也不知道, 不能因为别的项过了就宣布
+         「整体通过」(§7.7.2)。
+      ②' **工人中止了整轮**(`aborted > 0`, 2026-10-29) → `stopped`
+         —— 「停止」键跳掉的那些项**根本没测**, 整轮**没跑完**。
+         ⚠️ 这一条**不能省**: 那些项记的是 `skipped`(用户主动让它别测),
+         而 skipped 也可能是「TF 卡没插」那种环境原因 —— 光看 skipped 的
+         计数**分不出来**。少了这一条, 「3 项测过都过了 + 工人按了停止
+         剩下 7 项」会被判成 `passed` —— **假通过**: 一台只测了三项的机器
+         拿着「整体通过」出货(§9.3: 静默的「通过」比明确的「失败」有害得多)。
+      ③ 一项都没出结论(`total == 0`) → `skipped`(§9.2: **不得**判 passed)
+      ④ 其余 → `passed`
+
+    为什么单独拎出来一个函数: 这一段口径以前在**两个地方**各写了一遍
+    (runner 收尾时算一次, `recompute_run` 重算时算一次), 两份迟早会走歪
+    —— 走歪的后果是「这一轮判 stopped, 重测合并时又被重算成 passed」,
+    界面和报告当场打架(§7.7.2 第 2 条)。现在只有这一个函数说了算。
+
+    ⚠️ 它是**模块级**函数, 不是 `Database` 的方法 —— 测试里会把
+    `Database` 整个换成假库(只实现存/取那几个动作); 口径要是挂在类上,
+    假库也得抄一份, 抄的那份迟早跟真的走歪。挂在模块上, 假库换掉了它
+    也不受影响 ✓。
+    """
+    failed = summary.get("failed", 0) or 0
+    error = summary.get("error", 0) or 0
+    not_run = summary.get("not_run", 0) or 0
+    aborted = summary.get("aborted", 0) or 0
+    total = summary.get("total", 0) or 0
+    if failed or error:
+        return "failed"
+    if not_run > 0 or aborted > 0:
+        return "stopped"
+    if total == 0:
+        return "skipped"
+    return "passed"
+
+
+def _metrics_skipped_reason(metrics_json) -> str:
+    """从一行结果的 metrics_json 里取出 `skipped_reason`(取不到就空串)。
+
+    用来分辨两种**都记 skipped** 的跳过:
+      · `aborted_by_user` —— 工人按了「停止」, 整轮没跑完(§9.3);
+      · 别的(环境原因 / 用户主动跳这一项)—— 整轮照常收尾。
+    光看 status 分不出来, 所以每一行自己写了这个标记。
+    """
+    try:
+        m = json.loads(metrics_json) if metrics_json else {}
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(m, dict):
+        return ""
+    return m.get("skipped_reason") or ""
+
+
 class Database:
     @staticmethod
     async def init():
@@ -104,12 +186,12 @@ class Database:
         现在存下来, 以后换机器、重装、重启服务都还能补导历史报告。
         """
         m = meta or {}
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "INSERT INTO runs (started_at, status, config_json, sn, operator, batch, "
                 "updated_at, retest_count) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-                (time.time(), "running", json.dumps(config, ensure_ascii=False),
-                 m.get("sn"), m.get("operator"), m.get("batch"), time.time())
+                (clock.now(), "running", json.dumps(config, ensure_ascii=False),
+                 m.get("sn"), m.get("operator"), m.get("batch"), clock.now())
             )
             await db.commit()
             return cur.lastrowid
@@ -122,12 +204,12 @@ class Database:
         归档时根本认不出是哪台机器。
         """
         m = meta or {}
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "INSERT INTO runs (started_at, status, config_json, mini_of, sn, operator, batch, "
                 "updated_at, retest_count) VALUES (?, 'running', ?, ?, ?, ?, ?, ?, 0)",
-                (time.time(), json.dumps(config, ensure_ascii=False), parent_run_id,
-                 m.get("sn"), m.get("operator"), m.get("batch"), time.time())
+                (clock.now(), json.dumps(config, ensure_ascii=False), parent_run_id,
+                 m.get("sn"), m.get("operator"), m.get("batch"), clock.now())
             )
             await db.commit()
             return cur.lastrowid
@@ -139,7 +221,7 @@ class Database:
         导出失败时**不要**调用 —— pdf_path 留空本身就代表"没导出",
         不用再造一个 error 列去记失败原因(日志和 UI warning 已经带了)。
         """
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             await db.execute(
                 "UPDATE runs SET pdf_path=? WHERE id=?", (pdf_path, run_id)
             )
@@ -148,10 +230,10 @@ class Database:
     @staticmethod
     async def finish_run(run_id: int, status: str, summary: dict, error: str = None):
         """收尾 run, 写 status / finished_at / summary / error."""
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             await db.execute(
                 "UPDATE runs SET finished_at=?, status=?, summary_json=?, error=? WHERE id=?",
-                (time.time(), status, json.dumps(summary, ensure_ascii=False), error, run_id)
+                (clock.now(), status, json.dumps(summary, ensure_ascii=False), error, run_id)
             )
             await db.commit()
 
@@ -172,7 +254,7 @@ class Database:
 
         返回改了几行。
         """
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "UPDATE results SET status='stopped', "
                 "error=COALESCE(error, '重测中途停止, 本项未跑完') "
@@ -183,6 +265,204 @@ class Database:
             return cur.rowcount or 0
 
     @staticmethod
+    async def get_result_status(run_id: int, test_name: str) -> Optional[str]:
+        """取某一轮里某一项当前的 status; 那一行压根不存在时返回 None。
+
+        合并重测时要用它判「父轮那一项**有没有结论**」(§7.7「结论只能被结论
+        替换」): 有结论(passed/failed/error)就不许被重测那一轮的「没测成」
+        (skipped/stopped) 覆盖掉 —— 首测那条 failed 是**真证据**。
+        """
+        async with aiosqlite.connect(_db_path()) as db:
+            cur = await db.execute(
+                "SELECT status FROM results WHERE run_id=? AND test_name=?",
+                (run_id, test_name)
+            )
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    async def finalize_interrupted_run(run_id: int,
+                                       is_parent: bool = False,
+                                       hard_reset: bool = False) -> Optional[dict]:
+        """收尾一个「服务中途夭折」的轮次 —— 它的 `runs` 行还停在 `running`。
+
+        收尾口径(§9.3「中途停止 = 没跑完」, **不冤枉被测设备**):
+          · 这一轮仍在 `running` 的**逐项**结果 → `stopped`(没跑完, 没结论);
+          · 轮级状态: 有 failed/error 的项 → `failed`(那些结论是真的, 不该被
+            工具的死抹掉); 否则**有没跑到的项** → `stopped`; 再否则按 §9.2 算。
+
+        `hard_reset=True` —— **板子是被硬拉死的**(上一次启动的日志里**没有
+        关机序列** ⇒ 掉电 / PMIC 复位 / 看门狗复位 / `reboot -f` 这类不经过
+        systemd 的强制重启), 不是有人重启了服务。这时候口径**反过来**:
+          · 正在跑的那一项 → **failed**, 不是 stopped ——
+            「板子在加压中被硬复位」= **板子没扛住** = **被测设备不合格**;
+          · 轮级 error 改成「板子硬复位 —— 被测设备不合格」。
+        ⚠️ **2026-11-02 之前没有这个分支** —— 板子死在 CPU 加压里(硬复位),
+        报告一律写「服务重启, 这一轮中途夭折(没跑完) —— 不代表被测设备
+        不合格」, **方向是反的**: 那等于**放行一块扛不住加压的板子**。
+        ⚠️ 判据只认「日志里没有关机序列」这一条**硬证据** —— 拿不到日志
+        (看不出来)时**一律按老口径**(stopped), 不冤枉板子, 也不冤枉工具。
+
+        `is_parent=True` —— 收的是**重测轮的父轮**(夭折的是那个重测轮,
+        父轮只是有一项被重测轮写成了 `running`)。这时候**只**做一件事:
+        把父轮里卡在 `running` 的那一行收成 `stopped`。
+        父轮的 `runs` 行(status / summary_json / error / updated_at)**一个字
+        都不许动** —— 三个理由:
+          · **张冠李戴**: 夭折的是重测轮, 父轮自己好好地跑完了; 给父轮盖上
+            「服务重启, 这一轮中途夭折」是**把别人的事写到自己头上**;
+          · **信息丢失**: 父轮原来那条 error(比如整轮异常终止的原因)是
+            **父轮自己的历史**, 抹掉就再也查不到了;
+          · **越权**: 父轮多半是**已判定**的轮次(重测只能从跑完的轮次发起),
+            它的轮级结论不该被工具顺手改掉(启动收尾的授权范围写得很死:
+            「不碰已判定的轮次」)。
+        ⇒ 所以 `hard_reset` **只作用在被夭折的那一轮自己**(is_parent=False)。
+
+        返回 {"status":..., "summary":..., "is_parent":...}; 轮次不存在返回 None。
+        """
+        async with aiosqlite.connect(_db_path()) as db:
+            cur = await db.execute("SELECT id FROM runs WHERE id=?", (run_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+
+            # ① 这一轮仍在 running 的逐项结果 → stopped。
+            #    ⚠️ **不能**直接复用 fix_stale_running —— 它那句「重测中途停止」
+            #    是给「工人按了停止」用的; 这里是**服务自己死了**, 说法不一样,
+            #    操作员看到得知道是哪个原因。
+            #
+            #    硬复位时改成 **failed**: 板子是在**这一项**上被拉死的 ⇒
+            #    这一项没通过 ⇒ **被测设备不合格**(而不是「工具没跑完」)。
+            #    ⚠️ 授权范围(用户 2026-11-02 点名): 只处理服务启动时收尾的
+            #    「卡在 running 的轮次」里**正在跑的那一项**; 不碰任何已判定
+            #    的轮次、不删数据、不回头改已经收好尾的历史轮次。
+            if hard_reset and not is_parent:
+                await db.execute(
+                    "UPDATE results SET status='failed', "
+                    "error=COALESCE(error, ?) "
+                    "WHERE run_id=? AND status='running'",
+                    (boot_evidence.HARD_RESET_ITEM_ERROR, run_id)
+                )
+            else:
+                await db.execute(
+                    "UPDATE results SET status='stopped', "
+                    "error=COALESCE(error, ?) "
+                    "WHERE run_id=? AND status='running'",
+                    (boot_evidence.SOFT_ITEM_ERROR, run_id)
+                )
+            await db.commit()
+
+        # ② 按 §9.2 重算
+        #
+        # ⚠️ 这里**不再**自己判一次(2026-10-28 删掉): 以前这里有一段「兜底」
+        # (「有没跑到的项 → 盖成 stopped」), 那是给 recompute 的老口径打的补丁 ——
+        # 老口径把这条挂在「这一轮上一回是 stopped」上, 而被服务中断的那一轮
+        # 上一回可能是 failed ⇒ 补丁才补上。现在 recompute 自己就不挂任何前提
+        # (见 recompute_run 的 ②), 这段兜底成了**空操作** —— 留着它等于留了
+        # 一段「改不动、也看不出」的代码(变异测试咬不住: 改了照样绿)。
+        # 口径只留一处(§9.2 + §9.3), 免得两处各算各的。
+        out = await Database.recompute_run(run_id)
+        if not out:
+            return None
+        summary = out["summary"]
+        status = out["status"]
+
+        async with aiosqlite.connect(_db_path()) as db:
+            if is_parent:
+                # 父轮: 逐项收完了(上面那句 UPDATE 已经执行), 但父轮的
+                # `runs` 行**一个字都不动** —— 它的轮级结论是它自己的。
+                # 只把父轮现在的状态/汇总**读出来**照实返回(调用方要照实
+                # 印出来, 别把重算出来的值当成父轮现在的状态)。
+                cur = await db.execute(
+                    "SELECT status, summary_json FROM runs WHERE id=?", (run_id,)
+                )
+                prow = await cur.fetchone()
+                try:
+                    psummary = json.loads(prow[1]) if prow and prow[1] else {}
+                except (TypeError, ValueError):
+                    psummary = {}
+                return {
+                    "status": prow[0] if prow else status,
+                    "summary": psummary if isinstance(psummary, dict) else {},
+                    "is_parent": True,
+                }
+
+            await db.execute(
+                "UPDATE runs SET status=?, summary_json=?, error=?, updated_at=? "
+                "WHERE id=?",
+                (status, json.dumps(summary, ensure_ascii=False),
+                 boot_evidence.HARD_RESET_RUN_ERROR if hard_reset
+                 else boot_evidence.SOFT_RUN_ERROR,
+                 clock.now(), run_id)
+            )
+            await db.commit()
+        return {"status": status, "summary": summary, "is_parent": False}
+
+    @staticmethod
+    async def list_interrupted_runs() -> list:
+        """列出卡在 `running` 的轮次 —— **只读, 什么都不改**。
+
+        卡在「运行中」只有一个原因: 上一轮服务**中途夭折**了(设备卡住把事件
+        循环冻死 / 被 kill / 断电)。进程早没了, 只是那一行的状态没人收尾 ——
+        界面上就一直显示「▶ 运行中」, 让人以为还有测试在跑。
+        """
+        async with aiosqlite.connect(_db_path()) as db:
+            cur = await db.execute(
+                "SELECT id, sn, status, started_at, mini_of FROM runs "
+                "WHERE status='running' ORDER BY id"
+            )
+            rows = await cur.fetchall()
+        return [
+            {"id": r[0], "sn": r[1], "status": r[2],
+             "started_at": r[3], "mini_of": r[4]}
+            for r in rows
+        ]
+
+    @staticmethod
+    async def reconcile_interrupted_runs(hard_reset: bool = False) -> list:
+        """服务启动时收尾所有「上一轮服务中途夭折」的轮次。
+
+        什么时候会有残留: 服务在跑测试的途中**死掉**了 —— 冻死(设备卡住,
+        同步 I/O 堵在事件循环里, 2026-10-28 实测)、被 kill、断电。那一轮的
+        `runs` 行会永远停在 `running`: 历史列表于是**一直显示「运行中」**,
+        明明什么都没在跑(那次实测挂了一整天, 工人以为测试还在跑)。
+
+        `hard_reset=True` —— 上一次是**硬复位**(板子被硬拉死, 不是有人
+        重启了服务)⇒ 正在跑的那一项判 **failed**(被测设备不合格),
+        而不是 stopped。判据与授权范围见 `finalize_interrupted_run`。
+
+        mini-run(重测轮)被中断时, **父轮**里对应的行也停在 `running`
+        (mini-run 开跑时会把父轮对应项先写成 running, 见 _merge_into_parent)
+        ⇒ 父轮里那一行也要收, 否则父轮会出现「永远 running 的一项」(它在
+        §9.2 的任何一档里都不算 ⇒ 父轮的计数凭空少一项)。
+        ⚠️ 父轮**只收那一行**: 它的轮级结论(status / error)是**父轮自己的**
+        —— 夭折的是重测轮, 不能把父轮已经判定的结论改掉(见
+        finalize_interrupted_run 的 `is_parent` 说明)。
+
+        返回被收尾的轮次列表 [{"id":..., "status":..., "summary":...}]。
+        """
+        async with aiosqlite.connect(_db_path()) as db:
+            cur = await db.execute(
+                "SELECT id, mini_of FROM runs WHERE status='running' ORDER BY id"
+            )
+            rows = await cur.fetchall()
+
+        out = []
+        done = set()
+        for run_id, mini_of in rows:
+            # 夭折的那一轮自己: 按「整轮收尾」处理(轮级 status/error 要写)。
+            # 它的父轮: 只收父轮里卡在 running 的那一行(轮级结论不动)。
+            for rid, is_parent in ((run_id, False), (mini_of, True)):
+                if not rid or rid in done:
+                    continue
+                done.add(rid)
+                r = await Database.finalize_interrupted_run(
+                    rid, is_parent=is_parent, hard_reset=hard_reset)
+                if r:
+                    r["id"] = rid
+                    out.append(r)
+        return out
+
+    @staticmethod
     async def recompute_run(run_id: int) -> Optional[dict]:
         """按 §9.2 口径重算某一轮的 status + summary。
 
@@ -190,33 +470,38 @@ class Database:
         不许各算各的):
           · total = passed + failed + error —— skipped / stopped **不计入**
           · 有 failed / error → failed
+          · **有没跑到的项 → stopped** —— 没测过的项合不合格谁也不知道,
+            不能因为别的项过了就宣布「整体通过」(§7.7.2)
           · total == 0 → skipped(**不得**判 passed —— 否则全跳过能拿一张空报告)
           · 否则 → passed
 
-        另有一条: 当初**被工人停掉**的一轮(total > 0 但还有没跑到的项),
-        重测把失败项修好之后**仍然是 stopped**, 不是 passed ——
-        没测过的项合不合格谁也不知道, 不能因为重测就宣布「整体通过」。
+        ⚠️「有没跑到的项 → stopped」这条**不许**挂在「这一轮上一回是什么状态」
+        上(2026-10-28 修): 挂上去的话, 父轮上一回判的是 failed, 而重测那一轮
+        中途夭折(那一项记 stopped)时, 这条判不出来 ⇒ 整轮落进 passed ——
+        那是**假通过**: 没测过的项合不合格谁也不知道, 好板子/坏板子一起放行。
+        父轮上一回是什么状态跟「这一轮有没有没跑到的项」**无关**。
 
         返回 {"status":..., "summary":{...}} 或 None(轮次不存在)。
         """
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
-                "SELECT status, config_json FROM runs WHERE id=?", (run_id,)
+                "SELECT config_json FROM runs WHERE id=?", (run_id,)
             )
             row = await cur.fetchone()
             if not row:
                 return None
-            old_status, config_json = row[0], row[1]
+            config_json = row[0]
 
             cur = await db.execute(
-                "SELECT test_name, status FROM results WHERE run_id=?", (run_id,)
+                "SELECT test_name, status, metrics_json FROM results WHERE run_id=?",
+                (run_id,)
             )
             rows = await cur.fetchall()
 
             counts = {"passed": 0, "failed": 0, "error": 0,
-                      "skipped": 0, "not_run": 0}
+                      "skipped": 0, "not_run": 0, "aborted": 0}
             ran = set()
-            for name, st in rows:
+            for name, st, metrics_json in rows:
                 ran.add(name)
                 if st == "passed":
                     counts["passed"] += 1
@@ -226,6 +511,14 @@ class Database:
                     counts["error"] += 1
                 elif st == "skipped":
                     counts["skipped"] += 1
+                    # 「因用户中止整轮而跳过」的项(2026-10-29)—— 整轮仍判
+                    # stopped: 那些项**根本没测**, 不能因为别的项过了就宣布
+                    # 整体通过(§9.3: 假通过最有害)。
+                    # ⚠️ 光看 status 分不出来 —— skipped 也可能是「TF 卡没插」
+                    # 那种环境原因, 那种**不该**把整轮判成 stopped。所以要读
+                    # 那一行自己写的标记。
+                    if _metrics_skipped_reason(metrics_json) == "aborted_by_user":
+                        counts["aborted"] += 1
                 elif st == "stopped":
                     counts["not_run"] += 1
                 # 'running' / 'pending' 不落进任何一档 —— 它们不是结论。
@@ -256,6 +549,10 @@ class Database:
                 "error": counts["error"],
                 "skipped": counts["skipped"],
                 "not_run": counts["not_run"],
+                # 「工人中止整轮」而跳掉的项数 —— 跟 runner 算的**同一个口径**
+                # (§9.3)。父轮被中止过、而重测只补了其中一部分时, 整轮仍判
+                # stopped: 那些项还是没测过。
+                "aborted": counts["aborted"],
                 # 老库的 config 里可能压根没有 enabled(那时候按
                 # `cfg.get("enabled", False)` 判定) —— 这时用「已测 + 跳过 +
                 # 没跑到」兜底, 跟报告 render_html 里的回退一致。
@@ -263,14 +560,16 @@ class Database:
                             or (total + counts["skipped"] + counts["not_run"])),
             }
 
-            if counts["failed"] or counts["error"]:
-                status = "failed"
-            elif total == 0:
-                status = "skipped"
-            elif old_status == "stopped" and counts["not_run"] > 0:
-                status = "stopped"
-            else:
-                status = "passed"
+            # 轮级判定(§9.2 + §9.3) —— 口径只留一处:
+            # `decide_run_status()` 跟 runner 收尾时用的是**同一个函数**
+            # (见那个函数的说明: 两处各写一遍, 迟早走歪)。
+            #
+            # ⚠️ 特别提醒(2026-10-28 修): 「有没跑到的项 → stopped」这条
+            # **跟这一轮上一回是什么状态无关** —— 以前它挂在
+            # old_status=='stopped' 上, 于是「父轮判 failed + 重测那一轮中途
+            # 夭折」这一种漏判 ⇒ 整轮落进 passed —— **假通过**, 坏板子被当
+            # 合格品放行。
+            status = decide_run_status(summary)
 
             return {"status": status, "summary": summary}
 
@@ -284,11 +583,11 @@ class Database:
         updated_at 一起刷: 历史列表按它排序, 被合并过的记录要能跳到最上面
         (它刚刚才动过, 是列表里最新的状态)。
         """
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             await db.execute(
                 "UPDATE runs SET status=?, summary_json=?, updated_at=?, "
                 "retest_count=COALESCE(retest_count,0)+1 WHERE id=?",
-                (status, json.dumps(summary, ensure_ascii=False), time.time(), run_id)
+                (status, json.dumps(summary, ensure_ascii=False), clock.now(), run_id)
             )
             await db.commit()
             cur = await db.execute(
@@ -300,8 +599,8 @@ class Database:
     @staticmethod
     async def upsert_result(run_id: int, test_name: str, **fields):
         """有就更新, 没有就插入."""
-        now = time.time()
-        async with aiosqlite.connect(DB_PATH) as db:
+        now = clock.now()
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "SELECT id FROM results WHERE run_id=? AND test_name=?",
                 (run_id, test_name)
@@ -361,7 +660,7 @@ class Database:
         记录会永远沉在老位置, 工人刚合完却找不到它。
         """
         where = "" if include_mini else " WHERE mini_of IS NULL "
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "SELECT id, started_at, finished_at, status, summary_json, mini_of, error, "
                 "sn, pdf_path, updated_at, retest_count "
@@ -392,7 +691,7 @@ class Database:
         结果里带 sn/operator/batch/pdf_path —— 手动补导 PDF 时正好复用这份
         run dict, 不用再回头查一遍设备身份。
         """
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "SELECT id, started_at, finished_at, status, config_json, summary_json, "
                 "mini_of, error, sn, operator, batch, pdf_path, updated_at, retest_count "
@@ -446,7 +745,7 @@ class Database:
     @staticmethod
     async def get_result_log(run_id: int, test_name: str) -> Optional[str]:
         """取某一项已落库的日志。"""
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "SELECT log FROM results WHERE run_id=? AND test_name=?",
                 (run_id, test_name)
@@ -467,7 +766,7 @@ class Database:
 
         ⚠️ **只读** —— 这个方法不改任何数据。
         """
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "SELECT id, started_at, finished_at, status FROM runs "
                 "WHERE mini_of=? ORDER BY id",
@@ -506,7 +805,7 @@ class Database:
         重测时用: 父轮里这一项已经试过 N 次, 这次重测就是第 N+1 次 ——
         「第 2 次测试通过」那个记号就是这么来的。
         """
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "SELECT test_name, attempt FROM results WHERE run_id=?", (run_id,)
             )
@@ -516,7 +815,7 @@ class Database:
     @staticmethod
     async def find_incomplete_results(run_id: int, statuses: list) -> list:
         """返回指定 run 中状态匹配的 test_name 列表. 用于重测时筛 failed 项."""
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(_db_path()) as db:
             cur = await db.execute(
                 "SELECT test_name FROM results WHERE run_id=? AND status IN "
                 "(" + ",".join("?" * len(statuses)) + ")",

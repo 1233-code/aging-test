@@ -21,11 +21,17 @@
 改法 (server/tests/gpu.py):
   · 数**真的渲染出来的场景行** ([场景] <选项>: FPS: N FrameTime: X ms);
   · 场景集**显式点名** (-b), 「该跑几个」我们自己知道;
-  · 判定分开三种「没跑完」:
+  · 判定分开几种「没跑完」:
         用户按「停止」        → stopped (主动中止, 不算失败)
-        glmark2 自己退了      → failed  (这一轮没有结论)
+        glmark2 自己退了      → stopped (场景数是清单的**前缀** = 人误关了窗口)
+        一个场景都没渲染出来   → error   (工具/环境没跑起来, 这一项没测成)
+        渲染过之后异常退出      → failed  (板子真的崩过 —— 真证据)
         挂钟到点被 timeout 杀 → error   (没有结论, 且披露跑了多少)
     清单和实际对不上 (不是前缀) → error (清单过时了, 要重新标定)
+
+⚠️ 2026-10-29 再改两处判 `failed` → `error` / `stopped`: 「工具没跑起来」
+   和「人误关了全屏窗口」以前都算在板子头上 —— 前者是环境问题、后者是人为
+   打断, 都不是设备不合格。判 failed = 冤枉被测设备(好板子被送去修)。
 
 跑法: .venv/bin/python tests/test_gpu_scene_judgement.py
 """
@@ -153,23 +159,45 @@ _SUDO_CALLS = []
 
 
 class FakeGroup:
-    """假进程组 —— 模拟「我们起的那一组」里还活着一个 root 的 glmark2。
+    """假进程表 —— 模拟「我们自己起的那一棵进程树」。
 
-    killed 里记下 (pgid, sig), 用来断言收尾动作。
+    ⚠️ **拓扑照 2026-10-29 真机实测摆** (这是 G11 的要害):
+
+        sudo    pid 4242  pgid 4242  sid 4242
+          └─ timeout  pid 4300  pgid 4300  sid 4242   ← timeout 自己另起了一组
+               └─ glmark2  pid 4301  pgid 4300  sid 4242  ← 真正占着屏幕的
+
+    也就是: **sudo 那一组 (4242) 里只有 sudo 一个** —— 照着它整组杀,
+    root 的 glmark2 根本收不到信号 (老代码就是这么干的, 然后还报
+    「窗口应已消失」)。真正该杀的是 **4300** 那一组。
+
+    `killed` 里记下 (pgid, sig), 用来断言收尾动作。
     """
 
-    def __init__(self, alive=True, members=None):
+    BIN = "/fake/glmark2-es2"
+
+    def __init__(self, alive=True):
         self.alive = alive
-        self.members = members or [
-            (4242, "glmark2-es2", "S",
-             "/usr/bin/glmark2-es2 --fullscreen -b build:use-vbo=false"),
-        ]
         self.killed = []
+        self.sudo_pid = 4242
+        self.sid = 4242
+        self.sudo_pgid = 4242
+        self.payload_pgid = 4300
+        self._proc = [
+            (4242, "sudo", "S", 4242, 4242,
+             f"sudo -n env DISPLAY=:0 /usr/bin/timeout -k 5.0 305 "
+             f"{self.BIN} --fullscreen -b build"),
+            (4300, "timeout", "S", 4300, 4242,
+             f"/usr/bin/timeout -k 5.0 305 {self.BIN} --fullscreen -b build"),
+            (4301, "glmark2-es2", "S", 4300, 4242,
+             f"{self.BIN} --fullscreen -b build:use-vbo=false"),
+        ]
 
-    def list_members(self, pgid):
-        return self.members if self.alive else []
+    def list_proc(self):
+        return list(self._proc) if self.alive else []
 
-    async def kill(self, pgid, sig="TERM", timeout_sec=8.0, expect_cmdline=None):
+    async def kill(self, pgid, sig="TERM", timeout_sec=8.0, expect_cmdline=None,
+                  session=None):
         self.killed.append((pgid, sig))
         if sig == "TERM":
             self.alive = False          # TERM 就退了, 不用 KILL
@@ -187,7 +215,7 @@ def patch(lines, rc=0, cancelled=False, cancel_after=None, cfg=None, group=None,
     _ORIGINALS["session"] = gpu._precheck_session
     _ORIGINALS["dri"] = gpu._precheck_dri
 
-    gpu.find_tool = lambda name: "/fake/glmark2-es2"
+    gpu.find_tool = lambda name: FakeGroup.BIN
     gpu.sudo_hint_if_unavailable = lambda result, label: True
     # 记下 with_sudo 拿到的 timeout_sec —— 用来断言「生效后的那个上限」
     # 真的传到了命令上 (不是配的那个更小的值)
@@ -196,9 +224,21 @@ def patch(lines, rc=0, cancelled=False, cancel_after=None, cfg=None, group=None,
         return list(cmd)
 
     gpu.with_sudo = _fake_with_sudo
-    gpu._precheck_display = lambda: (True, "测试桩")
-    gpu._precheck_session = lambda v: (True, "测试桩")
-    gpu._precheck_dri = lambda: (True, "测试桩")
+    # ⚠️ 前置检查现在是 **async** 的 —— X11 那一项要实连一次 xdpyinfo 才判得了
+    # 「会话能不能用」(2026-10-29 新板第一轮 GPU 误判的教训), 所以桩也得是
+    # async 的, 否则 `await checker()` 会炸。
+    async def _fake_display():
+        return True, "测试桩"
+
+    async def _fake_session(variant):
+        return True, "测试桩"
+
+    async def _fake_dri():
+        return True, "测试桩"
+
+    gpu._precheck_display = _fake_display
+    gpu._precheck_session = _fake_session
+    gpu._precheck_dri = _fake_dri
 
     async def fake_exec(*cmd, **kw):
         return FakeProc(lines, rc=rc, hang=hang)
@@ -207,13 +247,15 @@ def patch(lines, rc=0, cancelled=False, cancel_after=None, cfg=None, group=None,
     _SUDO_CALLS.clear()
     if group is not None:
         _ORIGINALS["_pgid_of"] = gpu._pgid_of
+        _ORIGINALS["_sid_of"] = gpu._sid_of
         _ORIGINALS["_own_pgid"] = gpu._own_pgid
-        _ORIGINALS["_proc_group_members"] = gpu._proc_group_members
+        _ORIGINALS["_scan_proc"] = gpu._scan_proc
         _ORIGINALS["_sudo_kill_group"] = gpu._sudo_kill_group
-        # 假进程组: 进程组 id == 我们的进程 pid (start_new_session 建的那种)
+        # 假进程表: 我们起的进程 (pid 4242) 自己就是会话 leader (sid == pid)
         gpu._pgid_of = lambda pid: pid
+        gpu._sid_of = lambda pid: pid
         gpu._own_pgid = lambda: 999999
-        gpu._proc_group_members = group.list_members
+        gpu._scan_proc = group.list_proc
         gpu._sudo_kill_group = group.kill
     return FakeCtx(cancelled=cancelled, cancel_after=cancel_after, cfg=cfg)
 
@@ -226,7 +268,8 @@ def restore():
     gpu._precheck_display = _ORIGINALS["display"]
     gpu._precheck_session = _ORIGINALS["session"]
     gpu._precheck_dri = _ORIGINALS["dri"]
-    for name in ("_pgid_of", "_own_pgid", "_proc_group_members", "_sudo_kill_group"):
+    for name in ("_pgid_of", "_sid_of", "_own_pgid", "_scan_proc",
+                 "_sudo_kill_group"):
         if name in _ORIGINALS:
             setattr(gpu, name, _ORIGINALS[name])
             _ORIGINALS.pop(name)
@@ -258,7 +301,7 @@ def case1():
 # ── ② 判定: 三种「没跑完」必须分开 ─────────────────────────────
 
 def case2():
-    print("\n【2】判定: 被掐断 → failed, 不是 passed")
+    print("\n【2】判定: 场景数是清单的前缀 → stopped (人误关了窗口), 不是 failed")
     expected = gb.expected_identities()
     # 只渲染了 2 个场景就出分 (历史 run 124 的原样)
     rendered = ["build|use-vbo=false", "build|use-vbo=true"]
@@ -266,11 +309,32 @@ def case2():
         rc=0, score=198.0, rendered=rendered, expected=expected,
         cancelled=False, timed_out=False, timeout_sec=600, tag="", out="",
     )
-    check(st == "failed", f"只跑 2/{len(expected)} 个场景 → failed (不是 passed)", st)
+    check(st == "stopped", f"只跑 2/{len(expected)} 个场景 → stopped (不是 failed)", st)
+    check(st != "failed", "**不是** failed (不冤枉被测设备)", st)
     check("没有结论" in (err or ""), "错误信息明说「没有结论」", err)
     check("2/" in (err or ""), "错误信息带上场景数", err)
     check("Esc" in (err or "") or "关" in (err or ""),
           "错误信息提示常见原因 (窗口被关/按了 Esc)", err)
+    check("不是板子不合格" in (err or ""),
+          "错误信息明说「不是板子不合格」", err)
+
+    print("\n【2b】判定: 一个场景都没渲染出来 → error (工具没跑起来, 不是 failed)")
+    st, err = gpu._judge_round(
+        rc=1, score=None, rendered=[], expected=expected,
+        cancelled=False, timed_out=False, timeout_sec=600, tag="", out="",
+    )
+    check(st == "error", "0 场景 + 非 0 退出码 → error", st)
+    check(st != "failed", "**不是** failed", st)
+    check("没跑起来" in (err or ""), "错误信息明说「工具/环境没跑起来」", err)
+    check("不是「板子不合格」" in (err or ""),
+          "错误信息明说不是板子不合格", err)
+
+    print("\n【2c】判定: 渲染过场景之后才崩 → failed (真证据, 别放过)")
+    st, err = gpu._judge_round(
+        rc=139, score=None, rendered=rendered, expected=expected,
+        cancelled=False, timed_out=False, timeout_sec=600, tag="", out="",
+    )
+    check(st == "failed", "渲染过之后异常退出 → failed (板子真的崩过)", st)
 
     print("\n【3】判定: 用户按停止 → stopped (主动中止 ≠ 失败)")
     st, err = gpu._judge_round(
@@ -334,7 +398,7 @@ def case3():
 # ── ④ 端到端: 真的跑一遍 GPUTest.run() ─────────────────────────
 
 async def case4():
-    print("\n【8】端到端: 半截的测试不能再记成 passed")
+    print("\n【8】端到端: 半截的测试不能记成 passed, 也不该记成 failed")
     expected = gb.expected_identities()
     # 假装只跑了 2 个场景就退出了 (exit 0, 照样出分) —— 历史 run 124 的原样
     lines = LINES_FULL[:2] + SCORE_BANNER
@@ -343,7 +407,10 @@ async def case4():
         res = await gpu.GPUTest().run(ctx)
     finally:
         restore()
-    check(res.status == "failed", "整项判 failed", res.status)
+    check(res.status == "stopped", "整项判 stopped (人关了窗口, 不是板子不合格)",
+          res.status)
+    check(res.status != "passed", "不是 passed", res.status)
+    check(res.status != "failed", "不是 failed", res.status)
     check(res.metrics.get("scenes_completed") == 2, "场景数被数出来了 (2)",
           res.metrics.get("scenes_completed"))
     check(res.metrics.get("scenes_expected") == len(expected),
@@ -352,6 +419,20 @@ async def case4():
     # 分数明明是 198, 但**不能**判通过
     check(res.metrics.get("score") == 198.0, "分数照样记下来 (供排查)",
           res.metrics.get("score"))
+
+    print("\n【8b】端到端: 一个场景都没渲染出来 → error (工具没跑起来)")
+    # 假进程一行都不吐就退出 (rc=1) —— 模拟 sudo 提权失败 / 会话连不上
+    ctx = patch([], rc=1)
+    try:
+        res = await gpu.GPUTest().run(ctx)
+    finally:
+        restore()
+    check(res.status == "error", "整项判 error", res.status)
+    check(res.status != "failed", "不是 failed (不冤枉被测设备)", res.status)
+    check("没跑起来" in (res.error or ""), "错误信息明说工具/环境没跑起来",
+          res.error)
+    check(res.metrics.get("scenes_completed") == 0, "场景数 = 0",
+          res.metrics.get("scenes_completed"))
 
     print("\n【9】端到端: 跑全了才判 passed")
     full_lines = full_scene_lines()
@@ -442,7 +523,7 @@ async def case6():
 
 
 async def case7():
-    print("\n【12】按「停止」→ 以 root 身份整组收掉 (全屏窗口立刻消失)")
+    print("\n【12】按「停止」→ 以 root 身份**整组收掉真正占屏的那一组**")
     grp = FakeGroup()
     ctx = patch(full_scene_lines()[:1] + SCORE_BANNER, cancel_after=2, group=grp,
                 hang=True)
@@ -454,58 +535,161 @@ async def case7():
     check(len(grp.killed) == 1, "只收了一次 (TERM 就退了, 不多杀)",
           grp.killed)
     check(grp.killed and grp.killed[0][1] == "TERM", "先发 TERM", grp.killed)
-    check(grp.killed and grp.killed[0][0] == 4242,
-          "杀的是我们自己那一组 (pgid == 我们起的进程 pid)", grp.killed)
+    # ⚠️ **G11 的要害**: GNU timeout 自己另起了一组, glmark2 在 **4300** 那一组,
+    #    sudo 那一组 (4242) 里只有 sudo 一个。杀 4242 = 打空组 = root 的
+    #    glmark2 收不到信号, 而工具还照样报「窗口应已消失」—— 撒谎。
+    check(grp.killed and grp.killed[0][0] == 4300,
+          "杀的是**真正跑着 glmark2 的那一组** (4300)", grp.killed)
+    check(grp.killed and grp.killed[0][0] != 4242,
+          "**没有**去杀 sudo 那个空组 (4242 —— 打过去打不到 root 的 glmark2)",
+          grp.killed)
     check("整组收掉" in (res.error or "") and "Esc" not in (res.error or ""),
           "提示语说窗口已被收掉, 不用再让工人按 Esc", res.error)
     check(any("进程组" in l for l in ctx.logs),
-          "日志里记下了这一组进程的组 id", ctx.logs[:6])
+          "日志里记下了收尾用的那个进程组", ctx.logs[:6])
 
 
 async def case8():
     print("\n【13】提权收尾的安全前提: 校验不过就绝不动手")
     # 这一组里全是**别的东西** (防 pid 复用撞车) —— 必须拒绝, 且一条命令
-    # 都不许发出去
-    orig_members = gpu._proc_group_members
+    # 都不许发出去。
+    # ⚠️ 这里把 `with_sudo` 和 `create_subprocess_exec` **都**换成假的:
+    #    万一哪天哪道校验失效了, 发出去的也只是**假命令** —— 真命令要是漏出去,
+    #    那就是在真机上杀进程组了, 测试不该有这权限。
+    orig_scan = gpu._scan_proc
     orig_own = gpu._own_pgid
+    orig_with_sudo = gpu.with_sudo
+    orig_exec = gpu.asyncio.create_subprocess_exec
     sent = []
 
-    async def spy(cmd, env=None, timeout_sec=None):
-        sent.append(cmd)
+    def spy(cmd, env=None, timeout_sec=None):
+        sent.append(list(cmd))
         return list(cmd)
 
-    orig_with_sudo = gpu.with_sudo
+    class FakeKillProc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*cmd, **kw):
+        sent.append(list(cmd))
+        return FakeKillProc()
+
     gpu.with_sudo = spy
+    gpu.asyncio.create_subprocess_exec = fake_exec
     try:
         # ① 组里没有活进程
-        gpu._proc_group_members = lambda pgid: []
-        ok, why = await gpu._sudo_kill_group(4242, "TERM")
+        gpu._scan_proc = lambda: []
+        ok, why = await gpu._sudo_kill_group(4242, "TERM", session=4242)
         check(not ok and "没有活进程" in why, "空组 → 拒绝, 不用杀", why)
 
         # ② 组里有别的进程 (不含 glmark2) → 拒绝 (pid 复用撞车)
-        gpu._proc_group_members = lambda pgid: [
-            (1234, "sleep", "S", "/bin/sleep 100")]
+        gpu._scan_proc = lambda: [
+            (1234, "sleep", "S", 4242, 4242, "/bin/sleep 100")]
         ok, why = await gpu._sudo_kill_group(4242, "TERM",
-                                             expect_cmdline="glmark2")
+                                             expect_cmdline="glmark2",
+                                             session=4242)
         check(not ok and "不是我们要杀的那个" in why,
               "组里不是 glmark2 → 拒绝", why)
 
-        # ③ 我们自己的进程组 → 拒绝 (否则等于自杀)
+        # ③ 组里混进了**别的会话**的进程 → 拒绝 (2026-10-29 新增的那道)
+        #    组 id 会过期、会撞车; **会话 id 不会** —— 这是新加的防撞依据
+        gpu._scan_proc = lambda: [
+            (1234, "glmark2-es2", "S", 4242, 9999,
+             "/usr/bin/glmark2-es2 --fullscreen"),
+            (1235, "sleep", "S", 4242, 9999, "/bin/sleep 100")]
+        ok, why = await gpu._sudo_kill_group(4242, "TERM",
+                                             expect_cmdline="glmark2",
+                                             session=4242)
+        check(not ok and "不属于我们会话" in why,
+              "组里混进别的会话的进程 → 拒绝 (防 pid 复用撞车)", why)
+
+        # ④ 没说清是哪个会话 → 拒绝 (会话才是认「这棵树是我们起的」的依据)
+        gpu._scan_proc = lambda: [
+            (1234, "glmark2-es2", "S", 4242, 4242,
+             "/usr/bin/glmark2-es2 --fullscreen")]
+        ok, why = await gpu._sudo_kill_group(4242, "TERM",
+                                             expect_cmdline="glmark2")
+        check(not ok and "哪个会话" in why, "没给会话 → 拒绝", why)
+
+        # ⑤ 我们自己的进程组 → 拒绝 (否则等于自杀)
         gpu._own_pgid = lambda: 4242
-        ok, why = await gpu._sudo_kill_group(4242, "TERM")
+        ok, why = await gpu._sudo_kill_group(4242, "TERM", session=4242)
         check(not ok and "自杀" in why, "服务自己的组 → 拒绝", why)
         gpu._own_pgid = orig_own
 
-        # ④ 非法 pgid
-        ok, why = await gpu._sudo_kill_group(0, "TERM")
+        # ⑥ 非法 pgid
+        ok, why = await gpu._sudo_kill_group(0, "TERM", session=4242)
         check(not ok and "不合法" in why, "pgid=0 → 拒绝", why)
-        ok, why = await gpu._sudo_kill_group(1, "TERM")
+        ok, why = await gpu._sudo_kill_group(1, "TERM", session=4242)
         check(not ok and "不合法" in why, "pgid=1 (init) → 拒绝", why)
     finally:
-        gpu._proc_group_members = orig_members
+        gpu._scan_proc = orig_scan
         gpu._own_pgid = orig_own
         gpu.with_sudo = orig_with_sudo
-    check(not sent, "上面四种情况一条提权命令都没发出去", sent)
+        gpu.asyncio.create_subprocess_exec = orig_exec
+    check(not sent, "上面六种情况一条提权命令都没发出去", sent)
+
+
+def case9():
+    print("\n【14】按会话找那棵树: 认的是**真正跑 glmark2 的那一组**")
+    grp = FakeGroup()
+    orig_scan = gpu._scan_proc
+    gpu._scan_proc = grp.list_proc
+    try:
+        t = gpu.GPUTest()
+        t.sid = grp.sid
+        t._glmark_bin = FakeGroup.BIN
+        t.proc = FakeProc([])              # sudo 自己 (pid 4242)
+        check(t._glmark_target_group() == 4300,
+              "找到的是 payload 那一组 (4300), 不是 sudo 那一组 (4242)",
+              t._glmark_target_group())
+        check(t._glmark_left_alive() is True,
+              "安全网: 认出 root 的 glmark2 还活着 (原来永远认不出)")
+        # glmark2 还没起来, 只有 timeout 包装层 → 也认它那一组
+        grp._proc = [p for p in grp._proc if p[0] != 4301]
+        check(t._glmark_target_group() == 4300,
+              "glmark2 还没起来时, 认 timeout 那一组 (4300) —— "
+              "它还在就说明 glmark2 还能被拉起来",
+              t._glmark_target_group())
+        # 一个都没了 → 找不到
+        grp._proc = []
+        check(t._glmark_target_group() is None, "都没了 → 找不到 (None)",
+              t._glmark_target_group())
+        check(t._glmark_left_alive() is False, "安全网不再误报")
+    finally:
+        gpu._scan_proc = orig_scan
+
+
+async def case10():
+    print("\n【15】收不掉就**如实说收不掉** —— 绝不谎报「窗口应已消失」")
+    # 假的收尾: 信号发出去了, 但那个占屏的进程**赖着不走** (D 态 / 卡死的
+    # 那种)。这时工具必须说「没能收掉、可能还占着屏幕」——
+    # 谎报「窗口已经消失」会让工人不去按 Esc, 屏幕就一直占着。
+    class StubbornGroup(FakeGroup):
+        async def kill(self, pgid, sig="TERM", timeout_sec=8.0,
+                      expect_cmdline=None, session=None):
+            self.killed.append((pgid, sig))
+            return True, f"(假) 已向进程组 {pgid} 发出 {sig} (但它没死)"
+
+    grp = StubbornGroup()
+    ctx = patch(full_scene_lines()[:1] + SCORE_BANNER, cancel_after=2, group=grp,
+                hang=True)
+    try:
+        res = await gpu.GPUTest().run(ctx)
+    finally:
+        restore()
+    check(len(grp.killed) >= 2, "TERM 不行就升级到 KILL", grp.killed)
+    check(grp.killed and grp.killed[-1][1] == "KILL", "最后一轮是 KILL",
+          grp.killed)
+    check(res.status == "stopped", "整项仍是 stopped", res.status)
+    msg = res.error or ""
+    check("可能还占着屏幕" in msg or "没能把它收掉" in msg,
+          "提示语明说「没能收掉 / 可能还占着屏幕」", msg)
+    check("窗口应该已经消失" not in msg, "**没有**谎报「窗口已经消失」", msg)
+    check(not any("窗口应已消失" in l for l in ctx.logs),
+          "日志里也没有谎报「窗口应已消失」", ctx.logs)
 
 
 async def main():
@@ -517,6 +701,8 @@ async def main():
     await case6()
     await case7()
     await case8()
+    case9()
+    await case10()
     print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))
     for f in FAILS:
         print("  ✗ " + f)

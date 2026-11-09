@@ -8,7 +8,10 @@ import shutil
 import signal
 import subprocess
 import time
-from typing import Awaitable, Callable, List, Optional, Tuple
+from pathlib import Path
+from typing import Awaitable, Callable, List, NamedTuple, Optional, Tuple
+
+from ..config import Config
 
 
 # ── 终端还原: 把子进程"原地重绘"的输出还原成屏幕上的样子 ──
@@ -78,6 +81,24 @@ def demangle_tty(text: str) -> str:
 
 # ── 带进度的子进程等待 ──
 
+class ProcOutcome(NamedTuple):
+    """run_proc_with_progress 的结果。
+
+    `reason` 说明「**为什么停下来的**」—— 这一条是 2026-10-28 那次事故的
+    产物: 以前只回一个 `killed: bool`, 于是「用户按了停止」和「设备卡死
+    超时」被混成同一句 RuntimeError, 工人自己按的暂停在报告里变成了
+    「失败」, 整轮也跟着判 failed。
+
+      · ""            —— 进程自己跑完
+      · "cancelled"   —— 用户中途按了「停止」
+      · "hard_limit"  —— 到了我们自己的硬上限, 我们主动收的
+    """
+    rc: int
+    text: str
+    killed: bool
+    reason: str = ""
+
+
 async def run_proc_with_progress(
     proc: asyncio.subprocess.Process,
     duration_sec: float,
@@ -85,8 +106,8 @@ async def run_proc_with_progress(
     on_tick: Optional[Callable[[float], Awaitable[None]]] = None,
     tick_sec: float = 1.0,
     hard_limit_sec: Optional[float] = None,
-) -> Tuple[int, str, bool]:
-    """按挂钟等子进程自然退出, 期间每 tick_sec 回调一次。返回 (rc, 输出, 是否被我们杀掉)。
+) -> ProcOutcome:
+    """按挂钟等子进程自然退出, 期间每 tick_sec 回调一次。返回 ProcOutcome。
 
     **为什么不能用 `communicate()` 一把等到底** —— 那是一次阻塞到进程退出,
     中间既不报进度也不查取消: 工人看着进度条不动, 点了「停止」也没反应,
@@ -125,6 +146,7 @@ async def run_proc_with_progress(
 
     t0 = time.monotonic()
     killed = False
+    reason = ""
     while True:
         done, _ = await asyncio.wait({wait_task}, timeout=tick_sec)
         if done:
@@ -135,11 +157,13 @@ async def run_proc_with_progress(
         # 会先到点, 走不到这里; 这道是给 `timeout` 自己都不在了的场合兜底)
         if hard_limit_sec is not None and elapsed > hard_limit_sec:
             killed = True
+            reason = "hard_limit"
             await kill_proc(proc, wait_sec=3.0, ctx=ctx)
             break
 
         if ctx is not None and await ctx.is_cancelled():
             killed = True
+            reason = "cancelled"
             await kill_proc(proc, wait_sec=3.0, ctx=ctx)
             break
 
@@ -155,7 +179,7 @@ async def run_proc_with_progress(
         pass
 
     rc = proc.returncode if proc.returncode is not None else -1
-    return rc, "\n".join(lines), killed
+    return ProcOutcome(rc, "\n".join(lines), killed, reason)
 
 
 def fio_runtime_args(duration_sec: float, size_mb: int) -> List[str]:
@@ -186,6 +210,45 @@ def fio_timeout_sec(duration_sec: float) -> int:
     测试当成卡死杀掉 —— 那个误判会让一个好端端的盘被判 failed。
     """
     return max(30, int(duration_sec)) + 120
+
+
+def loader_error_message(rc: int, text: str) -> str:
+    """工具**起不来**(不是「跑了但失败」)时, 给人话; 不是这类问题返回 ""。
+
+    ⚠️ **为什么非把它跟「跑失败」分开**(2026-11-06 实测):
+    U 盘版里 fio 是 wrapper, 靠 LD_LIBRARY_PATH 找盘里的 .so。依赖没带齐时
+    它是 rc=127 + `error while loading shared libraries` ⇒ 报告里写
+    「fio write 失败」⇒ **看着像板子坏了 ⇒ 白白返修一台好板子**。
+    真实原因: 盘里 fio 的依赖没打全(那次是缺 `libceph-common.so.2`)。
+
+    所以这类要单独说一句「**工具起不来, 不是板子坏了**」。
+    """
+    if rc != 127 and "error while loading shared libraries" not in (text or ""):
+        return ""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    detail = ""
+    for ln in lines:
+        if "error while loading shared libraries" in ln:
+            detail = ln
+            break
+    if not detail:
+        detail = lines[-1] if lines else f"rc={rc}"
+    # 只要出得去缺失的库名, 工人/排障的人一眼就知道该补什么
+    # (报错行长这样: `<binary>: error while loading shared libraries:
+    #  libceph-common.so.2: cannot open shared object file: ...`
+    #  ⇒ 库名是第 3 段, 不是第 1 段 —— 第 1 段是二进制自己的路径)
+    lib = ""
+    for part in detail.split(": "):
+        part = part.strip()
+        if ".so" in part and " " not in part:
+            lib = part
+            break
+    return (
+        "工具起不来(缺共享库), 不是板子坏了 —— "
+        + (f"缺 {lib}: " if lib else "")
+        + detail
+        + "。U 盘版的工具靠盘里的 .so 运行 ⇒ 这根盘的工具没带全, 换一根完整的盘重跑。"
+    )
 
 
 # ── 进程超时管理 (避免 rc=-15 误判) ──
@@ -234,16 +297,52 @@ async def run_proc_with_wallclock(
     return proc, rc, out.decode(errors="replace"), elapsed, killed_by_us
 
 
+#: **U 盘版应用**: 随包工具目录(环境变量名)。
+#:
+#: 「应用装在 U 盘上跑」时, `fio` / `glmark2-es2` 这些**不是**装在板子上的
+#: —— 它们在 U 盘的 `tools/` 里。`start.sh` 把这个目录指出来, `find_tool()`
+#: 就先去那儿找。
+#:
+#: 目录长这样(由 `scripts/build_usb_image.sh` 生成):
+#:     <U 盘>/tools/bin/<名字>      ← wrapper(设好 LD_LIBRARY_PATH 再 exec)
+#:     <U 盘>/tools/lib/…           ← 那 10 个运行时库(.so)
+#:     <U 盘>/tools/libexec/<名字>.bin ← 真二进制
+#:     <U 盘>/tools/share/glmark2/  ← glmark2 的场景数据
+#:
+#: ⚠️ **没设这个变量时行为一个字不变** —— 设备版(deb 装)走的是系统 PATH。
+TOOL_DIR_ENV = "AGING_TOOL_DIR"
+
+
+def tool_dir() -> Optional[str]:
+    """随包工具目录(`AGING_TOOL_DIR`), 没设 → None。
+
+    ⚠️ U 盘挂载点漂移时这个目录会**跟着盘换位置**(`/media/User/AGING/tools`
+    → `/media/User/AGING1/tools`)⇒ 按**设备**重新绑定(见 `Config.rebind`)。
+    """
+    d = os.environ.get(TOOL_DIR_ENV, "").strip()
+    if not d:
+        return None
+    return str(Config.rebind(Path(d)))
+
+
 def find_tool(name: str) -> Optional[str]:
-    """在 PATH + /sbin + /usr/sbin + /usr/local/sbin 找可执行.
+    """在 **随包工具目录** + PATH + /sbin + /usr/sbin + /usr/local/sbin 找可执行.
 
     返回绝对路径或 None.
+
+    ⚠️ **随包工具目录排在最前面** —— 「U 盘版」时盘上那份才是这一版的工具,
+    板子上碰巧也装了一份(旧版)也不该用它。
     """
+    d = tool_dir()
+    if d:
+        cand = os.path.join(d, "bin", name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
     p = shutil.which(name)
     if p:
         return p
-    for d in ("/usr/local/sbin", "/usr/sbin", "/sbin", "/usr/local/bin"):
-        full = os.path.join(d, name)
+    for dd in ("/usr/local/sbin", "/usr/sbin", "/sbin", "/usr/local/bin"):
+        full = os.path.join(dd, name)
         if os.path.isfile(full) and os.access(full, os.X_OK):
             return full
     return None
@@ -279,6 +378,72 @@ async def run_cmd(
 
 def is_root() -> bool:
     return os.geteuid() == 0
+
+
+# ── 收尾: 删文件 (走子进程) / 找出没收干净的进程 ──────────────────
+
+async def remove_file_async(path: str, timeout: float = 10.0) -> bool:
+    """删掉一个文件 —— **走子进程**, 绝不在调用者的线程里直接 unlink。
+
+    为什么不能直接 `os.unlink(path)`:
+      卡一旦挂死(设备对读写没有应答), unlink 会卡在内核的写信号量上
+      **永远不返回**(D 态, 不可中断)。而这个调用是**同步**的, 跑在
+      asyncio 的事件循环线程里 ⇒ 整个事件循环就此冻结 ⇒ 整个服务死掉。
+
+      2026-10-28 实测: 主线程死在
+      `unlinkat → vfs_unlink → rwsem_down_write_slowpath`, uvicorn 从此
+      不再响应任何请求(`/api/health 都超时), 只能拔卡复位才缓过来。
+
+    走子进程的话, 卡死的是**那个子进程**(而且它会被 timeout 收掉),
+    事件循环照跑, 服务活着 —— 卡坏了顶多这一项判不合格。
+
+    删不掉(文件归 root, 因为 fio 是被提权起的)时再用 `sudo -n rm -f`
+    补一次 —— 跟老逻辑一致, 只是**全程没有同步 I/O**。
+
+    返回 True = 删掉了(或本来就没有)。
+    """
+    if not path:
+        return True
+    # 先用普通用户删一次(文件是 root 的话会失败, 那再走 sudo)
+    rc, _out, err = await run_cmd(["rm", "-f", path], timeout=timeout)
+    if rc == 0:
+        return True
+    rc2, _out2, err2 = await run_cmd(
+        with_sudo(["rm", "-f", path]), timeout=timeout)
+    if rc2 == 0:
+        return True
+    # 两个都没删掉 —— 但**不能**因此把整项判失败: 卡挂死时删不掉是常态,
+    # 真正要报的是「设备无响应」, 不是「文件删不掉」。
+    return False
+
+
+def leftover_fio_pids(marker: str) -> List[int]:
+    """找出**还活着的** fio 进程(命令行里带 marker 的), 返回 PID 列表。
+
+    为什么需要它: 设备卡死时, fio 会卡在内核的不可中断状态(D 态) ——
+    **任何信号都杀不掉它**(SIGTERM/SIGKILL 都被内核挂起), 连同为 root 的
+    `timeout` 到点也收不掉它。于是它变成一个孤儿进程(PPID=1), 继续往
+    那张死卡上写。
+
+    工具必须**如实告诉操作员**「这几个进程没收掉」, 否则人会以为工具已经
+    清理干净了, 拔卡重插时那些进程还在写 —— 卡永远缓不过来。
+    """
+    out: List[int] = []
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return out
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if "fio" in cmd and marker and marker in cmd:
+            out.append(int(pid))
+    return sorted(out)
 
 
 def sudo_available() -> bool:
@@ -328,6 +493,51 @@ def is_sudo_password_error(text: str) -> bool:
         return False
     low = text.lower()
     return any(s in low for s in _SUDO_PASSWORD_ERRORS)
+
+
+# ── §11.2 补充: sudo **不许执行这条命令** 时的特征报错 ──
+#
+#   "sudo: user aging is not allowed to execute '/usr/bin/timeout'"
+#
+# ⚠️ **跟「要密码」是两回事** —— 免密是配了的, 但 sudoers 的命令白名单里
+#   **没有这一条**。症状一样是「命令跑不起来」, 药方完全不同:
+#     · 要密码      → 补 NOPASSWD;
+#     · 不许执行    → 补**这条命令**的白名单。
+#
+# ⚠️ **被拒的会是 `/usr/bin/timeout`(或 `/usr/bin/env`), 一般不会是盘上的工具** ——
+#   `with_sudo()` 一律先包一层 timeout(§11.2 的「服务不提权, 只提权单条命令」),
+#   而 **sudo 只认最外层那条命令**, 后面的都是它的参数:
+#     sudo -n /usr/bin/timeout -k 5 60 /mnt/aging/tools/bin/fio --name=...
+#                    ^^^^^^^^^^^^^^^ sudo 授权的是这个; 盘上的 fio 只是参数
+#   ⇒ 「U 盘版」**不需要**在产线的 sudoers 里额外放行盘上的工具路径:
+#     设备版和 U 盘版被授权的命令**完全一样** ⇒ 现有的白名单继续有效。
+#   (2026-11-05 实测: 两种模式下 fio/glmark2/memtester 的 sudo 命令逐项比对,
+#    被授权的那条命令一模一样 —— 见 tests/test_usb_app_mode.py 的
+#    「sudo 被授权的永远是系统路径」那个测试, 它是这条结论的绊线。)
+#
+# ⚠️ 不认它的话, 这一项会判 **failed**(工人眼里 = 板子坏了, 送修)——
+#   实际是产线的权限配置漏了这条命令。§11.2: 报错口径不能混。
+_SUDO_NOT_ALLOWED_ERRORS = (
+    "not allowed to execute",
+)
+
+
+def is_sudo_not_allowed_error(text: str) -> bool:
+    """这段报错是不是「sudo 不许执行这条命令」(白名单里没有)?"""
+    if not text:
+        return False
+    low = text.lower()
+    return any(s in low for s in _SUDO_NOT_ALLOWED_ERRORS)
+
+
+def sudo_not_allowed_hint(text: str = "") -> str:
+    """统一文案: sudoers 白名单里没有这条命令 —— 产线环境配置问题。"""
+    tail = f" 原始报错: {text.strip()[:200]}" if text else ""
+    return (
+        "sudoers 的免密白名单里没有这条命令(免密是配了的, 但没覆盖到它)。"
+        "这是**产线环境配置问题**, 不是被测设备不合格 —— 请产线管理员把"
+        "这条命令加进 sudoers 的 NOPASSWD 名单。" + tail
+    )
 
 
 def sudo_nopasswd_hint(text: str = "") -> str:

@@ -1,0 +1,25 @@
+Package: aging-test
+Version: 0.1.0-15
+Section: utils
+Priority: optional
+Architecture: arm64
+Maintainer: Factory Aging Test <factory@local>
+Depends: python3 (>= 3.8), python3-venv, python3-pip
+Description: 工厂老化测试工具 (A527 产线硬件体检 + 老化测试)
+ 单机硬件体检 + 老化测试工具, 带 Web UI, 桌面图标一键启动, 报告可导出 PDF。
+ .
+ 测试项 (11 项): CPU 压力 / GPU 渲染 / WiFi 扫描 / 蓝牙 (应关闭) / USB 读写 /
+ 网口链路 / HDMI 输出 / 风扇 / TF 卡 / 内存 / eMMC。
+ .
+ 本包**自带系统工具的离线仓** (/usr/lib/aging-test/deps/*.deb): 装机时一次性
+ dpkg 装上, 全程**不联网** —— 产线跑测时再去镜像源拉包就是产品质量事故
+ (docs/需求设计.md §11.7)。
+ .
+ ⚠️ 依赖列表里**故意不写** chromium 和那些测试工具:
+   · chromium 由**出货镜像自带**, 而 Ubuntu 20.04 仓库里的 chromium-browser
+     是个 48KB 的 snap 过渡包 —— 装上 PDF 报告会静默变成空白 (§8.2.1);
+   · 其它工具由随包的离线仓提供, 走 dpkg 装, 不走 apt 依赖解析
+     (依赖解析要联网, 且会顺手降级目标机上已有的包)。
+ .
+ 装完: 桌面点「工厂老化测试」图标启动。数据落在 /var/lib/aging-test/
+ (history.db / 报告 PDF / 日志), 代码在 /usr/lib/aging-test/ (root 所有)。

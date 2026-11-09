@@ -137,7 +137,13 @@ class MemoryTest(TestCase):
             "原地重绘进度(原始字节里是几万个字符的转轮), 还原后每个测试项一行, "
             "结论一字不少。"
         )
-        await ctx.on_progress(0, "准备开始")
+        # ── 整项的计时起点 ──
+        #
+        # ⚠️ 进度文案里的「已用 Ns」用它, 而且必须是**整项**的尺度 ——
+        #    跟那根条的百分比同一个尺度(见 `_report` 里的说明)。工人拿到
+        #    「已用 30s / 预计 60s」就能算出该是 50%, 拿条一比就知道条没骗人。
+        item_t0 = time.time()
+        await ctx.on_progress(0, f"准备开始 · 预计 {times * timeout_sec:.0f}s")
 
         # ── 进度条的分母: 一轮该用多少秒 ──
         #
@@ -163,6 +169,18 @@ class MemoryTest(TestCase):
                 """报一次进度: 以**轮次**为主, 轮内按 frac 插值。
 
                 整数百分比和文案都没变就不报 —— 进度条不需要每 0.1% 刷一次。
+
+                ⚠️ **文案里必须带时间**(2026-11-06 产线反馈「内存测试的进度条
+                不对, 没按照实际的进度百分比和显示时间」)。别的项(eMMC /
+                CPU / GPU / USB / 风扇 / HDMI)文案里都带「已用 Ns / 预计 Ns」,
+                只有内存这项原来只有一句「第 1/1 轮」⇒ 工人盯着那根条, 看到
+                的是**光秃秃一个百分比**, 没有第二个数可以对 —— 「条是不是
+                走慢了」只能靠猜, 于是「条不对」的怀疑落回工具头上。
+
+                这里给的是**整项**的尺度(不是本轮的), 这样文案里的两个数
+                跟那根条的百分比**永远是同一个比例**:
+                「已用 30s / 预计 60s」⇒ 条就该在 50% —— 工人一比就知道。
+                (本轮尺度不行: times>1 时本轮走完是 100%, 而条才走了 1/times。)
                 """
                 nonlocal round_frac, last_sent
                 if done_rounds != i:
@@ -170,6 +188,12 @@ class MemoryTest(TestCase):
                 else:
                     round_frac = max(round_frac, frac)
                 pct = _overall_pct(done_rounds, round_frac, times)
+                # 整项的「已用 / 预计」—— 与百分比同一个尺度。
+                # 分母用**自校准后**的 round_sec_est(第一轮前是 timeout_sec),
+                # 所以「预计」跟条的分母是同一个数, 不会各说各话。
+                elapsed = time.time() - item_t0
+                total = times * round_sec_est
+                msg = f"{msg} · 已用 {elapsed:.0f}s / 预计 {total:.0f}s"
                 if (pct, msg) == last_sent:
                     return
                 last_sent = (pct, msg)
@@ -417,5 +441,5 @@ class MemoryTest(TestCase):
         elif result.status == "pending":
             result.status = "failed"
 
-        await ctx.on_progress(100, "完成")
+        await ctx.on_progress(100, f"完成 · 共 {time.time() - item_t0:.0f}s")
         return result

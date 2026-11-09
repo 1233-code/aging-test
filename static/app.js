@@ -110,6 +110,12 @@ createApp({
         // 就是测试没过。
         const reportPath = ref('');
         const reportError = ref('');
+        // §8.2.3 报告有没有存到 U 盘上, 存在哪儿。
+        //
+        // **只是条提示, 不弹窗** —— 产线上一个工人守着几十台机器, 弹窗只会
+        // 挡路。存成了告诉他存哪儿(拔盘走人时知道东西在盘上), 没存成告诉他
+        // 「报告还在本机」, 但**绝不影响**这一轮的判定。
+        const usbReportNote = ref('');
         // ⚠️ **不能用 `runId` 拼下载链接** —— `runId` 在 mini-run(重测失败项)
         // 时是**故意指向父轮**的(见 run_started 处理), 而刚导出的 PDF 属于
         // mini-run 自己那一份。不另记一份 id 的话, 重测完点「打开 PDF 报告」
@@ -145,20 +151,59 @@ createApp({
         // 而报告印的是「后端说它什么时候开始」 —— 两个数差几秒, 工人对着
         // 屏幕和对着纸面会看出两回事。用后端的时间戳, 界面跟报告永远对得上。
         const runStartedAt = ref(0);
-        // 「现在」—— 每秒走一格, 只为让读秒**看得见在动**。
-        // 计时本身不用它算(用的是后端的时间戳), 它只在**还没结束**时兜底。
-        const clockNow = ref(Date.now() / 1000);
+        // 「现在」—— **后端的时钟**, 不是浏览器的墙钟。
+        //
+        // ⚠️ (2026-11-06 实测, 症状: 顶栏读秒整轮是 00:00:00, 校正之后又
+        //     跳成「2 个多小时」, 而报告里的「总耗时」是对的):
+        //     产线板子的系统时钟常常是**歪的**(硬复位后退回 51.8 天前),
+        //     后端因此用「锚点 + 单调钟」**推算**时间戳 ⇒ 报告上印的是推算
+        //     时间。前端要是拿 `Date.now()`(系统时钟)去减后端给的
+        //     `started_at`(推算时间), 那是**跨时间尺度相减**:
+        //       · 系统时钟慢 ⇒ 差值是负数 ⇒ 被 clamp 成 00:00:00(整轮冻住);
+        //       · 系统时钟被校正(前跳 51.8 天)之后 ⇒ 差值变成几十天;
+        //       · 锚点要是停在几小时前(见 clock.save_anchor 的坑)⇒ 差值
+        //         正好是那几小时 ⇒ 「2 个多小时」(实测 2 小时 28 分)。
+        //     ⇒ 一律用后端下发的 `server_now` 打底, 再用**浏览器的单调钟**
+        //     (`performance.now()`)往前推 —— 单调钟不受系统时钟跳变影响。
+        const serverNow = ref(0);        // 后端时钟(与报告同一个时间尺度)
+        const serverNowPerf = ref(0);    // 收到它那一刻的 performance.now()
+        const clockNow = ref(0);
         let clockTimer = null;
+        // 浏览器单调钟(毫秒) —— 墙钟跳变(NTP 校时/手动改时间)不影响它。
+        const perfNow = () => (
+            (typeof performance !== 'undefined' && typeof performance.now === 'function')
+                ? performance.now()
+                : Date.now()
+        );
+        // 收到后端的时间戳 ⇒ 重新打基准(WS 每条消息 / 快照都调)。
+        const syncServerClock = (v) => {
+            const n = Number(v);
+            if (!Number.isFinite(n) || n <= 0) return false;
+            serverNow.value = n;
+            serverNowPerf.value = perfNow();
+            clockNow.value = n;
+            return true;
+        };
         const startClock = () => {
             if (clockTimer) return;
             clockTimer = setInterval(() => {
-                clockNow.value = Date.now() / 1000;
+                // 有后端基准 ⇒ 用它 + 单调钟往前推(不受系统时钟跳变影响);
+                // 没有(老后端 / 还没连上) ⇒ 兜底用本机墙钟。
+                clockNow.value = serverNow.value
+                    ? serverNow.value + (perfNow() - serverNowPerf.value) / 1000
+                    : Date.now() / 1000;
             }, 1000);
             // Node 里(测试用)让这个定时器别吊着进程 —— 浏览器里没这方法。
             if (clockTimer && typeof clockTimer.unref === 'function') {
                 clockTimer.unref();
             }
         };
+        // ⚠️ **这里曾经有一个「⚠ 时钟 推算值 · 差 51.8 天」的小标签**
+        // (§9.3.4), 2026-11-06 **按工人要求撤掉了** —— 顶栏只留读秒。
+        // 撤掉的是**提示**, 不是**修法**: 时钟本身照样走「后端基准 +
+        // 浏览器单调钟」(见下面 serverNow / perfNow), 所以顶栏读秒、
+        // 总结页「总耗时」、报告头表「总耗时」三个数**仍然是同一个数**;
+        // 「系统时钟倒退过」这件事由**报告正文里的黄条**说明(那儿本来就有)。
         const stopClock = () => {
             if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
         };
@@ -241,15 +286,29 @@ createApp({
 
         // ── §7.7 「没测出通过结果」的项都能重测 ──
         //
-        // failed + error + **skipped**: 跳过的项也是**没测成** —— 未接显示器、
-        // 网口没插、TF 卡槽是空的、环境不具备条件。这些恰恰是「补上料/补上环境
-        // 之后再跑一遍」就能测的项, 所以跟失败项走**同一个**重测入口。
-        // (stopped —— 用户中途停止、压根没跑到的项 —— 不算: 那不是「跳过」,
-        //  工人是主动叫停的, 那一轮剩下的项本来就不该由这个入口接管。)
+        // failed + error + **skipped** + **stopped**:
+        //   · failed / error —— 测出了问题;
+        //   · skipped —— **没测成**(未接显示器 / 网口没插 / TF 卡槽是空的);
+        //   · stopped  —— 也是**没测成**, 而且是**最该重测**的那一种:
+        //     工人中途按了暂停(多半就是那一项卡住了), 或者上一轮服务中途夭折
+        //     (卡挂死把事件循环冻死 / 被 kill / 断电 —— 见 §6.9.1)。
+        //     两种都是「结论没拿到」, 补上料、把板子复位之后**就该再测一次**
+        //     才知道合不合格。
+        //
+        // ⚠️ 旧规则把 stopped 排除在外, 理由是「工人主动叫停的, 不该由这个入口
+        //   接管」—— 那条只对「工人不想再测这一轮」成立; 而工人按暂停恰恰是
+        //   **因为那一项坏了**, 按完他要的就是「再测一次这张卡」。
+        //   更要命的是: 重测轮开跑会把父轮对应项先写成 `running`, 而 `running`
+        //   从来不在重测集合里 ⇒ **重测那一轮没跑完, 父轮那一项就永远重测不了**,
+        //   按钮直接消失(2026-10-28 TF 卡挂死那次就是这样)。收尾逻辑把 running
+        //   收成 stopped 之后, 按钮还得在 —— 所以 stopped 必须进这个集合。
+        //
+        // passed 不进(过了就别白跑); pending / running 也不进(那是「还没测」,
+        // 不是「没测成」—— 那一轮还在跑, 按钮本来就是灰的)。
         const retestableItemNames = computed(() =>
             resultList.value
                 .filter(r => r.status === 'failed' || r.status === 'error'
-                         || r.status === 'skipped')
+                         || r.status === 'skipped' || r.status === 'stopped')
                 .map(r => r.name)
         );
         const hasRetestableItems = computed(() => retestableItemNames.value.length > 0);
@@ -284,7 +343,7 @@ createApp({
         // **skipped / stopped 都不计入** —— 没跑的项不该拉低通过率。
         //
         // 光有「8 通过 / 0 失败 / 0 跳过」是不够的: 屏幕上分不清
-        // 「勾了 8 项全测过」和「勾了 10 项只测了 8 项、2 项没测」。
+        // 「勾了 8 项全测过」和「勾了 11 项只测了 8 项、3 项没测」。
         // 所以把通过率、(已测 M / 共勾选 K) 和未测项名一起摆出来。
         const executedCount = computed(() =>
             passedCount.value + failedCount.value + errorCount.value
@@ -414,7 +473,7 @@ createApp({
             }
         };
 
-        // 2026-10-27: 拖拽排序和「↺ 重置顺序」一起去掉了 —— 10 项的顺序
+        // 2026-10-27: 拖拽排序和「↺ 重置顺序」一起去掉了 —— 11 项的顺序
         // 固定成后端下发的推荐顺序(§7.6), 工人拖不动也不需要复位。
         // `testOrder` 留着: 它是**这一轮的执行顺序**的唯一来源, 开始测试
         // 时原样发给后端, 后端按它跑。
@@ -542,6 +601,10 @@ createApp({
         // WS 的 `snapshot` 和启动后的补查都走这里 —— 同一套恢复逻辑, 不写两份。
         const applySnapshot = (msg) => {
             if (!msg) return;
+            // 快照里带着后端自己的「现在」⇒ 对表(WS 那条路在 onmessage 里
+            // 已经对过一次, 这里再对一次是为了覆盖「页面刚打开 / 刷新后
+            // 主动补查」这条路 —— 那条路没有 WS 消息经过)。
+            if (msg.server_now) syncServerClock(msg.server_now);
             // mini-run 时 runId 仍指向父轮 —— 跟 run_started 的约定一致。
             // 以前这里是无条件 runId = msg.run_id, mini-run 时会跟那条约定
             // 打架(一会儿指父轮一会儿指自己), 顺着改掉。
@@ -657,10 +720,40 @@ createApp({
             }
         };
 
+        // ── 两个键 (2026-10-29): 「停止」和「下一项」 ──
+        //
+        // · 「停止」  = 中止**整轮**: 当前项和后面所有项都记「跳过」,
+        //   收尾后直接跳到结果页;
+        // · 「下一项」= 只跳**当前这一项**(记「跳过」), 接着测下一项。
+        //
+        // 两个都弹确认框 —— 「停止」是不可逆的(这一轮剩下的项都不测了),
+        // 「下一项」虽然可逆(那一项能重测), 但按错了也白按掉一项。
         const stopTest = async () => {
-            if (!confirm('确定停止测试?')) return;
+            if (!confirm(
+                '确定停止整轮测试?\n\n' +
+                '· 当前这一项和后面所有项都会记为「跳过」(没测成)\n' +
+                '· 收尾后直接跳到结果页\n' +
+                '· 已经测出来的通过/失败**不会被抹掉**'
+            )) return;
             userStopped.value = true;  // 标记用户主动停
-            await fetch('/api/test/stop', { method: 'POST' });
+            const r = await fetch('/api/test/stop', { method: 'POST' });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok || data.ok === false) {
+                alert(data.error || ('停止失败: HTTP ' + r.status));
+            }
+        };
+
+        const nextTest = async () => {
+            if (!confirm(
+                '跳过当前这一项, 直接测下一项?\n\n' +
+                '· 当前项会记为「跳过」(没测成, 不计入通过率, 之后能重测)\n' +
+                '· 后面各项照常测'
+            )) return;
+            const r = await fetch('/api/test/next', { method: 'POST' });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok || data.ok === false) {
+                alert(data.error || ('操作失败: HTTP ' + r.status));
+            }
         };
 
         // ========== 关闭服务 ==========
@@ -726,18 +819,19 @@ createApp({
             await loadHistory();
         };
 
-        // ========== 重测失败/跳过项 (§7.7) ==========
+        // ========== 重测没测成的项 (§7.7) ==========
         //
         // **总结页和历史页调的是同一个函数** —— 两者唯一的差别是「重测哪一轮」:
         //   · 总结页: 刚跑完这一轮 → 目标 = 当前这一轮
         //   · 历史页: 点开的那条记录 → 目标 = **那条记录**(可能是刚跑完, 也可能
         //     是过了一会儿、期间还开了别的测试)
         // 两条路走的是同一个后端接口, 都会把结果**合并回被重测的那一轮**,
-        // 并更新那一份报告 —— 这才是「重测失败/跳过项」该有的样子。
+        // 并更新那一份报告 —— 这才是「重测没测成的项」该有的样子。
         //
-        // **重测哪些项**: failed + error + skipped(见上面 retestableItemNames)。
-        // 跳过的那几项也是**没测成**(没接显示器 / 没插网线 / 卡槽是空的) ——
-        // 补上料、补上环境之后就该能重测, 所以跟失败项走同一个入口。
+        // **重测哪些项**: failed + error + skipped + stopped(见上面
+        // retestableItemNames)。跳过、没跑到的那几项也是**没测成**(没接显示器 /
+        // 没插网线 / 卡槽是空的 / 中途停了) —— 补上料、补上环境之后就该能重测,
+        // 所以跟失败项走同一个入口。
         //
         // seedItems: 历史页进来时向导页的结果列表是空的, 得用那条记录的
         // 逐项结果把它铺上, 否则工人看到的是个空白的向导页。
@@ -751,7 +845,7 @@ createApp({
                 return;
             }
             if (!confirm(
-                `将重新测试 ${names.length} 项(失败/出错/跳过):\n${names.join(', ')}\n\n` +
+                `将重新测试 ${names.length} 项(失败/出错/跳过/没跑到):\n${names.join(', ')}\n\n` +
                 `结果会合并回${sourceLabel}, 并更新那一份报告。\n继续?`
             )) {
                 return;
@@ -806,20 +900,21 @@ createApp({
             }
         };
 
-        // 总结页的「重测失败/跳过项」—— 目标就是当前这一轮
-        const retestFailedOrSkipped = async () => {
+        // 总结页的「重测没测成的项」—— 目标就是当前这一轮
+        const retestNotPassed = async () => {
             await retestRun(runId.value, retestableItemNames.value, '这一轮');
         };
 
-        // 历史页的「重测失败/跳过项」—— 目标是**被点开的那条记录**。
+        // 历史页的「重测没测成的项」—— 目标是**被点开的那条记录**。
         // 只给正式轮(不是重测轮)出这个入口: 重测轮只是过程, 归档对象
         // 始终是最初那一轮 —— 在重测轮上再重测, 只会套出一串套娃记录。
         //
-        // 挑哪些项: failed + error + **skipped** —— 跟总结页**同一套口径**
-        // (§7.7): 跳过的项也是没测成的, 补上料/环境之后就该能重测。
+        // 挑哪些项: failed + error + **skipped** + **stopped** —— 跟总结页
+        // **同一套口径**(§7.7): 跳过的项、没跑到(中途停下/服务夭折)的项都是
+        // **没测成**, 补上料/把板子复位之后就该能重测。
         const historyRetestableNames = (detail) => (detail && detail.results || [])
             .filter(r => r.status === 'failed' || r.status === 'error'
-                     || r.status === 'skipped')
+                     || r.status === 'skipped' || r.status === 'stopped')
             .map(r => r.test_name);
         const retestHistoryRun = async (detail) => {
             if (!detail) return;
@@ -846,8 +941,22 @@ createApp({
             no_ap: '未扫描到任何 WiFi 热点 —— 环境无 AP',
             dhcp_failed: 'WiFi 关联成功但 DHCP 未拿到地址 —— 地址池耗尽或 AP 侧限制',
             no_route: '关联成功但无默认路由 —— 网络配置异常',
+            aborted_by_user: '工人中止了整轮测试 —— 本项未执行',
+            skipped_by_user: '工人跳过此项, 直接测了下一项',
         };
         const envReasonText = (code) => ENV_REASON_TEXT[code] || code;
+
+        // 跳过原因**分两类**(2026-10-29): 「环境原因」(料没到位/工位环境不行)
+        // 和「用户主动」(按了「停止」/「下一项」)—— 提示语不能混, 否则工人
+        // 看到「建议处理工位环境」会去查网线, 而实际上是他自己按的按钮。
+        const SKIP_REASON_LABEL = {
+            aborted_by_user: '用户中止整轮',
+            skipped_by_user: '用户跳过此项',
+        };
+        const skipReasonLabel = (code) => SKIP_REASON_LABEL[code] || '环境原因跳过';
+        const skipReasonNote = (code) => SKIP_REASON_LABEL[code]
+            ? '不计入通过率, 需要的话可以重测这一项'
+            : '不计入通过率, 建议处理工位环境后复测';
 
         // 指标值怎么显示在界面上。
         //
@@ -976,6 +1085,10 @@ createApp({
                     reportPath.value = body.path || '';
                     reportRunId.value = id;
                 }
+                // §8.2.3 手动补导的也会同步到 U 盘 —— 提示一下存没存成。
+                if (body.usb && body.usb.message) {
+                    usbReportNote.value = body.usb.message;
+                }
                 await loadHistoryDetail(id);
                 await loadHistory();
             } catch (e) {
@@ -992,6 +1105,12 @@ createApp({
 
             ws.onmessage = async (ev) => {
                 const msg = JSON.parse(ev.data);
+                // ⚠️ **每条消息都重新对一次表** —— 后端在每条事件里都带
+                //    `server_now`(它自己的时钟, 跟报告同一个时间尺度)。
+                //    不对表的话, 顶栏读秒就退回用浏览器自己的系统时钟算 ⇒
+                //    板子的系统时钟歪着(硬复位后退回 51.8 天前)时读秒会
+                //    整轮冻在 00:00:00, 校正之后又跳成「2 个多小时」。
+                if (msg && msg.server_now) syncServerClock(msg.server_now);
                 await handleEvent(msg);
             };
             ws.onclose = () => setTimeout(connectWS, 2000);
@@ -1264,6 +1383,16 @@ createApp({
                     reportError.value = msg.reason || '未知原因';
                     break;
                 }
+                // §8.2.3 报告存 U 盘的结果 —— **只是条提示**, 不弹窗。
+                // 两种都**不改**本轮判定(测试结果早写完库了)。
+                case 'usb_report_saved': {
+                    usbReportNote.value = msg.message || '报告已存到 U 盘';
+                    break;
+                }
+                case 'usb_report_missing': {
+                    usbReportNote.value = msg.message || '未检测到 U 盘 —— 报告仍在本机';
+                    break;
+                }
             }
         };
 
@@ -1310,10 +1439,12 @@ createApp({
             alertBanner, setAlert,
             history, historyDetail, runId, expandedId,
             exportingId, exportError, reportPath, reportError, reportRunId,
+            usbReportNote,
             tfPrompt, ethPrompt, currentTestIndex, lastStatus,
             depsInfo, shuttingDown,
             runSn, runFinishedAt, runError, mergedParent,
             runStartedAt, clockNow, startClock, stopClock, fmtHms, fmtDur,
+            serverNow, syncServerClock, perfNow,
             // computed
             snUnknown, snDisplay, snTitle,
             hasAnyEnabled, hasFailedItems, failedCount,
@@ -1327,9 +1458,10 @@ createApp({
             summaryEmoji, summaryStatusText,
             // methods
             statusText, formatTime, formatDuration, displayNameOf, envReasonText,
+            skipReasonLabel, skipReasonNote,
             fmtMetricValue,
-            selectAll, startTest, stopTest, shutdownService,
-            goConfig, goHistory, retestFailedOrSkipped, retestHistoryRun,
+            selectAll, startTest, stopTest, nextTest, shutdownService,
+            goConfig, goHistory, retestNotPassed, retestHistoryRun,
             historyRetestableNames,
             toggleHistoryDetail,
             tfInserted, tfSkip, ethPlugged, ethSkip,
@@ -1341,3 +1473,8 @@ createApp({
         };
     }
 }).mount('#app');
+
+// 界面确实挂起来了 —— 告诉页面里的看门狗「别再显示『界面没能加载出来』」。
+// ⚠️ 放**最后一行**: 上面任何一步抛错, 这行就不执行 ⇒ 看门狗会**如实**说
+//    界面没起来(而不是装作一切正常, 让工人对着白屏发呆)。
+window.__AGING_BOOTED__ = true;

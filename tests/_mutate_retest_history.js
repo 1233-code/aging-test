@@ -32,7 +32,7 @@ const MUTATIONS = [
         file: 'app.js',
         from: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
             .filter(r => r.status === 'failed' || r.status === 'error'
-                     || r.status === 'skipped')
+                     || r.status === 'skipped' || r.status === 'stopped')
             .map(r => r.test_name);`,
         to: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
             .filter(r => r.status === 'failed')
@@ -43,10 +43,22 @@ const MUTATIONS = [
         file: 'app.js',
         from: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
             .filter(r => r.status === 'failed' || r.status === 'error'
-                     || r.status === 'skipped')
+                     || r.status === 'skipped' || r.status === 'stopped')
             .map(r => r.test_name);`,
         to: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
             .filter(r => r.status === 'failed' || r.status === 'error')
+            .map(r => r.test_name);`,
+    },
+    {
+        name: 'JS: historyRetestableNames 不再挑「没跑到」的项 (重测轮没跑完的那项永远测不了)',
+        file: 'app.js',
+        from: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
+            .filter(r => r.status === 'failed' || r.status === 'error'
+                     || r.status === 'skipped' || r.status === 'stopped')
+            .map(r => r.test_name);`,
+        to: `        const historyRetestableNames = (detail) => (detail && detail.results || [])
+            .filter(r => r.status === 'failed' || r.status === 'error'
+                     || r.status === 'skipped')
             .map(r => r.test_name);`,
     },
     {
@@ -56,12 +68,29 @@ const MUTATIONS = [
         from: `        const retestableItemNames = computed(() =>
             resultList.value
                 .filter(r => r.status === 'failed' || r.status === 'error'
-                         || r.status === 'skipped')
+                         || r.status === 'skipped' || r.status === 'stopped')
                 .map(r => r.name)
         );`,
         to: `        const retestableItemNames = computed(() =>
             resultList.value
                 .filter(r => r.status === 'failed' || r.status === 'error')
+                .map(r => r.name)
+        );`,
+    },
+    {
+        name: 'JS: 总结页的可重测清单里没有「没跑到」的项',
+        file: 'app.js',
+        summary: true,
+        from: `        const retestableItemNames = computed(() =>
+            resultList.value
+                .filter(r => r.status === 'failed' || r.status === 'error'
+                         || r.status === 'skipped' || r.status === 'stopped')
+                .map(r => r.name)
+        );`,
+        to: `        const retestableItemNames = computed(() =>
+            resultList.value
+                .filter(r => r.status === 'failed' || r.status === 'error'
+                         || r.status === 'skipped')
                 .map(r => r.name)
         );`,
     },
@@ -144,8 +173,15 @@ const MUTATIONS = [
         name: 'HTML: 总结页按钮上的数字写死 (跳过项没算进去)',
         file: 'index.html',
         summary: true,
-        from: `>🔂 重测失败/跳过项 ({{ retestableCount }})</button>`,
-        to: `>🔂 重测失败/跳过项 ({{ failedCount }})</button>`,
+        from: `>🔂 重测失败/跳过/没跑到 ({{ retestableCount }})</button>`,
+        to: `>🔂 重测失败/跳过/没跑到 ({{ failedCount }})</button>`,
+    },
+    {
+        name: 'HTML: 按钮文案回退成「重测失败/跳过项」(工人以为没跑到的项不能重测)',
+        file: 'index.html',
+        summary: true,
+        from: `>🔂 重测失败/跳过/没跑到 ({{ retestableCount }})</button>`,
+        to: `>🔂 重测失败/跳过项 ({{ retestableCount }})</button>`,
     },
     {
         name: 'HTML: 按钮不再禁用 (跑着的时候也能点)',

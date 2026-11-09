@@ -6,10 +6,14 @@ import re
 import shutil
 from typing import Optional
 
-from .base import TestCase, TestContext, TestResult, register
+from .base import (
+    TestCase, TestContext, TestResult, register,
+    TestCancelled, DeviceUnresponsive,
+)
 from ._tools import (
     find_tool, with_sudo, sudo_hint_if_unavailable,
     run_proc_with_progress, fio_runtime_args, fio_timeout_sec,
+    leftover_fio_pids, remove_file_async, loader_error_message,
 )
 
 
@@ -77,6 +81,22 @@ def _read_life_time(path: str = LIFE_TIME_PATH) -> tuple:
     return pct, raw, None
 
 
+def _leftover_note(pids) -> str:
+    """「还有几个 fio 进程没收掉」—— 如实写进报错。
+
+    设备卡死时 fio 会卡在内核的不可中断状态(D 态), 连同为 root 的
+    `timeout` 都杀不掉它, 它就变成孤儿进程(PPID=1)继续往死卡上写。
+    操作员必须知道这件事 —— 否则他会以为工具已经收干净了, 拔卡重插时
+    那些进程还在写, 卡永远缓不过来。
+    """
+    if not pids:
+        return ""
+    return (f"; ⚠ 还有 {len(pids)} 个 fio 进程没收掉"
+            f"(PID {', '.join(str(p) for p in pids)}): "
+            f"设备卡死时进程会卡在内核不可中断状态, 任何信号都杀不掉它, "
+            f"需要把卡拔出来复位才能清掉")
+
+
 def _parse_fio_text(text: str) -> dict:
     """解析 fio 文本输出中的关键指标"""
     metrics = {}
@@ -133,6 +153,11 @@ async def _run_fio_test(
         # **必须带 timeout_sec**: fio 一旦卡住 (坏块 / 驱动异常) 就是永久挂死,
         # 而它被 §11.2 提权成 root 后我们发不了信号 —— 只能靠同为 root 的
         # `timeout` 到点杀它。
+        #
+        # ⚠️ 但 `timeout` **也杀不掉**卡在 D 态(内核不可中断)的 fio ——
+        #    信号会被内核挂起直到 I/O 返回, 而那张卡永远不返回。于是 fio
+        #    变成孤儿进程(PPID=1)继续往死卡上写。`timeout` 的退出码 124
+        #    就是「到点了但没杀掉」的信号, 下面据此判「设备无响应」。
         cmd = with_sudo([
             fio_bin, f"--name={rw}", "--ioengine=libaio",
             "--direct=1", "--bs=1M",
@@ -148,12 +173,39 @@ async def _run_fio_test(
             if on_progress:
                 await on_progress(rw, elapsed, duration_sec)
 
-        rc, text, killed = await run_proc_with_progress(
+        out = await run_proc_with_progress(
             proc, duration_sec, ctx=ctx, on_tick=tick, hard_limit_sec=tmo + 30,
         )
-        if killed:
-            raise RuntimeError(f"fio {rw} 被中断 (取消或超时)")
+        rc, text = out.rc, out.text
+
+        # ── 三种「停下来」要分得开 (§9.1 / §9.3) ──
+        #
+        #   ① 用户按了「停止」      → TestCancelled      → 这一项记 stopped
+        #   ② 设备没应答(卡死了)   → DeviceUnresponsive → 这一项记 failed
+        #   ③ fio 自己报错          → RuntimeError       → 这一项记 error
+        #
+        # 以前①②③全是同一句 RuntimeError, 于是工人自己按的暂停在报告里
+        # 变成了「失败」(2026-10-28 实测), 而卡死了也看不出是卡的问题。
+        if out.reason == "cancelled":
+            raise TestCancelled(f"fio {rw} 被用户中止")
+        if out.reason == "hard_limit":
+            raise DeviceUnresponsive(
+                f"fio {rw} 跑了 {tmo + 30}s 还没结束 —— 设备没有应答"
+                + _leftover_note(leftover_fio_pids(os.path.basename(test_file)))
+            )
+        if rc == 124:
+            # `timeout` 到点(退出码 124) —— 设备没应答。注意: 卡在 D 态的
+            # fio 这时候**还活着**, timeout 收不掉它。
+            raise DeviceUnresponsive(
+                f"fio {rw} 跑到挂钟上限({tmo}s)仍未结束 —— 设备没有应答"
+                + _leftover_note(leftover_fio_pids(os.path.basename(test_file)))
+            )
         if rc != 0:
+            # ⚠️ 「工具起不来」跟「跑了但失败」必须分开说 —— 前者是**盘/镜像**
+            # 的问题(不是板子坏了), 混成一句会让好板子白白返修(2026-11-06 实测)
+            loader_msg = loader_error_message(rc, text)
+            if loader_msg:
+                raise RuntimeError(loader_msg)
             raise RuntimeError(f"fio {rw} 失败: rc={rc} · {text[-300:]}")
         m = _parse_fio_text(text)
         if metric_key in m:
@@ -249,6 +301,19 @@ class EMMCTest(TestCase):
                 result.metrics[f"round_{round_idx}_write_mbps"] = write
                 if not all_passed:
                     break
+        except TestCancelled:
+            # 用户中途按了「停止」→ 记 **stopped**(§9.3), 不是 error/failed。
+            # 没跑完 ≠ 不合格, 更不该把整轮判成失败。
+            result.status = "stopped"
+            result.error = "用户中途停止 (本项未跑完)"
+            await ctx.on_log("[eMMC] 用户中途停止 → 本项记 stopped (不计失败)")
+            return result
+        except DeviceUnresponsive as e:
+            # 设备对读写没应答 = **设备本身坏了** → failed(不合格, 换板子)
+            result.status = "failed"
+            result.error = f"设备无响应: {e}"
+            await ctx.on_log(f"[eMMC] ❌ {result.error}")
+            return result
         except FileNotFoundError:
             result.status = "error"
             result.error = "未安装 fio"
@@ -258,10 +323,11 @@ class EMMCTest(TestCase):
             result.error = f"异常: {e!r}"
             return result
         finally:
-            # 清理
+            # 清理 —— **走子进程**, 绝不在事件循环里直接 os.unlink:
+            # 设备卡死时 unlink 会永远不返回(D 态, 内核不可中断), 而这是
+            # 同步调用 → 整个事件循环冻结 → 整个服务死掉(2026-10-28 实测)。
             try:
-                if os.path.exists(test_file):
-                    os.unlink(test_file)
+                await remove_file_async(test_file)
             except Exception:
                 pass
 

@@ -140,7 +140,7 @@ async function main() {
     }
 
     // ══════════════════════════════════════════════════════════
-    section('【2】历史页点「重测失败/跳过项」→ 打的是**那条记录**');
+    section('【2】历史页点「重测没测成的项」→ 打的是**那条记录**');
     {
         const f = makeFetch();
         const a = loadApp({ fetch: f });
@@ -174,7 +174,7 @@ async function main() {
             { name: 'ethernet', status: 'failed' },
             { name: 'wifi', status: 'skipped' },
         ];
-        await a.retestFailedOrSkipped();
+        await a.retestNotPassed();
         const sumCall = f.calls.find(c => c.url === '/api/test/retest');
         check(!!sumCall, '总结页也打 /api/test/retest');
         if (sumCall) {
@@ -515,6 +515,62 @@ async function main() {
               '归档记录都还在', ids);
         check(a.history.value.length === 2,
               '列表正好两行', ids);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    section('【14】没跑到(stopped)的项**也能重测** —— 不然就没法测了');
+    /* 工人原话(2026-10-28):「既然重测一轮没通过, 那应该还是要保留重测按钮吧,
+     * 不然怎么测试」。
+     *
+     * 事故链条: TF 卡挂死 → 工人按了暂停 → 重测轮开跑时把父轮对应项先写成
+     * `running`(让界面别停在旧状态上) → 服务在事件循环里冻死 → 收尾逻辑把
+     * 那一项记成 `stopped`。
+     *
+     * 而 `running` / `stopped` 从来**不在**重测集合里 ⇒ 父轮那一项**永远
+     * 重测不了**, 「🔂 重测…」按钮直接消失 —— 那张卡再也测不了了。
+     * `stopped` 跟 `skipped` 一样是「**没测成**」, 补上料/把板子复位之后就该
+     * 能再测一次。 */
+    {
+        const stoppedDetail = {
+            ...DETAIL,
+            id: 89,
+            status: 'stopped',
+            results: [
+                ...DETAIL.results,
+                // ⚠️ 名字**不能**跟 DETAIL 里已有的项重名 —— DETAIL 里已经有一
+                //   个 tfcard(status=error)了, 重名的话「tfcard 被挑中」这条
+                //   断言在**丢掉 stopped 之后照样成立**(它是被那个 error 项
+                //   挑中的), 断言就咬不住东西了(踩过)。
+                { test_name: 'emmc', status: 'stopped', duration_sec: 0,
+                  metrics: {}, error: '服务重启, 本项没跑完', attempt: 1 },
+            ],
+        };
+
+        const a = loadApp({ fetch: makeFetch() });
+        const names = a.historyRetestableNames(stoppedDetail);
+        check(names.includes('emmc'),
+              '**没跑到(stopped)的项也能重测**', JSON.stringify(names));
+        check(names.includes('wifi'),
+              '跳过的那项照旧能重测', JSON.stringify(names));
+        check(!names.includes('cpu'),
+              '过了的不重测', JSON.stringify(names));
+
+        const f = makeFetch();
+        const b = loadApp({ fetch: f });
+        await b.retestHistoryRun(stoppedDetail);
+        const call = f.calls.find(c => c.url === '/api/test/retest');
+        check(!!call, '点了就发重测请求', f.calls.map(c => c.url));
+        if (call) {
+            check(call.body.test_names.includes('emmc'),
+                  '**没跑到的那项也发过去了**(不然这一项永远测不了)',
+                  JSON.stringify(call.body.test_names));
+            check(call.body.run_id === 89, '目标是那条记录', call.body.run_id);
+        }
+
+        // 铺进向导页时, 要重测的那一项摆成「等待」
+        const em = b.resultList.value.find(r => r.name === 'emmc');
+        check(em && em.status === 'pending',
+              '它在新一轮里摆成「等待」(这轮要重测)', em && em.status);
     }
 
     return finish();

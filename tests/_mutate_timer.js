@@ -143,9 +143,11 @@ const MUTATIONS = [
     {
         name: 'CSS: .run-timer 不再 nowrap (右上角窄, 折行把顶栏撑开)',
         file: 'style.css',
-        from: `    font-family: ui-monospace, "DejaVu Sans Mono", "Courier New", monospace;
+        from: `    font-weight: 600;
+    font-family: ui-monospace, "DejaVu Sans Mono", "Courier New", monospace;
     white-space: nowrap;`,
-        to: `    font-family: ui-monospace, "DejaVu Sans Mono", "Courier New", monospace;`,
+        to: `    font-weight: 600;
+    font-family: ui-monospace, "DejaVu Sans Mono", "Courier New", monospace;`,
     },
     {
         name: 'HTML: 读秒挪到左边那一段 (不是右上角了)',
@@ -185,8 +187,10 @@ const MUTATIONS = [
     {
         name: 'JS: 快照不取 started_at (刷新页面后计时归零)',
         file: 'app.js',
-        from: `            if (msg.started_at) runStartedAt.value = msg.started_at;`,
-        to: `            /* 不取了 */`,
+        from: `            // 计时照样从后端记的那个起点接着走(§7.6 同一条规矩)。
+            if (msg.started_at) runStartedAt.value = msg.started_at;`,
+        to: `            // 计时照样从后端记的那个起点接着走(§7.6 同一条规矩)。
+            /* 不取了 */`,
     },
     {
         name: 'JS: 换项时把起点也改了 (每项各记一个, 不是整轮一个)',

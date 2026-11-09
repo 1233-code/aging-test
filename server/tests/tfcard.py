@@ -31,9 +31,13 @@ import re
 import time
 from typing import List, NamedTuple, Optional
 
-from .base import TestCase, TestContext, TestResult, register
+from .base import (
+    TestCase, TestContext, TestResult, register,
+    TestCancelled, DeviceUnresponsive,
+)
 from ._tools import (
     is_sudo_password_error,
+    remove_file_async,
     run_cmd,
     sudo_hint_if_unavailable,
     sudo_nopasswd_hint,
@@ -340,21 +344,26 @@ async def _unmount(ctx, disk: str, dev: str, path: str, method: str) -> None:
 
 
 async def _remove_test_file(ctx, path: str) -> None:
-    """删掉测试文件。
+    """删掉测试文件 —— **走子进程**, 绝不在事件循环里直接 os.unlink。
 
-    普通删不掉的时候(挂载点是 root 建的, 文件归 root)再用 sudo 删一次
-    —— 留着几十 MB 的垃圾在客户的卡上不像话。
+    为什么(2026-10-28 实测的教训): 卡一旦卡死(设备对读写没应答), unlink
+    会卡在内核的写信号量上**永远不返回**(D 态, 不可中断)。而这是**同步**
+    调用, 跑在 asyncio 的事件循环线程里 ⇒ 整个事件循环就此冻结 ⇒
+    **整个服务死掉**: 当时主线程死在
+    `unlinkat → vfs_unlink → rwsem_down_write_slowpath`, 连 /api/health
+    都不再响应, 只能拔卡复位才缓过来。
+
+    走子进程的话, 卡死的只是**那个子进程**, 服务照样活着 —— 卡坏了顶多
+    这一项判不合格, 不该把整台机器带走。
+
+    删不掉时(fio 是 root 起的, 文件归 root)由 remove_file_async 再用 sudo
+    补一次 —— 留着几十 MB 的垃圾在客户的卡上不像话。
     """
-    try:
-        if os.path.exists(path):
-            os.unlink(path)
-        return
-    except OSError:
-        pass
-    rc, out, err = await run_cmd(with_sudo(["rm", "-f", path]), timeout=15)
-    if rc != 0:
+    ok = await remove_file_async(path)
+    if not ok:
         await ctx.on_log(
-            f"[TF] ⚠ 测试文件没删掉 ({path}): {(err or out or '').strip()[:120]}"
+            f"[TF] ⚠ 测试文件没删掉 ({path}) —— 卡无响应时删不掉是常态, "
+            f"把卡拔出来复位后手动删掉 .aging_test_tf.bin"
         )
 
 
@@ -517,6 +526,22 @@ class TFCardTest(TestCase):
                 result.metrics[f"round_{round_idx}_write_mbps"] = write_mbps
                 if not all_passed:
                     break
+        except TestCancelled:
+            # 用户中途按了「停止」→ 记 **stopped**(§9.3), 不是 error/failed。
+            # 没跑完 ≠ 不合格, 更不该把整轮判成「失败」—— 2026-10-28 就是
+            # 这么把一次人工暂停记成了 fail 的。
+            result.status = "stopped"
+            result.error = "用户中途停止 (本项未跑完)"
+            await ctx.on_log("[TF] 用户中途停止 → 本项记 stopped (不计失败)")
+            await ctx.on_progress(100, "已停止")
+            return result
+        except DeviceUnresponsive as e:
+            # 卡对读写没应答 = **这张卡卡死了** → failed(不合格, 换一张)
+            result.status = "failed"
+            result.error = f"TF 卡无响应: {e} —— 这张卡不合格, 请换一张"
+            await ctx.on_log(f"[TF] ❌ {result.error}")
+            await ctx.on_progress(100, "卡无响应")
+            return result
         except FileNotFoundError:
             result.status = "error"
             result.error = "未安装 fio"

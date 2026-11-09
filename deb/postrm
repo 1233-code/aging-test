@@ -1,0 +1,152 @@
+#!/bin/bash
+# aging-test 卸载后 —— 收尾
+#
+# 【刻意不删数据目录】/var/lib/aging-test 里装的是**产线在用的历史记录**
+#   (history.db + 报告 PDF) —— 那是这台板子过没过货的证据, 不是缓存。
+#   `dpkg --purge` 顺手删掉 = 产线的事故。所以 purge 只做两件事:
+#     ① 收回我们自己解包铺出去的工具文件 (要**两条证据**都成立才删, 见下);
+#     ② 把数据目录留在原地, 并明确告诉工人要清请手工清。
+#
+#   真要连数据一起清:  dpkg --purge aging-test && rm -rf /var/lib/aging-test
+set -u
+
+#: DESTDIR: 打包惯例里的「安装根前缀」, 正常装机是空的 (= 真实 /)。
+#:   dpkg 跑维护脚本时只传一小组干净的环境变量 (PATH/HOME/LANG/DEBIAN_*),
+#:   不会把外面的 DESTDIR 带进来 ⇒ 产线上它恒为空, 只给测试用。
+DESTDIR="${DESTDIR:-}"
+DATA_DIR="${AGING_TEST_DATA_DIR:-/var/lib/aging-test}"
+FILES_FILE="${AGING_TEST_FILES_FILE:-$DATA_DIR/.installed-tools.files}"
+
+log() { echo "[aging-test] $*"; }
+warn() { echo "[aging-test] ⚠ $*" >&2; }
+
+if [ "$1" != "purge" ]; then
+    # 普通 remove: 数据留着 (Debian 惯例 —— remove 保留数据, purge 才删)
+    exit 0
+fi
+
+# ── 1. 收回自己解包铺出去的工具文件 ──
+#
+# postinst 用 `dpkg-deb -x` 把工具解到 / (不进 dpkg 数据库), 所以卸载时要
+# 自己收拾。清单每行三样: **包名 <TAB> 内容指纹 <TAB> 路径**。
+#
+# ⚠️ **删一个文件要两条独立的证据同时成立** —— 缺一条就不删:
+#
+#   ① **指纹对得上** —— 装机时记下的 sha256 (软链记链接目标) 与磁盘上这份
+#      一模一样 ⇒ 证明「这份还是我们铺的那份, 没被谁换过」。
+#      目标机后来用 apt 装了同一个包 → 文件被换掉 → 指纹不符 → 不碰。
+#
+#   ② **这个包在目标机上不是正式安装状态** —— 用 `dpkg-query -W` 查状态库
+#      (/var/lib/dpkg/status, dpkg 的核心库)。
+#      为什么要查状态库而不是 `dpkg -S`: `dpkg -S` 读的是文件索引, 在这类
+#      板子上**半废** —— ① 它记的是打包时的旧路径 (focal 的包记 `/bin/ls`),
+#      文件系统上却是合并后的 (`/usr/bin/ls`), 查后者查不到; ② 有的包
+#      (guvcview / libguvcview-2.0-2) 的 files-list 直接丢了, 索引建不全,
+#      对**真实存在的系统文件**也答「找不到」。拿这种答复当「这是我们铺的,
+#      可以删」⇒ **会把人家 apt 正式装的文件删掉**。
+#      状态库不受这两个坑影响。
+#
+#   ① 挡「文件被人换过」, ② 挡「包本身是人家正式装的 (比如目标机上装的是
+#   旧版本、我们解包盖了上去)」—— 两种情况各挡一半, 缺一不可。
+#
+# 另: 清单里没有指纹的 (老版本装的) 一律**不删** —— 证据不足就不动手。
+#     宁可留几个残留文件, 也不能误删系统文件。
+TAB=$(printf '\t')
+
+# 状态库探针 —— 整个读不出来就什么都不删
+DB_OK=0
+for probe in dpkg coreutils libc6; do
+    st="$(dpkg-query -W -f='${Status}' "$probe" 2>/dev/null | head -1)"
+    case "$st" in
+        *"ok installed"*) DB_OK=1; break ;;
+    esac
+done
+
+# fingerprint <路径> → "<工具>:<值>"; 取不到就返回 1 (与 postinst 同一套算法)
+fingerprint() {
+    local f="$1" t tool
+    if [ -L "$f" ]; then
+        printf 'link:%s' "$(readlink "$f")"
+        return 0
+    fi
+    [ -f "$f" ] || return 1
+    for tool in sha256sum md5sum; do
+        command -v "$tool" >/dev/null 2>&1 || continue
+        t="$("$tool" "$f" 2>/dev/null | cut -d' ' -f1)"
+        if [ -n "$t" ]; then
+            printf '%s:%s' "$tool" "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ -f "$FILES_FILE" ]; then
+    removed=0; kept=0; kept_fingerprint=0; kept_installed=0
+    if [ "$DB_OK" = "0" ]; then
+        warn "dpkg 状态库读不出来 —— 判据不可用, **一个文件都不删** (宁可留残留, 也不误删系统文件)"
+        kept="$(grep -c . "$FILES_FILE" 2>/dev/null || echo 0)"
+    else
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            # 拆行: 包名 / 指纹 / 路径 (老清单可能只有一段或两段)
+            rest="$line"
+            pkg="${rest%%$TAB*}"
+            if [ "$pkg" = "$rest" ]; then
+                pkg=""; fp=""; f="$rest"
+            else
+                rest="${rest#*$TAB}"
+                fp="${rest%%$TAB*}"
+                if [ "$fp" = "$rest" ]; then fp=""; f="$rest"
+                else f="${rest#*$TAB}"; fi
+            fi
+            [ -n "$f" ] || continue
+            [ -e "$DESTDIR$f" ] || [ -L "$DESTDIR$f" ] || continue
+            case "$f" in
+                /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/usr/lib/*|/lib/*|\
+                /usr/lib64/*|/lib64/*|/usr/share/*) ;;
+                *) continue ;;   # 只收系统路径下的, 别的路径不碰
+            esac
+
+            # 证据 ①: 指纹 —— 没有指纹 (老清单) 或对不上 ⇒ 不碰
+            if [ -z "$fp" ]; then
+                kept=$((kept+1)); kept_fingerprint=$((kept_fingerprint+1)); continue
+            fi
+            cur="$(fingerprint "$DESTDIR$f")" || { kept=$((kept+1)); kept_fingerprint=$((kept_fingerprint+1)); continue; }
+            if [ "$cur" != "$fp" ]; then
+                kept=$((kept+1)); kept_fingerprint=$((kept_fingerprint+1))
+                continue
+            fi
+
+            # 证据 ②: 包状态 —— 目标机上正式装了这个包 ⇒ 文件是人家的, 不碰
+            st="$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | head -1)"
+            case "$st" in
+                *"ok installed"*)
+                    kept=$((kept+1)); kept_installed=$((kept_installed+1))
+                    continue ;;
+            esac
+
+            rm -f "$DESTDIR$f" 2>/dev/null && removed=$((removed+1)) || warn "删不掉 $f"
+        done < "$FILES_FILE"
+    fi
+    log "收回工具文件: 删了 $removed 个, 保留 $kept 个"
+    log "  保留原因: 内容已被换过/无指纹 $kept_fingerprint 个, 属于已装包 $kept_installed 个"
+    rm -f "$FILES_FILE"
+fi
+
+# ── 2. 数据目录: 留着, 但说清楚 ──
+if [ -d "$DATA_DIR" ]; then
+    log "数据目录 $DATA_DIR 保留 —— 里面是产线的历史记录与报告 PDF"
+    log "  要连数据一起清: rm -rf $DATA_DIR"
+fi
+
+# ── 3. 收尾: 收回空目录 + 重建字体缓存 ──
+# conffile (/etc/aging-test/config.yaml, /etc/default/aging-test) 由 dpkg 自己
+# 在 purge 时删除, 这里只收空壳目录。
+rmdir "$DESTDIR/etc/aging-test" 2>/dev/null || true
+
+if command -v fc-cache >/dev/null 2>&1; then
+    fc-cache -f >/dev/null 2>&1 || true
+fi
+
+exit 0
