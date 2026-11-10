@@ -8,6 +8,7 @@ from typing import Optional
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import (
     find_tool, with_sudo, sudo_hint_if_unavailable, run_proc_with_progress,
+    deps_fix_hint,
 )
 from ..boot_evidence import cpu_evidence_path
 
@@ -131,7 +132,7 @@ _LADDER = (1, 2, 3, 4, 8, 16, 32)
 #     或者在**终端**里手跑(命令见上)。
 #   ⚠️ **「0 = 自动」当时也等于 5**(自动 = 核数, 再被上限夹住) ——
 #     以前填 0 会回到满核那条危险路上, 那时不会了。
-#     ⚠️ **现在(上限 8)「0 = 自动」= 满核 8**(故意, 但页面 title 里写明了)。
+#     ⚠️⚠️ **2026-11-10: 这条路整个取消了** —— 见下面「范围 1..8」那段。
 #
 # ⚠️⚠️ **2026-11-09 晚(更晚): 默认值定在 4 核 —— 上限仍然是 8**
 #
@@ -172,24 +173,61 @@ _LADDER = (1, 2, 3, 4, 8, 16, 32)
 #     峰值 ≈ 68~72℃ ⇒ 峰值 ≈ **96~100℃** ⇒ 超 85℃ 判定线 ⇒ 判 failed,
 #     离 110℃ critical 只差 10~14℃ ⇒ **内核 emergency shutdown ⇒
 #     板子当场重启**。⇒ **找平衡点时, 每轮之间要让板子凉回同一个起点。**
+#
+# ⚠️⚠️⚠️ **2026-11-10: 线程数的「范围」定死 1..8 —— 下界也抬了**
+#
+#   · **用户的决定(原话)**: 「cpu核数控制在最低是1,最高是8」
+#   · ⇒ **下限从 0 抬到 1**: 以前 `0` = 「自动」= 按核数 = **满核 8** ——
+#     而满核 8 正是 2026-11-04 实测**会把板子压死**的那一档(见上面)
+#     ⇒ **「填 0 就回到满核」那条路封掉**: 页面旋钮 `min="1"`, 后端把
+#     `0` / 负数 / 非法值 一律夹到 **1**;
+#   · ⇒ **上限一个字没动**(仍是 8): 用户要自己在页面上拧, 找平衡点
+#     ⇒ 旋钮 `max="8"` 不动, `MAX_STRESS_THREADS` 也不动;
+#   · ⇒ **「0 = 自动」这个说法在界面上已经没有了**(前端不再有「自动」这
+#     一档, 后端也不再把 0 当「按核数」)—— 想要满核就**明明白白填 8**;
+#   · ⚠️ **这一段只动「下限」, 判定口径一个字没动**: 峰值 > `max_temp_c`
+#     判 failed / 「死在加压途中 ⇒ 判 failed 不放行」那道兜底, 都照旧。
 MAX_STRESS_THREADS = 8
+
+
+def _parse_thread_request(requested) -> int:
+    """页面/配置里填的线程数 → 整数(**非法值当 0**)。
+
+    ⚠️ **解析只做一次, 两边共用** —— `_requested_threads`(算出真正压几核)
+    和 `_floor_applied`(算「有没有被下限顶上去」)必须对同一个字符串给出
+    同一个答案 ⇒ 各写一份 `int()` 的话, 将来改了一处忘了另一处 ⇒
+    报告上说「没被夹」而实际压的是 1 核。
+    """
+    try:
+        return int(requested)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _requested_threads(requested) -> int:
     """页面/配置里填的线程数 → **不考虑天花板**的目标线程数。
 
-    · `0`(或填了非法值)= 自动 = **核数**;
+    · **下限 1**(2026-11-10 用户点名: 「cpu核数控制在最低是1,最高是8」):
+      `0` / 负数 / 非法值 一律当 **1**;
     · 不能比核数还多;
     · 最少 1 线程 —— `stress-ng --cpu 0` 是非法参数。
     """
-    try:
-        req = int(requested)
-    except (TypeError, ValueError):
-        req = 0
+    req = _parse_thread_request(requested)
     ncpu = os.cpu_count() or 4
     if req <= 0:
-        req = ncpu
+        req = 1
     return max(1, min(req, ncpu))
+
+
+def _floor_applied(requested) -> bool:
+    """请求有没有被**下限 1 核**顶上去(填 0 / 负数 / 非法值)。
+
+    为什么要单独问一句: `threads_capped` 只反映**上限**被夹 ⇒ 工人填 `0`
+    (实际只压 1 核)时它仍是「否」⇒ 报告上写着「配置 0 / 实际 1」而**没有
+    一句话解释这个 0 是怎么变成 1 的** —— 看着像老版本那个「0 = 自动 = 按
+    核数」的残留。2026-11-10 起 `0` **不再**表示自动 ⇒ 得让这个夹取**看得见**。
+    """
+    return _parse_thread_request(requested) < 1
 
 
 def _resolve_threads(requested) -> int:
@@ -208,6 +246,9 @@ def _resolve_threads(requested) -> int:
     ⚠️ **2026-11-09 晚(更晚)默认值定在 4 核**(在 `config.yaml` 的
     `defaults.cpu.threads` 里)—— **天花板没动, 仍是 8**; 这个函数只管
     上限, 默认值不归它管。
+    ⚠️ **2026-11-10 下界也定了 1**(用户: 「cpu核数控制在最低是1,最高是8」)
+    —— 「0 = 自动 = 按核数」那条路**取消了**, `0`/负数/非法值一律当 **1**
+    (见 `_requested_threads`); **上限没动, 仍是 8。**
     """
     return max(1, min(_requested_threads(requested), MAX_STRESS_THREADS))
 
@@ -918,6 +959,14 @@ class CPUTest(TestCase):
         # 是**政策**定的, 不是这台板子只有 6 核。
         want_threads = _requested_threads(t_cfg.get("threads", 0))
         threads_capped = (threads != want_threads)
+        # ⚠️ `threads_capped` 的判据是「**夹完的核数 > 加压上限**」——
+        #   `_requested_threads` 已经把请求夹到**核数**了 ⇒ 8 核板子上
+        #   want ≤ 8 = MAX ⇒ **capped 恒为「否」** ⇒ 它回答的是
+        #   「配置值被改了没有」, **不是**「这一轮是不是满核」。
+        #   「这一轮压在满核上」由日志里另一条 `threads >= 上限` 那句管。
+        # 有没有被**下限 1 核**顶上去(填 0 / 负数 / 非法值)——
+        # `threads_capped` 只反映**上限**, 所以这一句得单独问。
+        threads_floored = _floor_applied(t_cfg.get("threads", 0))
         max_temp = float(t_cfg.get("max_temp_c", 85))
         # ── 热保护的两个旋钮 (§6.2) ──
         # ── 加压形态: **连续跑**(默认) 还是 **分片**(显式配了 slice_sec) ──
@@ -1017,9 +1066,29 @@ class CPUTest(TestCase):
         if threads_capped:
             await ctx.on_log(
                 f"[CPU] ⚠️ 线程数被**加压上限 {MAX_STRESS_THREADS} 核**夹住: "
-                f"要 {want_threads} 核, 实际压 {threads} 核 —— 满核会把一批"
-                f"「日常用得好好的」板子压死(实测 6 核稳 / 7 核就复位), "
-                f"误杀好板的代价高于漏判边缘板")
+                f"要 {want_threads} 核, 实际压 {threads} 核 —— 高核是**过应力"
+                f"那一档**(2026-11-04 实测有板子在加压途中**硬复位**, 死因到"
+                f"现在还没查清), 误杀好板的代价高于漏判边缘板")
+        # ⚠️⚠️ **2026-11-10 加**: 「这一轮压在满核上」的提醒。
+        #   ⚠️ 上面那条**在这台板子上永远走不到** —— `threads_capped` 的判据
+        #   是「夹完的上限 > 加压上限」, 而 `_requested_threads` 先把请求夹到
+        #   **核数** ⇒ 8 核板子上 want ≤ 8 = MAX ⇒ **不可能 > 8**
+        #   ⇒ capped 恒为「否」⇒ 那句「满核会压死板子」的提醒**从来没响过**。
+        #   ⇒ 真正该提醒的是「**这一轮实际压到了满核**」(拧到 8 就是满核,
+        #     不管是自己填的还是被夹出来的)⇒ 判据改成 `threads >= 上限`。
+        #   ⇒ 口径跟打包脚本那条警告**一致**(它也是看「用户拧得到几核」,
+        #     不看出厂默认 —— 默认改成 4 之后, 照看出厂默认就永远不响了)。
+        elif threads >= MAX_STRESS_THREADS:
+            await ctx.on_log(
+                f"[CPU] ⚠️ 这一轮压的是**满核 {threads} 核** = **过应力那一档** —— "
+                f"2026-11-04 实测有板子在加压途中**硬复位**(死因还没查清; 满核"
+                f"的温升也最大)⇒ **开跑前请把页面上的「线程数」调低**(出厂默认 4 核)")
+        if threads_floored:
+            await ctx.on_log(
+                f"[CPU] ⚠️ 线程数被**下限 1 核**夹住: 页面填的是 "
+                f"{t_cfg.get('threads', 0)!r}, 实际压 {threads} 核 —— "
+                f"2026-11-10 起 0 不再表示「自动 = 按核数」, "
+                f"想压满请明明白白填 8")
         result.metrics["abort_temp_c"] = abort_temp
         result.metrics["slice_sec"] = slice_sec
         result.metrics["load_mode"] = "sliced" if sliced else "continuous"
@@ -1032,6 +1101,10 @@ class CPUTest(TestCase):
         result.metrics["max_stress_threads"] = MAX_STRESS_THREADS
         if threads_capped:
             result.metrics["threads_capped"] = "是"
+        # 「被下限夹住」也得看得见 —— 否则报告上只有一句「配置 0 / 实际 1」,
+        # 读的人会以为 0 还是老版本那个「自动 = 按核数」。
+        if threads_floored:
+            result.metrics["threads_floored"] = "是"
 
         # ── 起跑前的温度底 ──
         #
@@ -1312,7 +1385,7 @@ class CPUTest(TestCase):
         except FileNotFoundError:
             return {"rc": -1, "text": "", "killed": False, "peak_temp": 0.0,
                     "temp": None,
-                    "error": "未安装 stress-ng,请运行 sudo bash scripts/install_deps.sh"}
+                    "error": f"未安装 stress-ng,{deps_fix_hint()}"}
         except Exception as e:
             return {"rc": -1, "text": "", "killed": False, "peak_temp": 0.0,
                     "temp": None, "error": f"异常: {e!r}"}

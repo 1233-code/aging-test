@@ -94,9 +94,107 @@ MUTATIONS = [
     ),
     (
         "scripts/build_usb_image.sh",
+        'if [ "$_knob_min" -ne 1 ] 2>/dev/null; then',
+        'if false; then',
+        "旋钮下界那道闸门恒不触发(⇒ 页面旋钮又能让工人填 0 = 「自动 = 满核」"
+        "⇒ 2026-11-04 实测会把板子压死的那一档)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        """| grep -oE 'min="[0-9]+"'""",
+        """| grep -oE 'min="[0-9][0-9]+"'""",
+        "读不出页面上的旋钮下界(⇒ 下界闸门永远拿 0 比, 拦不住任何东西)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        """_knob_min="$(grep -m1 -oE 'tests\\[t\\.name\\]\\.threads[^>]*min="[0-9]+"' \\
+            "$OUT_DIR/static/index.html" 2>/dev/null \\
+            | grep -oE 'min="[0-9]+"' | grep -oE '[0-9]+' || true)"
+""",
+        """_knob_min="$(grep -m1 -oE 'tests\\[t\\.name\\]\\.threads[^>]*min="[0-9]+"' \\
+            "$OUT_DIR/static/index.html" 2>/dev/null \\
+            | grep -oE 'min="[0-9]+"' | grep -oE '[0-9]+')"
+""",
+        "把 `|| true` 去掉(⇒ 读不到下界时 `set -e` 在**赋值那一步**就把脚本打死"
+        "(exit 1)⇒ 产线只看到一句莫名其妙的错误, 连「下界必须是 1」都看不到)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
         'cat > "$OUT_DIR/版本.txt" <<EOF',
         'cat > /dev/null <<EOF',
         "版本戳不生成(产线那边又分不清手上这根盘是哪一版)",
+    ),
+    # ── 2026-11-10 新加的三道闸门(范围 1~8 这个事实散在三处)──────────
+    (
+        "scripts/build_usb_image.sh",
+        'if [ "$_app_min" -ne "$_knob_min" ] 2>/dev/null || [ "$_app_max" -ne "$_knob_max" ] 2>/dev/null; then',
+        'if false; then',
+        "前端那道夹子的常量跟旋钮对不上时也不拦(⇒ 镜像带着一道失效的夹子出厂"
+        "⇒ 「填 0 就回到满核」那条路又回来)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        """_app_min="$(grep -m1 -oE 'THREADS_MIN = [0-9]+' "$OUT_DIR/static/app.js" 2>/dev/null \\
+            | grep -oE '[0-9]+' || true)\"""",
+        """_app_min="$(grep -m1 -oE 'THREADS_MIN = [0-9]+' "$OUT_DIR/static/app.js" 2>/dev/null \\
+            | grep -oE '[0-9]+')\"""",
+        "读不到前端夹子的下界时 `set -e` 在**赋值那一步**就把脚本打死(exit 1)"
+        "(⇒ 产线只看到一句莫名其妙的错误, 连「对不上」都看不到)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        """_app_max="$(grep -m1 -oE 'THREADS_MAX = [0-9]+' "$OUT_DIR/static/app.js" 2>/dev/null \\
+            | grep -oE '[0-9]+' || true)\"""",
+        """_app_max="$(grep -m1 -oE 'THREADS_MAX = [0-9]+' "$OUT_DIR/static/app.js" 2>/dev/null \\
+            | grep -oE '[0-9]+')\"""",
+        "同上(上界那一份)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        'if [ "$_code_cap" -gt 0 ] 2>/dev/null && [ "$_knob_max" -gt "$_code_cap" ] 2>/dev/null; then',
+        'if false; then',
+        "旋钮超过代码硬上限时也不拦(⇒ 工人填 8、实际只压 4 ⇒ 界面跟实际对不上)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        """if [ "$_cfg_threads" -gt 0 ] 2>/dev/null && [ "$_knob_def" -gt 0 ] 2>/dev/null \\
+   && [ "$_knob_def" -ne "$_cfg_threads" ] 2>/dev/null; then""",
+        'if false; then',
+        "旋钮 title 里的「默认 N 核」跟出厂默认对不上时也不拦"
+        "(⇒ 工人的提示是错的)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        """_knob_def="$(grep -m1 -oE 'tests\\[t\\.name\\]\\.threads[^>]*' "$OUT_DIR/static/index.html" 2>/dev/null \\
+            | grep -oE 'title="默认 [0-9]+ 核' | grep -oE '[0-9]+' || true)\"""",
+        """_knob_def="$(grep -m1 -oE 'tests\\[t\\.name\\]\\.threads[^>]*' "$OUT_DIR/static/index.html" 2>/dev/null \\
+            | grep -oE 'title="默认 [0-9]+ 核' | grep -oE '[0-9]+')\"""",
+        "读不到 title 里的默认核数时 `set -e` 在**赋值那一步**就把脚本打死(exit 1)",
+    ),
+    (
+        "scripts/build_usb_image.sh",
+        'if ($0 ~ /^  cpu:[[:space:]]*$/) in_cpu = 1; else in_cpu = 0;',
+        'if ($0 ~ /^  cpuX:[[:space:]]*$/) in_cpu = 1; else in_cpu = 0;',
+        "出厂默认读的是**别的段**(认错了段落 ⇒ 读到 0 ⇒ 出厂断言与交叉校验一起失灵)",
+    ),
+    # ⚠️ **2026-11-10**: 「段落隔离」原来**根本没生效** —— 「清零」那条规则
+    #    写在后面, 而前一条先 `next` 掉了 ⇒ 清零永远轮不到 ⇒ 离开 cpu 段
+    #    (走到 gpu 段)时 in_cpu 不会清 ⇒ defaults.cpu 里没有 threads、而
+    #    别的段有同名键时, 读到的是**别的段的数**。
+    (
+        "scripts/build_usb_image.sh",
+        'if ($0 ~ /^  cpu:[[:space:]]*$/) in_cpu = 1; else in_cpu = 0;',
+        'if ($0 ~ /^  cpu:[[:space:]]*$/) in_cpu = 1;',
+        "「离开 cpu 段就清零」被拆掉了(⇒ 出厂默认会读成**别的段**的数 "
+        "⇒ 出厂断言与 title 对账一起失灵)",
+    ),
+    # ⚠️ **2026-11-10 新加的闸门 ⑦: 出厂默认**读不到** ⇒ 拦下**
+    (
+        "scripts/build_usb_image.sh",
+        'if [ "$_cfg_threads" -eq 0 ] 2>/dev/null; then',
+        'if false; then',
+        "出厂默认读不到时也不拦(⇒ 应用那边按「下限 1 核」跑, 这里却以为默认是 8 "
+        "⇒ 界面跟实际对不上)",
     ),
 ]
 

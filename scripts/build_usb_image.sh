@@ -18,7 +18,8 @@
 #     start.sh                ← 服务启动脚本 (启动器内部调它)
 #     怎么启动.txt             ← 给工人看的说明
 #     config.yaml  requirements.txt
-#     server/  static/  docs/  scripts/
+#     server/  static/  docs/
+#     scripts/                ← **只有「运行时 + 诊断」那几类**(其余排除, 见 §③)
 #     wheels/                 ← 离线 python wheel 仓
 #     venv/                   ← 离线建好的 venv (不联网)
 #     tools/
@@ -125,9 +126,56 @@ copy_tree() {   # $1=源目录 $2=目标目录
     done
 }
 
-for d in server static docs scripts; do
+for d in server static docs; do
     copy_tree "$PROJECT_ROOT/$d" "$OUT_DIR/$d"
 done
+# ⚠️⚠️ **2026-11-10 改: `scripts/` 不再整目录全拷**(「打包/部署类」不上盘)
+#
+#   以前这里是 `for d in server static docs scripts` ⇒ 整个 scripts/ 原样
+#   上盘 ⇒ 2026-11-10 从产线盘上清掉的那 8 个「打包/部署类」脚本
+#   (build_deb.sh / build_usb_image.sh / verify_deb.sh / deploy.sh /
+#   install_desktop_icon.sh / prepare_for_firmware.sh / find_pi5_label.py /
+#   **install_deps.sh**)下次打包**又全都回盘上** ⇒
+#   「产线盘只带运行时 + 诊断脚本」这件事**没有被构建脚本保证** ——
+#   只是靠那一次手工清理 ⇒ 清完的盘跟下一根打出来的盘**长得不一样**。
+#
+#   尤其 **`install_deps.sh` 不能带**: 缺工具时页面/报错会**按形态**给办法
+#   —— U 盘版那句话说「盘上没带齐 ⇒ 改用设备版(deb)」⇒ 要是盘上**偏偏
+#   躺着那个脚本**, 工人照着 `sudo bash scripts/install_deps.sh` 跑:
+#     ① 产线网络取不到公网 ⇒ 装不上;
+#     ② 装上了也是装在**板子**上 ⇒ 拔盘就走 ⇒ 白装;
+#   ⇒ 摆在盘上只会**引着工人去试一条死路**。
+#
+#   ⇒ 保留的是**运行时 + 诊断**那几类(自检、网口诊断、加压对照实验…),
+#     排除的是**打包/部署**那几类(产线上一个都用不上)。
+#   ⚠️ `probe_rp_gpio_write.py` 也排除 —— 开发期探针, 跟 deb 版
+#     (build_deb.sh 的白名单)保持一致。
+#   ⚠️ `check_deps.sh` **必须带** —— `start.sh` 启动时会跑它做自检。
+copy_tree_except() {   # $1=源目录 $2=目标目录 $3...=要**排除**的文件名
+    local src="$1" dst="$2"
+    shift 2
+    [ -d "$src" ] || return 0
+    ( cd "$src" && find . -name '__pycache__' -prune -o -name '*.pyc' -prune \
+        -o -name '.git' -prune -o -type f -print ) \
+    | while IFS= read -r f; do
+        local base skip=0
+        base="$(basename "$f")"
+        for x in "$@"; do
+            if [ "$base" = "$x" ]; then
+                skip=1
+            fi
+        done
+        if [ "$skip" = "1" ]; then
+            continue
+        fi
+        mkdir -p "$dst/$(dirname "$f")"
+        cp -p "$src/$f" "$dst/$f"
+    done
+}
+copy_tree_except "$PROJECT_ROOT/scripts" "$OUT_DIR/scripts" \
+    build_deb.sh build_usb_image.sh verify_deb.sh deploy.sh \
+    install_desktop_icon.sh prepare_for_firmware.sh find_pi5_label.py \
+    install_deps.sh probe_rp_gpio_write.py
 for f in start.sh config.yaml requirements.txt; do
     [ -f "$PROJECT_ROOT/$f" ] && cp -p "$PROJECT_ROOT/$f" "$OUT_DIR/$f"
 done
@@ -318,8 +366,33 @@ EOF
 #   板子成批硬复位。⇒ 这一份给工人/产线一个能看懂的答案 + **自查命令**。
 #
 #   ⚠️ **这里只读文本、只写文本**, 不执行镜像里的任何东西。
-_cfg_threads="$(grep -m1 -E '^[[:space:]]*threads:' "$OUT_DIR/config.yaml" 2>/dev/null \
-                | sed -e 's/#.*//' -e 's/[^0-9]*\([0-9]\+\).*/\1/')"
+# ⚠️ **2026-11-10: 「出厂默认」必须从 `defaults.cpu` 段里读** —— 以前是
+#   「文件里第一条 `threads:`」(grep -m1)⇒ 哪天别的段里也出现一个
+#   `threads:`, 读到的就**不是 cpu 的那个** ⇒ 而这个数要拿去做**交叉校验**
+#   (见下面「title 里的默认核数」那道闸门)⇒ 读错 = 误拦好镜像。
+#   ⇒ 用 awk 顺着 `defaults:` → `cpu:` 找, **认段落不认先后**。
+# ⚠️⚠️ **2026-11-10 修: 「段落隔离」原来根本没生效**
+#   规则顺序踩了坑 —— 「清零」那条(`in_cpu && /^  [a-zA-Z_]+:/`)写在
+#   **后**面, 而前一条(`in_def && /^  [a-zA-Z_]+:/`)**先 `next` 掉了**
+#   ⇒ **清零那条永远轮不到** ⇒ 离开 `cpu:` 段(比如走到 `gpu:`)时
+#   `in_cpu` **不会**清掉 ⇒ 万一 `defaults.cpu` 里没有 `threads:` 而
+#   **别的段**有同名键, 读出来的就是**别的段的数** ⇒ 出厂默认算错 +
+#   下面那道闸门拿错的数对账(误拦好镜像)。
+#   ⇒ 现在**一个规则里**就把话说全: 2 空格键是 `cpu:` 才进, 否则**出**。
+_cfg_threads="$(awk '
+    /^defaults:[[:space:]]*$/ { in_def = 1; next }
+    /^[^[:space:]#]/            { in_def = 0; in_cpu = 0; next }
+    in_def && /^  [a-zA-Z_]+:/  {
+        if ($0 ~ /^  cpu:[[:space:]]*$/) in_cpu = 1; else in_cpu = 0;
+        next
+    }
+    in_cpu && /^[[:space:]]+threads:/ {
+        sub(/#.*/, "")
+        gsub(/[^0-9]/, "")
+        print
+        exit
+    }
+' "$OUT_DIR/config.yaml" 2>/dev/null || true)"
 _code_cap="$(grep -m1 -E '^MAX_STRESS_THREADS[[:space:]]*=' "$OUT_DIR/server/tests/cpu.py" 2>/dev/null \
                 | sed -e 's/[^0-9]*\([0-9]\+\).*/\1/')"
 _cfg_threads="${_cfg_threads:-0}"
@@ -330,8 +403,41 @@ _code_cap="${_code_cap:-0}"
 #   ⇒ 警告必须看**用户拧得到几核**(= min(旋钮 max, 代码硬上限))。
 _knob_max="$(grep -m1 -oE 'tests\[t\.name\]\.threads[^>]*max="[0-9]+"' \
             "$OUT_DIR/static/index.html" 2>/dev/null \
-            | grep -oE 'max="[0-9]+"' | grep -oE '[0-9]+')"
+            | grep -oE 'max="[0-9]+"' | grep -oE '[0-9]+' || true)"
 _knob_max="${_knob_max:-0}"
+# ⚠️ **2026-11-10 新加: 旋钮的「下界」也要读出来** —— 用户点名:
+#   「cpu核数控制在最低是1,最高是8」
+#   ⇒ 页面上那个输入框的 `min` **必须是 1**。
+#   下界是 0 的旋钮 = 「0 = 自动 = 按核数 = 满核」那条路**还开着** ⇒ 那正是
+#   2026-11-04 实测**会把板子压死**的那一档 ⇒ 这样的盘不许打出来。
+# ⚠️ **读不到也算不合格**(值 = 0)—— 宁可拦住, 也不放一个「下界不明」的盘
+#   出去(那个输入框的写法一变, 正则就可能读空)。
+_knob_min="$(grep -m1 -oE 'tests\[t\.name\]\.threads[^>]*min="[0-9]+"' \
+            "$OUT_DIR/static/index.html" 2>/dev/null \
+            | grep -oE 'min="[0-9]+"' | grep -oE '[0-9]+' || true)"
+_knob_min="${_knob_min:-0}"
+# ⚠️⚠️ **2026-11-10 新加: 前端那道夹子的常量也得读出来** ——
+#   「范围 1~8」这个事实**散在三处**:
+#     ① `static/index.html` 的 min/max(旋钮本身)
+#     ② `static/app.js` 的 THREADS_MIN / THREADS_MAX(提交前的那道夹子)
+#     ③ `server/tests/cpu.py` 的 MAX_STRESS_THREADS(后端硬上限)
+#   ⇒ **只查 ① 是不够的**: ② 被改坏(比如放宽成 0..999)⇒ 打包闸门**放行**
+#   ⇒ 镜像带着一道**失效的夹子**出厂 ⇒ 「填 0 就回到满核」那条路又回来了
+#   (2026-11-04 实测会把板子压死的那一档)⇒ 闸门必须**两边都读、都比对**。
+_app_min="$(grep -m1 -oE 'THREADS_MIN = [0-9]+' "$OUT_DIR/static/app.js" 2>/dev/null \
+            | grep -oE '[0-9]+' || true)"
+_app_max="$(grep -m1 -oE 'THREADS_MAX = [0-9]+' "$OUT_DIR/static/app.js" 2>/dev/null \
+            | grep -oE '[0-9]+' || true)"
+_app_min="${_app_min:-0}"
+_app_max="${_app_max:-0}"
+# ⚠️ **2026-11-10 新加: 旋钮 title 里写着的「默认 N 核」也要读出来** ——
+#   那是 `config.yaml` 的 `defaults.cpu.threads` 的**第二份拷贝**(人看的
+#   那一份)⇒ 改了一处忘了另一处 ⇒ **工人看到的提示就是错的**(框上写
+#   「默认 4 核」, 实际默认是 6 核)⇒ 这跟「界面跟报告对不上」是同一类毛病。
+#   ⇒ 下面那道闸门拿它跟 `_cfg_threads` 对账。
+_knob_def="$(grep -m1 -oE 'tests\[t\.name\]\.threads[^>]*' "$OUT_DIR/static/index.html" 2>/dev/null \
+            | grep -oE 'title="默认 [0-9]+ 核' | grep -oE '[0-9]+' || true)"
+_knob_def="${_knob_def:-0}"
 _eff=99                        # 出厂默认(受硬上限夹住); 99 = 不设限
 if [ "$_cfg_threads" -gt 0 ] 2>/dev/null; then _eff=$_cfg_threads; fi
 if [ "$_code_cap" -gt 0 ] 2>/dev/null && [ "$_code_cap" -lt "$_eff" ]; then _eff=$_code_cap; fi
@@ -364,6 +470,67 @@ if [ "$_code_cap" -eq 0 ] 2>/dev/null; then
     warn "代码里没有 MAX_STRESS_THREADS 硬上限 —— 只靠 config.yaml 兜着
      ⇒ 页面「线程数」旋钮一改就能压到 8 核 ⇒ 建议把硬上限加回去"
 fi
+# ⚠️⚠️ **2026-11-10 新加的闸门 ⑦: 出厂默认**读不到** ⇒ 拦下**
+#   `defaults.cpu.threads` 读不出来就是 0。两种可能, **都不能放行**:
+#     · 配置里**没这个键** ⇒ 出厂默认不明 ⇒ 应用那边会按「没配 ⇒ 0 ⇒
+#       被下限 1 核夹住」跑(只压 1 核), 而闸门会以为默认是硬上限(8)
+#       ⇒ **界面说 8、实际压 1** ⇒ 正是这套系统栽过的「对不上」;
+#     · 配置里写的是 **0** ⇒ 0 从 2026-11-10 起**不是合法值**(被夹到下限 1)。
+#   ⇒ 一律**读不出一个可信的出厂默认** ⇒ 宁可拦住, 不出这种盘。
+#   ⇒ 放在「出厂默认 > 8」那道**之后**: 那种配置(0 或没配 + 没有硬上限)
+#     先由那道报「比核数还多」, 说法更贴近它真正的毛病。
+if [ "$_cfg_threads" -eq 0 ] 2>/dev/null; then
+    die "读不到 config.yaml 里 defaults.cpu.threads(读到的是 0)
+     ⇒ 出厂默认不明 ⇒ 应用那边会按「下限 1 核」跑, 而这里会以为默认是硬上限
+     ⇒ **界面跟实际对不上**
+     ⇒ 修法: config.yaml 的 defaults.cpu.threads 写成一个 1~8 的整数"
+fi
+# ⚠️⚠️ **2026-11-10 新加的闸门: 旋钮下界必须是 1**
+#   (用户点名授权: 「cpu核数控制在最低是1,最高是8」+「加(推荐)」
+#    —— 在「打包脚本加不加『页面旋钮下界必须是 1』的闸门」这一问里选的「加」)
+#   ⇒ 下界 0 的旋钮 = 「0 = 自动 = 按核数 = **满核 8**」那条路还开着 ⇒ 那正是
+#     2026-11-04 实测**会把板子压死**的那一档 ⇒ 这样的镜像**不许打出来**。
+#   ⇒ **读不到 `min` 也拦**(值 = 0): 宁可拦住, 也不放一个「下界不明」的盘
+#     出去(那个输入框的写法一变, 正则就可能读空)。
+if [ "$_knob_min" -ne 1 ] 2>/dev/null; then
+    die "页面上「线程数」旋钮的下界是 $_knob_min(必须 = 1)
+     ⇒ 修法: static/index.html 那个输入框写成 min=\"1\" max=\"8\"
+     ⇒ 下界 0 = 「0 = 自动 = 按核数 = 满核」那条路还开着(2026-11-04 实测
+       会把板子压死); 下界读不到 = 那个输入框的写法变了, 也要一起改"
+fi
+# ⚠️⚠️ **2026-11-10 新加的闸门 ④: 前端那道夹子的常量必须跟旋钮一致**
+#   —— 「范围」这个事实散在 ①index.html(旋钮) / ②app.js(夹子) /
+#   ③cpu.py(后端硬上限) 三处, 闸门**三处都要看**。
+#   ⇒ 只查 ① 的话, ② 被拆了(改成 0..999)闸门**照样放行**⇒ 出厂的镜像
+#     里带着一道**失效的夹子** ⇒ 「填 0 = 满核」那条路又回来了。
+if [ "$_app_min" -ne "$_knob_min" ] 2>/dev/null || [ "$_app_max" -ne "$_knob_max" ] 2>/dev/null; then
+    die "前端夹子的范围(app.js: THREADS_MIN=$_app_min, THREADS_MAX=$_app_max)
+     与页面旋钮的范围(index.html: min=$_knob_min, max=$_knob_max)**对不上**
+     ⇒ 修法: static/app.js 那道夹子的常量必须跟 static/index.html 的
+       min/max 一致(下限 1 / 上限 8)
+     ⇒ 两处对不上 = 有一处被改坏了(常见的: 只改了旋钮, 忘了夹子)
+     ⇒ 读不到 = 那道夹子被拆了或写法变了 ⇒ 宁可拦住, 不放一个
+       「填 0 就回到满核」的盘出去"
+fi
+# ⚠️⚠️ **2026-11-10 新加的闸门 ⑤: 旋钮不许超过代码里的硬上限**
+#   —— 旋钮 max=8 而 `MAX_STRESS_THREADS`=4 时, 工人填 8、**实际只压 4** ⇒
+#   **界面显示的核数 ≠ 实际压的核数** ⇒ 这正是这套系统栽过的跟头
+#   (「界面跟报告对不上」)⇒ 宁可拦住, 也不出这种盘。
+if [ "$_code_cap" -gt 0 ] 2>/dev/null && [ "$_knob_max" -gt "$_code_cap" ] 2>/dev/null; then
+    die "页面旋钮能拧到 $_knob_max 核, 但代码里的硬上限只有 $_code_cap 核
+     ⇒ 工人填 $_knob_max、实际只压 $_code_cap 核 ⇒ **界面跟实际对不上**
+     ⇒ 修法: static/index.html 那个输入框的 max 必须 ≤ server/tests/cpu.py
+       里的 MAX_STRESS_THREADS(现在是 8; 默认值 ≠ 上限, 别把上限一起降了)"
+fi
+# ⚠️ **2026-11-10 新加的闸门 ⑥: 旋钮 title 里的「默认 N 核」必须等于
+#   config.yaml 的 `defaults.cpu.threads`** —— 那是同一个数的**两份拷贝**
+#   (人看的那一份在 title 里)⇒ 改一处忘了另一处 ⇒ 工人看到的提示就是错的。
+if [ "$_cfg_threads" -gt 0 ] 2>/dev/null && [ "$_knob_def" -gt 0 ] 2>/dev/null \
+   && [ "$_knob_def" -ne "$_cfg_threads" ] 2>/dev/null; then
+    die "旋钮提示里写「默认 $_knob_def 核」, 但 config.yaml 的 defaults.cpu.threads
+     是 $_cfg_threads 核 ⇒ **同一件事两份拷贝, 对不上** ⇒ 工人的提示是错的
+     ⇒ 修法: static/index.html 那个输入框的 title 改成「默认 $_cfg_threads 核(…)」"
+fi
 # ⚠️ **2026-11-09 晚(更晚): 默认值定在 4 核, 上限仍是 8**(用户点名授权:
 #   「确定了, 默认四核, 但是像现在这样支持用户自己选择核数, 四核比较保险」)
 #   ⇒ **默认这一档现在是保险档**(4 核 + 应用自己的背景 ≈ 5.7 核, 离
@@ -376,9 +543,9 @@ fi
 if [ "$_reach" -ge 8 ] 2>/dev/null; then
     warn "这镜像的旋钮能拧到**满核 $_reach 线程**(出厂默认是 $_eff 核)
      ⇒ 满核是过应力那一档(2026-11-04 实测会硬复位)
-     ⇒ **开跑前请确认页面上 CPU 的「线程数」**, 别往上调(填 0 = 满核)"
+     ⇒ **开跑前请确认页面上 CPU 的「线程数」**, 别往上调(拧到 8 = 满核)"
 fi
-log "   出厂断言: 出厂默认 $_eff 核 / 旋钮上限 $_reach 核(≤8)✓"
+log "   出厂断言: 出厂默认 $_eff 核 / 旋钮上限 $_reach 核(≤8) / 旋钮下限 $_knob_min 核✓"
 
 _dead_guard="无"
 if grep -rq 'cpu_evidence_cut_short' "$OUT_DIR/server/" 2>/dev/null; then _dead_guard="有"; fi
@@ -394,12 +561,15 @@ CPU 加压:
   · 出厂默认线程数: $([ "$_cfg_threads" = 0 ] && echo "0(按核数)" || echo "$_cfg_threads")
   · 代码硬上限: $([ "$_code_cap" = 0 ] && echo "无" || echo "$_code_cap 核")
   · 旋钮上限  : $([ "$_reach" = 0 ] && echo "?" || echo "$_reach 核")
+  · 旋钮下限  : $([ "$_knob_min" = 0 ] && echo "?" || echo "$_knob_min 核")
   · 「死在加压途中 ⇒ 判 failed 不放行」的兜底: $_dead_guard
 
 怎么确认手上这根盘是哪一版(在盘根目录下跑):
   grep -m1 "threads:" config.yaml
       => 必须是  threads: 4
       => 若是   threads: 8  = 旧盘(出厂默认满核 8 线程, 板子会成批硬复位)
+  grep -m1 -oE 'tests\[t\.name\]\.threads[^>]*min="[0-9]+"' static/index.html
+      => 必须是  min="1"(下界 0 = 「0 = 自动 = 按核数 = 满核」那条路)
   grep -h "本轮加压峰值" logs/cpu_evidence_*.txt | tail -3
       => 写「4 线程」= 这一版(出厂默认 4 核); 写「8 线程」= 有人把旋钮拧到满核了
 EOF

@@ -275,7 +275,7 @@ async def deps_check():
     的 —— fio 缺 `libceph-common.so.2`)。
     设备版(deb 装)不走探针 —— apt 装的依赖是自洽的, 没必要多起进程。
     """
-    from .tests._tools import find_tool, tool_dir
+    from .tests._tools import find_tool, tool_dir, usb_mode as _usb_mode, deps_fix_hint
 
     # §11.7 打包必装清单 —— 缺任一即打包缺陷, 拒绝出货
     # §6.6 改版已删除 iperf3 测速, 网口只测 链路+DHCP+出网, 故不再列入
@@ -300,7 +300,12 @@ async def deps_check():
     )
 
     tdir = tool_dir()
-    usb_mode = bool(tdir)
+    # ⚠️ **2026-11-10**: 判据从「`tool_dir()` 有没有值」改成 `usb_mode()`
+    #    —— 那个函数认**两个**信号(环境变量 **或** 盘根目录的
+    #    `AGING_USB_MODE` 标记)⇒ **跟两个 shell 诊断脚本是同一个判据**
+    #    (以前两边各认各的 ⇒ 能同时对不上 ⇒ 盘上明明是 U 盘版,
+    #    这里却按设备版给出那条**盘上并不存在**的命令)。
+    usb_mode = _usb_mode()
 
     async def _probe(path: str, name: str) -> str:
         """真跑一次工具 —— 返回空串 = 起得来; 否则返回起不来的原因。
@@ -373,11 +378,10 @@ async def deps_check():
         # 设备版: 给命令; U 盘版: **别**再让工人去 apt 装(装到板子上,
         # 拔盘就走, 白装) ⇒ 给一句人话。
         "fix_command": "" if usb_mode else "sudo bash scripts/install_deps.sh",
-        "fix_hint": (
-            "U 盘版: 盘上自带 fio / glmark2-es2, 其余工具用板子出厂那份 ⇒ "
-            "缺工具或工具起不来, 说明这版出厂镜像没带齐, 请改用设备版(deb)安装。"
-            if usb_mode else ""
-        ),
+        # ⚠️ **2026-11-10**: 这里原来**另抄了一份** U 盘版那句话(还多个
+        #    句号)⇒ 全仓同一句有**两份拷贝** ⇒ 改一处忘一处, 页面和
+        #    报错说的就不是同一句话了 ⇒ 现在直接用**同一个函数**。
+        "fix_hint": deps_fix_hint() if usb_mode else "",
     }
 
 
@@ -400,6 +404,13 @@ async def get_config():
         "report": {
             "operator": (Config.get("report") or {}).get("operator") or "",
         },
+        # 历史库的状态 —— 坏库被**改名隔离**过没有(见 server/db.py)。
+        # ⚠️ **只作机器可查的记录, 界面上一个字不提**(2026-11-10 用户定):
+        #    挂横幅会让工人以为「这根盘坏了不能用」—— 而盘其实好好的,
+        #    只是**之前那批历史记录**读不出来了(旧文件还在 reports/ 里没删)。
+        #    ⇒ 这件事只留在 logs/server.log 和文档里; 要查就 curl 这个接口。
+        #    (前端不许再拿它渲染东西 —— 有 tests/test_frontend_history_db_silent.js 盯着)
+        "history_db": db.history_db_status(),
     }
 
 

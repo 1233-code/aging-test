@@ -10,13 +10,16 @@
  *   拧小的旋钮 —— 必须**在页面上就能拧**, 不用改代码、不用出包、不用
  *   重启服务(static/ 是热的, 刷新页面就生效)。
  *
- * 这个测试守三件事:
+ * 这个测试守四件事:
  *   ① 页面上真的有这个输入框, 而且绑的是 `tests[t.name].threads`
  *      —— 绑错了键, 工人拧的是空气, 后端收到的还是 8;
  *   ② 只有**带 threads 键的项**才显示它 (现在只有 CPU 项有)
  *      —— 别的项冒出一个「线程数」框, 工人会以为那些项也能调线程;
  *   ③ 工人拧的那个数**真的发给了后端** (startTest 的请求体里带着它)
- *      —— 这一条最要紧: 输入框好看但值没送出去, 是最难发现的坏法。
+ *      —— 这一条最要紧: 输入框好看但值没送出去, 是最难发现的坏法;
+ *   ④ **范围 1~8**(2026-11-10 用户点名: 「cpu核数控制在最低是1,最高是8」)
+ *      —— 以前下界是 0, 而 **0 = 「自动」= 按核数 = 满核 8** ⇒ 那正是
+ *      2026-11-04 实测会把板子压死的那一档 ⇒ 0 现在填不进来(夹到 1)。
  *
  * 跑法: node tests/test_frontend_cpu_threads.js
  */
@@ -101,14 +104,21 @@ async function main() {
         check(/v-if="'threads' in tests\[t\.name\]"/.test(html),
             '这个框用 \'threads\' in tests[t.name] 守卫 (只有带这键的项才显示)');
         check(/线程数/.test(html), '框旁边有「线程数」的字样 (工人认得出来)');
-        // min="0": 0 = 自动 是合法值, 不许被浏览器的下界校验挡住。
+        // min="1": **下限 1**(2026-11-10 用户点名: 「cpu核数控制在最低是1,
+        //   最高是8」)—— 以前是 min="0", 而 **0 = 「自动」= 按核数 = 满核 8**
+        //   ⇒ 那正是 2026-11-04 实测会把板子压死的那一档 ⇒ 0 填不进来。
         // max="8": **加压上限 8 核(满核)**(2026-11-09 晚放回; 当天白天是 5,
         //   再之前是 6)—— 输入框的上限要跟后端那道夹子一致, 否则工人填 6
         //   会被浏览器挡掉(上限 5 的时候他连 6 都试不了)。
         const m = html.match(/<input[^>]*v-model(?:\.number)?="tests\[t\.name\]\.threads"[^>]*>/);
         check(!!m, '找得到那个 input 标签');
         if (m) {
-            check(/min="0"/.test(m[0]), 'min="0" (0 = 自动 是合法的起点)');
+            check(/min="1"/.test(m[0]),
+                'min="1" (下限 1 —— 「0 = 自动 = 满核」那条路封了)',
+                m[0]);
+            check(!/min="0"/.test(m[0]),
+                '**不是** min="0"(0 = 自动 = 按核数 = 满核, 会把板子压死)',
+                m[0]);
             check(/type="number"/.test(m[0]), '是 number 类型 (能填数字, 不填串)');
             check(/max="8"/.test(m[0]),
                 'max="8" (加压上限 8 核 = 满核 —— 工人要自己拧线程数找平衡点)',
@@ -117,9 +127,9 @@ async function main() {
         // 2026-11-04: 「默认 4 核(上限 8); 0 = 自动」那句从**版面上**撤掉了
         // (右列只摆旋钮) ⇒ 挪进了这个输入框的 title(悬停才看得到)。
         // ⚠️ **不许整个消失** —— 上限是反直觉的(框上写 8, 后端也只给 8),
-        // 工人得知道拧 8 = 满核、拧 0 也是满核。
-        check(!!m && /title="默认 4 核\(上限 8\); 0 = 自动\(=8 满核\)"/.test(m[0]),
-            '「默认 4 核(上限 8); 0 = 自动(=8 满核)」在那个输入框的 title 里(悬停提示)',
+        // 工人得知道拧 8 = 满核。
+        check(!!m && /title="默认 4 核\(范围 1~8; 拧到 8 = 满核, 过应力那一档\)"/.test(m[0]),
+            '「默认 4 核(范围 1~8; 拧到 8 = 满核, 过应力那一档)」在那个输入框的 title 里(悬停提示)',
             m ? m[0] : '(没找到那个 input)');
     }
 
@@ -152,6 +162,37 @@ async function main() {
             && sent.start.tests.cpu
             && sent.start.tests.cpu.threads === 2,
             '请求体里 tests.cpu.threads = 2 (后端收到的就是拧小后的值)',
+            sent.start ? JSON.stringify(sent.start.tests && sent.start.tests.cpu) : '(没抓到)');
+    }
+
+    // ══════════════════════════════════════════════════════════
+    section('【4】填 0 / 填 99 都会被夹进 1~8(「0 = 自动 = 满核」那条路封死了)');
+    {
+        // ⚠️ **为什么前端也要夹一道**: 光靠后端夹, 工人看见框里是 0、这一轮
+        //   实际压 1 核 ⇒ 界面跟实际对不上(这套系统栽过这种跟头)。
+        //   ⇒ 夹完**写回框里**, 让人看得见。
+        const { app, sent } = makeApp();
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+
+        app.tests.cpu.threads = 0;
+        await app.startTest();
+
+        check(sent.start && sent.start.tests
+            && sent.start.tests.cpu
+            && sent.start.tests.cpu.threads === 1,
+            '填 0 ⇒ 请求体里是 1(夹到下限; **不是**「自动 = 满核 8」)',
+            sent.start ? JSON.stringify(sent.start.tests && sent.start.tests.cpu) : '(没抓到)');
+        check(app.tests.cpu.threads === 1,
+            '填 0 ⇒ 框里也变成 1(夹完写回 —— 界面不能跟实际压的核数对不上)',
+            app.tests.cpu ? String(app.tests.cpu.threads) : '(没有 tests.cpu)');
+
+        app.tests.cpu.threads = 99;
+        await app.startTest();
+        check(sent.start && sent.start.tests
+            && sent.start.tests.cpu
+            && sent.start.tests.cpu.threads === 8,
+            '填 99 ⇒ 请求体里是 8(夹到上限)',
             sent.start ? JSON.stringify(sent.start.tests && sent.start.tests.cpu) : '(没抓到)');
     }
 }

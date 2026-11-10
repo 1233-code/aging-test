@@ -36,7 +36,8 @@ import time
 from typing import List, Optional, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
-from ._tools import find_tool, find_wifi_iface, with_sudo, kill_proc, sudo_hint_if_unavailable
+from ._tools import (find_tool, find_wifi_iface, with_sudo, kill_proc,
+                     sudo_hint_if_unavailable, deps_fix_hint)
 
 # §11.3: 精确正则, 不做 substring 匹配。
 # **注意**: 行内空白一律用 `[ \t]` 不用 `\s` —— Python 的 `\s` 包含 \n,
@@ -458,7 +459,7 @@ class WiFiTest(TestCase):
         if missing:
             result.status = "error"
             result.error = (
-                f"未找到: {', '.join(missing)}. 解决: sudo bash scripts/install_deps.sh "
+                f"未找到: {', '.join(missing)}. 解决: {deps_fix_hint()} "
                 "(见 docs/需求设计.md §11.7)"
             )
             await ctx.on_log(f"[WiFi] ✗ {result.error}")

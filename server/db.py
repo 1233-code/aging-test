@@ -6,6 +6,7 @@ Schema:
 """
 import aiosqlite
 import json
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,6 +22,17 @@ DB_PATH = Config.data_root() / "reports" / "history.db"
 #: 导入时算出来的那个值 —— 用来分辨「这个路径是**我们**算的」还是
 #: 「**有人**(回归测试)改过的」⇒ 只在是我们算的时候才让它跟着数据根走。
 _AUTO_DB_PATH = DB_PATH
+
+#: 坏库隔离件的文件名后缀 —— **隔离 ≠ 删除**: 旧库还在盘上, 人工能捞。
+CORRUPT_SUFFIX = ".corrupt-"
+
+#: 体检时库超过这个大小就**不查** —— `quick_check` 要全扫一遍, 太大的库
+#: 扫完会拖慢启动(工人双击完等着, 以为没反应)。超过这个大小就只靠
+#: 运行时报错兜底。
+PROBE_MAX_BYTES = 256 * 1024 * 1024
+
+#: 本次启动隔离过库的话记在这儿 —— 给 `/api/config` 报, 界面挂横幅。
+QUARANTINED: list = []
 
 
 def _db_path() -> Path:
@@ -83,9 +95,163 @@ async def _ensure_column(db, table: str, column: str, typedef: str):
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {typedef}")
 
 
+def _quarantine_prefix(path: Path) -> str:
+    return path.name + CORRUPT_SUFFIX
+
+
+def find_quarantined(path: Path) -> list:
+    """盘上**已经**隔离过的库(新的在前) —— 那是「这根盘的历史重置过」的
+    **永久证据**: 盘一直在, 下一个人接手也知道。
+
+    ⚠️ 用**文件名**认, 不用 mtime 认 —— 拷盘/改时间戳会把它骗过去。
+    """
+    try:
+        items = list(path.parent.glob(_quarantine_prefix(path) + "*"))
+    except OSError:
+        return []
+    items.sort(key=lambda p: p.name, reverse=True)
+    return items
+
+
+async def probe_health(path: Path) -> tuple:
+    """体检一下这个库还能不能正常用。返回 (好?, 说明)。
+
+    ⚠️ **为什么要单独探**: 「启动没报错」**不等于**「库是好的」。
+       坏掉的库有个阴险的坏法: 表和索引**都读得动**、写也**写得进**,
+       但**读某几行的大字段会炸**(拔盘时把大字段的溢出页写了一半)。
+       ⇒ 应用平时一切正常, 直到某一步恰好读到那几行才报
+       `database disk image is malformed` —— 症状是「服务起得来、
+       历史页能看, 一开测就报错」, 工人根本查不出哪儿坏了。
+
+    ⚠️ **用读写方式打开**(不是只读): 上次是**写到一半被拔盘**的话, 盘上
+       会留下一个「热日志」, 只读打开**没法回滚**(直接报错)⇒ 读写打开
+       能让 **SQLite 自己把热日志回滚掉** —— 回滚成功的话这个库其实
+       **是好的**, 根本不用隔离。
+    """
+    if not path.exists():
+        return True, "新库(还没有)"          # 还没建过 ⇒ 没坏
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        return True, "读不到文件信息(%s), 先不动它" % e
+    if size == 0:
+        return True, "空文件(新建的)"        # 空库是合法的
+    if size > PROBE_MAX_BYTES:
+        return True, "太大(> %d MB), 不体检" % (PROBE_MAX_BYTES // 1024 // 1024)
+    try:
+        async with aiosqlite.connect(path) as conn:
+            async with conn.execute("PRAGMA quick_check") as cur:
+                row = await cur.fetchone()
+            verdict = (row[0] if row else "") or ""
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+    if verdict.strip().lower() == "ok":
+        return True, "ok"
+    return False, "quick_check: %s" % verdict
+
+
+def isolate_corrupt_db(path: Path, reason: str) -> Optional[Path]:
+    """把坏库**改名隔离** —— **不删**。
+
+    为什么要留着: 坏的是**一部分行**(某几条大日志的溢出页写坏了),
+    其余的轮次和结论**都是好的** ⇒ 直接删掉等于把能救的数据一起扔了。
+    改名之后人工还能拿别的工具去捞。
+
+    改名(而不是删)还顺手解决了**下次再坏**的问题: 隔离件叫
+    `history.db.corrupt-<时间戳>`, 新库还是叫 `history.db` ⇒ 应用下次
+    启动看到的是一个**干净的**库 ⇒ 不会反复隔离、也不会把坏件越攒越多。
+
+    返回隔离件的路径; 隔离不了(没权限等)返回 None。
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = path.with_name("%s%s%s" % (path.name, CORRUPT_SUFFIX, stamp))
+    try:
+        # 先把 WAL / 共享内存 / 热日志也一并挪走 —— 留着它们, 新库建起来时
+        # SQLite 会拿旧日志去回滚 ⇒ 反而更糟。
+        for suffix in ("-wal", "-shm", "-journal"):
+            side = path.with_name(path.name + suffix)
+            if side.exists():
+                try:
+                    side.rename(dest.with_name(dest.name + suffix))
+                except OSError:
+                    pass
+        path.rename(dest)
+    except OSError as e:
+        print("[db] ⚠⚠️ 历史库坏了, 但**隔离失败**(%s) —— 库留在原处: %s"
+              % (e, path))
+        return None
+    return dest
+
+
+async def _isolate_if_corrupt(path: Path) -> None:
+    """体检不过就把坏库隔离掉, 另起一个空的。"""
+    ok, reason = await probe_health(path)
+    if ok:
+        return
+    dest = isolate_corrupt_db(path, reason)
+    if dest is None:
+        return
+    info = {
+        "file": dest.name,
+        "path": str(dest),
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+    }
+    QUARANTINED.append(info)
+    print("[db] ⚠⚠️ 历史库损坏, 已**改名隔离**(没有删): %s" % dest.name)
+    print("[db]    原因: %s" % reason)
+    print("[db]    ⇒ 历史记录从这一刻起重新开始; 旧库就躺在 reports/%s, "
+          "要捞数据拿别的工具去捞。" % dest.name)
+
+
+def _quarantined_at(path: Path) -> str:
+    """隔离件**被隔离的时刻**(显示给人看的时间)。
+
+    ⚠️ **不能拿文件 mtime 当隔离时刻** —— 隔离是**改名**, 改名**不改 mtime**
+       ⇒ 那是**旧库最后一次被写入**的时间(实况: 隔离发生在 11-10 14:45,
+       mtime 却还是 11-09 17:31)⇒ 横幅会跟工人说「这根盘在 11-09 坏过」,
+       而实际是 11-10 隔离的 —— 时间对不上, 排查时会被带偏。
+
+    隔离时刻本来就**写在文件名里**(`history.db.corrupt-<YYYYmmdd-HHMMSS>`)
+    ⇒ 从文件名取; 名字对不上(手工改过?)才退回 mtime。
+    """
+    stamp = path.name.rsplit(CORRUPT_SUFFIX, 1)[-1]
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S",
+                             time.strptime(stamp, "%Y%m%d-%H%M%S"))
+    except ValueError:
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(path.stat().st_mtime))
+        except OSError:
+            return "?"
+
+
+def history_db_status() -> dict:
+    """历史库的状态 —— 给界面挂横幅用。
+
+    · `quarantined`: **这次启动**隔离过坏库(⇒ 工人该知道历史从头开始了)
+    · `previous`:   这根盘上**以前**隔离过(隔离件就躺在 reports/ 里 ——
+                     那是永久证据, 换个人接手这根盘也该知道)
+    """
+    path = _db_path()
+    old = find_quarantined(path)
+    return {
+        "quarantined": QUARANTINED[-1] if QUARANTINED else None,
+        "previous": [{"file": p.name, "at": _quarantined_at(p)}
+                     for p in old[:3]],
+        "db_path": str(path),
+    }
+
+
 async def init():
-    _db_path().parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(_db_path()) as db:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # ⚠️ **先体检再开**: 坏库会被改名隔离(见 `_isolate_if_corrupt`)。不带一个
+    #    「表能读、写几行才炸」的库去跑 —— 那症状是「服务起得来、历史页能看,
+    #    一开测就报错」, 工人查不出哪儿坏了。
+    await _isolate_if_corrupt(path)
+    async with aiosqlite.connect(path) as db:
         # 1. CREATE TABLE (对老 DB 是 no-op)
         await db.executescript(SCHEMA)
         # 2. Migrations: 补加老 DB 缺的列

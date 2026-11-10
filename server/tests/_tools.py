@@ -251,6 +251,71 @@ def loader_error_message(rc: int, text: str) -> str:
     )
 
 
+def _code_root() -> Path:
+    """代码根(仓库根 / 盘根)—— 会跟着 U 盘挂载点漂移走。
+
+    ⚠️ **单独拎出来一个函数**, 是为了让测试能把它**换掉**(测「标记文件在
+    哪」时不必去动真仓库)—— 见 `tests/test_deps_fix_hint.py`。
+    """
+    return Config.project_root()
+
+
+def usb_mode() -> bool:
+    """这台机器上跑的是**U 盘版**吗? —— 判据跟 shell 脚本**是同一个**。
+
+    ⚠️ **2026-11-10 修**: 以前 Python 侧只认 `AGING_TOOL_DIR` 有没有值,
+    而 `scripts/check_deps.sh` / `check_eth.sh` 认的是**盘根目录的
+    `AGING_USB_MODE` 标记文件** ⇒ 两个判据**不是同一个** ⇒ 它们能
+    同时对不上:
+      · `start.sh:37` 那行是**有条件**的 ——
+        `[ -d "$SCRIPT_DIR/tools/bin" ] && export AGING_TOOL_DIR=...`
+        ⇒ 盘上有标记、但 `tools/bin` 不在时, **环境变量不导出**
+        ⇒ Python 以为自己是**设备版** ⇒ 又把
+        「sudo bash scripts/install_deps.sh」端给工人
+        ⇒ **而盘上根本没有那个脚本**(打包脚本只带运行时+诊断脚本)
+        ⇒ 刚修掉的那个 P0 在另一种配置下**原样复活**。
+
+    ⇒ 现在两个判据**取或**: 环境变量在、**或**代码根有标记文件。
+    """
+    if os.environ.get(TOOL_DIR_ENV, "").strip():
+        return True
+    try:
+        root = _code_root()
+        return bool(root and (Path(root) / "AGING_USB_MODE").is_file())
+    except OSError:
+        return False
+
+
+def deps_fix_hint() -> str:
+    """缺工具/装不上时, 给工人的**补救办法**(两种形态不一样)。
+
+    ⚠️ **2026-11-10 修的真缺陷**: 以前各处都把
+    「sudo bash scripts/install_deps.sh」**写死**在报错里 ⇒ 但
+    **U 盘版的盘上根本没有这个脚本**(打包脚本只带运行时+诊断脚本,
+    `install_deps.sh` 属于「打包/部署类」,**不带**)⇒ 工人/排障的人
+    照着做 ⇒ 「No such file or directory」⇒ **补救办法是死的**。
+
+    ⇒ **两种形态分开说**:
+      · **U 盘版**(`usb_mode()` 为真): 盘上自带
+        fio / glmark2-es2, 其余工具用板子出厂那份 ⇒ 缺工具或工具起不来
+        **说明这版出厂镜像没带齐** ⇒ 该改用设备版(deb)装。
+        ⚠️ **别再让工人去 apt 装**: ① 产线网络取不到公网;
+        ② 装到板子上拔盘就走, 白装。
+      · **设备版**(deb 装的, 脚本在安装目录里): 给命令。
+
+    ⚠️ **设备版的文案一个字没改** —— deb 包里**确实带着**
+    `scripts/install_deps.sh`(build_deb.sh 的白名单里有它)⇒ 命令有效。
+
+    ⚠️ **这句文案全仓只此一份** —— `server/main.py` 的 `/api/config`
+    也用这个函数(以前那边**另抄了一份**, 改一处忘一处 ⇒ 页面和报错
+    说的不是同一句话)。
+    """
+    if usb_mode():
+        return ("U 盘版: 盘上自带 fio / glmark2-es2, 其余工具用板子出厂那份 ⇒ "
+                "缺工具或工具起不来, 说明这版出厂镜像没带齐, 请改用设备版(deb)安装")
+    return "请运行 sudo bash scripts/install_deps.sh"
+
+
 # ── 进程超时管理 (避免 rc=-15 误判) ──
 async def run_proc_with_wallclock(
     cmd: List[str],

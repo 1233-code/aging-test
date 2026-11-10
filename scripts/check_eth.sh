@@ -9,6 +9,25 @@
 # 用法: bash scripts/check_eth.sh [iface]   (默认 eth0)
 
 IFACE="${1:-eth0}"
+
+# ⚠️ **2026-11-10**: 补救办法**按形态分开说** —— U 盘版的盘上**没有**
+#   `scripts/install_deps.sh`(`scripts/build_usb_image.sh` 只往盘上拷
+#   「运行时 + 诊断」那几类脚本, 它属于「打包/部署类」,**不带**)⇒ 照着
+#   跑只会得到「No such file or directory」⇒ **补救办法是死的**。U 盘版缺
+#   工具 = **这版出厂镜像没带齐**(而且产线网络取不到公网, 本来也不该在
+#   板子上装)。
+# ⚠️ 这个判据**跟 Python 侧是同一个**(`server/tests/_tools.py:usb_mode()`:
+#   环境变量 `AGING_TOOL_DIR` 在、**或** 盘根目录有 `AGING_USB_MODE`
+#   标记 ⇒ 取或)—— 以前两边各认各的 ⇒ 能同时对不上。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# ⚠️ 判据跟 Python 侧 `server/tests/_tools.py:usb_mode()` **完全一样**:
+#   「环境变量 `AGING_TOOL_DIR` 在」**或**「盘根目录有 `AGING_USB_MODE` 标记」
+#   ⇒ 取或。少一个判据 ⇒ 两种形态能同时对不上(以前两边各认各的)。
+USB_MODE=0
+[ -f "$PROJECT_ROOT/AGING_USB_MODE" ] && USB_MODE=1
+[ -n "${AGING_TOOL_DIR:-}" ] && USB_MODE=1
+
 echo "###############################################"
 echo "# 网口诊断 (对齐 §6.6)  iface=$IFACE"
 echo "###############################################"
@@ -17,7 +36,12 @@ echo ""
 # ── ① 链路 ──
 echo "==> ① 链路检测 (纯 PHY 层, 零网络依赖)"
 if ! command -v ethtool > /dev/null 2>&1; then
-    echo "  ✗ 未装 ethtool —— sudo bash scripts/install_deps.sh"
+    if [ "$USB_MODE" = "1" ]; then
+        echo "  ✗ 未装 ethtool —— U 盘版: 盘上自带 fio / glmark2-es2, 其余工具用板子出厂那份 ⇒"
+        echo "     缺工具或工具起不来, 说明这版出厂镜像没带齐, 请改用设备版(deb)安装"
+    else
+        echo "  ✗ 未装 ethtool —— sudo bash scripts/install_deps.sh"
+    fi
     exit 1
 fi
 if [ ! -d "/sys/class/net/$IFACE" ]; then

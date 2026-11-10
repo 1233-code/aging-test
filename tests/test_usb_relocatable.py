@@ -79,7 +79,18 @@ def static_checks():
     # 构建脚本: 可搬迁自检
     build = read("scripts/build_usb_image.sh")
     check("reloc-check" in build, "构建脚本有「挪个地方再跑」的可搬迁自检")
-    check("bin/uvicorn" in build, "构建脚本检查 start.sh 不许调 console script")
+    # ⚠️ **2026-11-10 修**: 这条断言原来找的是字符串 `bin/uvicorn` ——
+    #    但打包脚本那道闸早就**泛化**了(2026-11-09 为了修「管道退出码取自
+    #    head ⇒ 闸门恒为真」那个真 bug): 现在它认的是 **`$VENV_DIR/bin/`
+    #    整个目录** ⇒ uvicorn / pip / fastapi…… 任何 console script 都算
+    #    ⇒ 闸门比从前**更强**, 只是断言还在找老字符串 ⇒ **这条测试一直是红的**
+    #    (与本次改动无关 ⇒ 是被上一次改动留下的)。
+    check('VENV_DIR"?/bin/' in build,
+          "构建脚本检查 start.sh 不许调 console script(认的是 `$VENV_DIR/bin/` "
+          "整个目录, 不只 uvicorn)",
+          "没找到那道闸 ⇒ 换台设备必坏(console script 的 shebang 写死构建路径)")
+    check("里还在直接调 venv 的 console script" in build,
+          "构建脚本拦下来时明说「还在直接调 venv 的 console script」")
 
 
 # ═══════════════════════ ② 行为: venv 挪走还能用 ═══════════════════════

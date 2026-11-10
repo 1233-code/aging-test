@@ -8,7 +8,7 @@ from typing import Optional
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import (find_tool, run_cmd, is_root, run_proc_with_wallclock,
                      with_sudo, kill_proc, sudo_hint_if_unavailable,
-                     TtyDemangler)
+                     TtyDemangler, deps_fix_hint)
 
 # memtester 的**原始**行可能非常长: 它的进度是原地重绘的, "Random Value"
 # 那一项画的是 -\|/ 转轮, 一行能塞几万字符 (见下面 read 循环的说明)。
@@ -116,7 +116,7 @@ class MemoryTest(TestCase):
             result.status = "error"
             result.error = (
                 "未找到 memtester (PATH 不含 /sbin, 或未装). "
-                "解决: sudo bash scripts/install_deps.sh"
+                f"解决: {deps_fix_hint()}"
             )
             await ctx.on_log(f"[内存] ✗ {result.error}")
             return result

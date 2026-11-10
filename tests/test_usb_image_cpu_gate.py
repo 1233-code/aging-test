@@ -106,21 +106,40 @@ def run_block(block, out_dir):
     return p.returncode, p.stdout + p.stderr
 
 
-def make_fixture(root, threads="8", cap="8", knob="8", start_sh=CLEAN_START_SH,
-                dead_guard=True):
-    """造一个假的镜像目录(config.yaml + server/tests/cpu.py + static/index.html + start.sh)。
+def make_fixture(root, threads="8", cap="8", knob="8", knob_min="1",
+                start_sh=CLEAN_START_SH, dead_guard=True,
+                app_min=None, app_max=None, title_default=None, extra_cfg=""):
+    """造一个假的镜像目录(config.yaml + server/tests/cpu.py + static/index.html
+    + static/app.js + start.sh)。
 
     ⚠️ **`knob` = 页面上那个「线程数」输入框的 max** —— 打包脚本要从镜像里的
     index.html 读它, 才算得出「用户拧得到几核」(满核警告看的是这个, 不是
     出厂默认)。所以不造这个文件的话, 脚本读不到 ⇒ 那条警告就测不到。
+
+    ⚠️ **2026-11-10: 这个夹具现在必须**照着真镜像的样子**造** —— 闸门读
+    的东西变多了, 夹具少一样就等于**测不到那道闸门**:
+      · `config.yaml` 必须是 `defaults:` → `  cpu:` → `    threads:` 的**层级**
+        (脚本现在按**段落**读出厂默认, 不是「文件里第一条 threads:」);
+      · `static/app.js` 必须有前端那道夹子的常量(闸门 ④ 要比对);
+      · 旋钮 title 里的「默认 N 核」必须**跟出厂默认一致**(闸门 ⑥ 要对账)。
+    ⇒ `app_min` / `app_max` / `title_default` 默认都取「一致」的值,
+      要测「对不上」的那几例才显式传进来。
     """
     os.makedirs(os.path.join(root, "server", "tests"), exist_ok=True)
     os.makedirs(os.path.join(root, "static"), exist_ok=True)
-    cfg = "  cpu:\n"
+    if app_min is None:
+        app_min = knob_min
+    if app_max is None:
+        app_max = knob
+    if title_default is None:
+        title_default = threads if threads is not None else "4"
+    cfg = "defaults:\n  cpu:\n"
     if threads is not None:
         # ⚠️ 注释里也带数字 —— 抠代码必须先剥注释再取数, 否则会取成 "666"
-        cfg += ("    threads: %s              # %s = 默认 %s 核(上限 8, 旋钮可自选); "
-                "0 = 自动\n" % (threads, threads, threads))
+        cfg += ("    threads: %s              # %s = 默认 %s 核(范围 1~8, 旋钮可自选)\n"
+                % (threads, threads, threads))
+    # extra_cfg: cpu 段**后面**再接别的段(测「段落隔离」用)
+    cfg += extra_cfg
     with open(os.path.join(root, "config.yaml"), "w", encoding="utf-8") as f:
         f.write(cfg)
     cpu = ""
@@ -132,7 +151,10 @@ def make_fixture(root, threads="8", cap="8", knob="8", start_sh=CLEAN_START_SH,
         f.write(cpu)
     with open(os.path.join(root, "static", "index.html"), "w", encoding="utf-8") as f:
         f.write('<input type="number" v-model.number="tests[t.name].threads" '
-                'min="0" max="%s" class="num-input" title="默认 4 核(上限 8)">\n' % knob)
+                'min="%s" max="%s" class="num-input" '
+                'title="默认 %s 核(范围 1~8)">\n' % (knob_min, knob, title_default))
+    with open(os.path.join(root, "static", "app.js"), "w", encoding="utf-8") as f:
+        f.write("const THREADS_MIN = %s, THREADS_MAX = %s;\n" % (app_min, app_max))
     with open(os.path.join(root, "start.sh"), "w", encoding="utf-8") as f:
         f.write(start_sh)
     return root
@@ -160,6 +182,7 @@ def main():
         check(rc != 9, "现状(threads 8 + 上限 8)不被拦下", out)
         check("出厂默认 8 核" in out, "出厂默认核数是 8", out)
         check("旋钮上限 8 核" in out, "旋钮能拧到的上限是 8", out)
+        check("旋钮下限 1 核" in out, "旋钮的下界是 1", out)
         stamp = os.path.join(d, "版本.txt")
         check(os.path.exists(stamp), "版本.txt 生成了")
         if os.path.exists(stamp):
@@ -167,6 +190,7 @@ def main():
                 st = f.read()
             check("threads: 8" in st, "版本戳里写了自查命令")
             check("8 核" in st, "版本戳里写了核数")
+            check("旋钮下限" in st, "版本戳里也写了旋钮的下界(产线自查用)")
 
     with tempfile.TemporaryDirectory() as td:
         d = make_fixture(os.path.join(td, "b"), threads="0", cap=None)
@@ -175,7 +199,10 @@ def main():
         check("比核数还多" in out, "拦下时说明了为什么(比核数还多)", out)
 
     with tempfile.TemporaryDirectory() as td:
-        d = make_fixture(os.path.join(td, "c"), threads="8", cap="6")
+        # ⚠️ **旋钮也必须 ≤ 硬上限**(闸门 ⑤)—— 旋钮 8 / 上限 6 时工人填 8、
+        #   实际只压 6 ⇒ 界面跟实际对不上 ⇒ 那种镜像**不许打出来**。
+        #   所以这里让旋钮也只到 6, 测的仍是「出厂默认取的是上限(6)」。
+        d = make_fixture(os.path.join(td, "c"), threads="8", cap="6", knob="6")
         rc, out = run_block(block_a, d)
         check(rc != 9, "threads 8 但有 6 核硬上限 ⇒ 出厂默认 6 ⇒ 不拦", out)
         check("出厂默认 6 核" in out, "出厂默认取的是上限(6)不是配置(8)", out)
@@ -236,6 +263,109 @@ def main():
         rc, out = run_block(block_a, d)
         check(rc == 9, "硬上限比核数还多(MAX_STRESS_THREADS = 12)被拦下", out)
         check("比核数还多" in out, "拦下时说明了为什么(代码写坏了)", out)
+
+    # ── ①septans 旋钮的**下界**必须是 1(2026-11-10 用户点名) ──────────
+    #    ⚠️ 下界 0 = 「0 = 自动 = 按核数 = 满核 8」那条路 ⇒ 那正是 2026-11-04
+    #    实测会把板子压死的那一档 ⇒ 这种镜像**不许打出来**。
+    with tempfile.TemporaryDirectory() as td:
+        d = make_fixture(os.path.join(td, "d7"), threads="4", cap="8", knob="8",
+                         knob_min="0")
+        rc, out = run_block(block_a, d)
+        check(rc == 9, "旋钮下界是 0 的镜像被拦下(「0 = 自动 = 满核」那条路还开着)", out)
+        check("下界" in out, "拦下时说明了为什么(下界必须是 1)", out)
+
+    with tempfile.TemporaryDirectory() as td:
+        # 那个输入框的写法变了 ⇒ 正则读不到 min ⇒ 一律当不合格处理
+        d = make_fixture(os.path.join(td, "d8"), threads="4", cap="8", knob="8")
+        with open(os.path.join(d, "static", "index.html"), "w", encoding="utf-8") as f:
+            f.write('<input type="number" v-model.number="tests[t.name].threads">\n')
+        rc, out = run_block(block_a, d)
+        check(rc == 9, "读不到旋钮下界时也拦下(宁可拦住, 不放「下界不明」的盘)", out)
+
+    # ── ①octans 前端那道夹子的常量必须跟旋钮一致(2026-11-10) ────────
+    #    ⚠️ **「范围 1~8」这个事实散在三处**: index.html 的 min/max(旋钮)、
+    #    app.js 的 THREADS_MIN/MAX(提交前那道夹子)、cpu.py 的硬上限。
+    #    ⇒ 只查 index.html 的话, app.js 那道夹子被拆了闸门**照样放行**
+    #    ⇒ 出厂的镜像带着一道**失效的夹子** ⇒ 「填 0 = 满核」那条路回来了。
+    with tempfile.TemporaryDirectory() as td:
+        d = make_fixture(os.path.join(td, "d9"), threads="4", cap="8", knob="8",
+                         app_max=4)
+        rc, out = run_block(block_a, d)
+        check(rc == 9, "前端夹子的上限(4)跟旋钮(8)对不上 ⇒ 被拦下", out)
+        check("对不上" in out, "拦下时说明了为什么(两边对不上)", out)
+
+    with tempfile.TemporaryDirectory() as td:
+        # 夹子被拆了(下限放开 ⇒ 0 = 满核那条路回来)
+        d = make_fixture(os.path.join(td, "d10"), threads="4", cap="8", knob="8",
+                         app_min=0)
+        rc, out = run_block(block_a, d)
+        check(rc == 9, "前端夹子的下限被放开(0)⇒ 被拦下", out)
+
+    with tempfile.TemporaryDirectory() as td:
+        d = make_fixture(os.path.join(td, "d11"), threads="4", cap="8", knob="8")
+        os.remove(os.path.join(d, "static", "app.js"))
+        rc, out = run_block(block_a, d)
+        check(rc == 9, "读不到前端夹子的常量时也拦下(宁可拦住)", out)
+
+    # ── ①nonum 旋钮不许超过代码里的硬上限(2026-11-10) ────────────────
+    #    旋钮 max=8 而硬上限=4 ⇒ 工人填 8、**实际只压 4** ⇒ 界面显示的
+    #    核数 ≠ 实际压的核数 ⇒ 这正是「界面跟报告对不上」那类毛病。
+    with tempfile.TemporaryDirectory() as td:
+        d = make_fixture(os.path.join(td, "d12"), threads="4", cap="4", knob="8")
+        rc, out = run_block(block_a, d)
+        check(rc == 9, "旋钮(8)超过硬上限(4)⇒ 被拦下", out)
+        check("对不上" in out, "拦下时说明了为什么(界面跟实际对不上)", out)
+
+    with tempfile.TemporaryDirectory() as td:
+        # 旋钮拧不到硬上限 ⇒ 没问题(旋钮 4 / 上限 8)
+        d = make_fixture(os.path.join(td, "d13"), threads="4", cap="8", knob="4")
+        rc, out = run_block(block_a, d)
+        check(rc != 9, "旋钮(4)不超过硬上限(8)⇒ 不拦", out)
+
+    # ── ①decem 旋钮 title 里的「默认 N 核」必须等于出厂默认(2026-11-10) ──
+    #    那是同一个数的**两份拷贝**(人看的那一份在 title 里)⇒ 对不上 ⇒
+    #    工人的提示就是错的 ⇒ 宁可拦住, 也不出这种盘。
+    with tempfile.TemporaryDirectory() as td:
+        d = make_fixture(os.path.join(td, "d14"), threads="4", cap="8", knob="8",
+                         title_default="6")
+        rc, out = run_block(block_a, d)
+        check(rc == 9, "title 里写「默认 6 核」而出厂默认是 4 ⇒ 被拦下", out)
+        check("两份拷贝" in out, "拦下时说明了为什么(同一个数两份拷贝)", out)
+
+    with tempfile.TemporaryDirectory() as td:
+        d = make_fixture(os.path.join(td, "d15"), threads="4", cap="8", knob="8",
+                         title_default="4")
+        rc, out = run_block(block_a, d)
+        check(rc != 9, "title 里的默认核数跟出厂默认一致 ⇒ 不拦", out)
+
+    # ── ①undecem 出厂默认**只认 defaults.cpu 那一段**(2026-11-10) ─────
+    #    ⚠️ 以前那段 awk 的「段落隔离」**根本没生效**: 「清零」那条规则写在
+    #    后面, 而前一条先 `next` 掉了 ⇒ 清零永远轮不到 ⇒ 离开 cpu 段(走到
+    #    gpu 段)时 in_cpu 不会清 ⇒ **defaults.cpu 里没有 threads、而别的段
+    #    有同名键时, 读到的是别的段的数**。
+    #    ⇒ 现在这一例: cpu 段**故意没有** threads, gpu 段**故意有**
+    #      ⇒ 读不到出厂默认 ⇒ 拦下(而不是把 gpu 的 2 当成 cpu 的默认值)。
+    with tempfile.TemporaryDirectory() as td:
+        # ⚠️ title_default 故意跟 **gpu 段的 2** 一致 —— 否则「title 对账」
+        #    那道闸门会先拦下来, 根本走不到「读不到出厂默认」这一条 ⇒
+        #    那样这条测试就**分不出**段落隔离有没有生效。
+        d = make_fixture(os.path.join(td, "d16"), threads=None, cap="8", knob="8",
+                         title_default="2",
+                         extra_cfg="  gpu:\n    threads: 2\n")
+        rc, out = run_block(block_a, d)
+        check(rc == 9,
+              "defaults.cpu 里没有 threads、而 defaults.gpu 里有 ⇒ "
+              "**不能**把 gpu 的数当成 cpu 的出厂默认 ⇒ 拦下", out)
+        check("读不到" in out,
+              "拦下时说的是「读不到出厂默认」(不是别的理由)", out)
+
+    with tempfile.TemporaryDirectory() as td:
+        # cpu 段里**有** threads ⇒ gpu 段那个同名键**不影响**它
+        d = make_fixture(os.path.join(td, "d17"), threads="4", cap="8", knob="8",
+                         extra_cfg="  gpu:\n    threads: 2\n")
+        rc, out = run_block(block_a, d)
+        check(rc != 9, "cpu 段有 threads 时, gpu 段那个同名键不影响它 ⇒ 不拦", out)
+        check("出厂默认 4 核" in out, "出厂默认取的是 cpu 段的 4(不是 gpu 的 2)", out)
 
     # ── ② console script 闸门 ───────────────────────────────────────
     with tempfile.TemporaryDirectory() as td:

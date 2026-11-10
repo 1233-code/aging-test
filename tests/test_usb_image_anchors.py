@@ -22,7 +22,10 @@
 跑法: .venv/bin/python -m tests.test_usb_image_anchors
 """
 import os
+import shlex
+import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -97,6 +100,184 @@ ANCHORS = [
 ]
 
 
+# ── 「打包/部署类脚本不上盘」(2026-11-10) ─────────────────────────────
+#
+#   以前构建脚本是 `for d in server static docs scripts` ⇒ 整个 scripts/
+#   原样上盘 ⇒ 产线盘上清掉的 8 个「打包/部署类」脚本下次打包又都回来
+#   (其中 install_deps.sh 特别不能带 —— 缺工具时页面/报错按形态给办法,
+#    U 盘版那句话说「盘上没带齐 ⇒ 改用设备版」; 要是盘上偏偏躺着那个脚本,
+#    工人照着跑只会白跑: 产线取不到公网, 装上了也是装在板子上、拔盘带走)。
+#
+#   这一节查两件事:
+#     ① 静态: 整目录拷贝那一行没了, 排除清单在;
+#     ② 行为: 把脚本里那个拷贝函数抠出来真跑一遍, 看排除是不是真生效。
+#
+#   ⚠️ 只在临时目录里跑, 碰不到仓库, 也不执行盘里的任何东西。
+
+#: 不该上盘的脚本(理由见上面那段)
+NOT_ON_STICK = [
+    "install_deps.sh",          # 缺工具时的「死办法」—— U 盘版不该带
+    "build_deb.sh",
+    "build_usb_image.sh",
+    "verify_deb.sh",
+    "deploy.sh",
+    "install_desktop_icon.sh",
+    "prepare_for_firmware.sh",
+    "find_pi5_label.py",
+    "probe_rp_gpio_write.py",   # 开发期探针(跟 deb 版一致)
+]
+
+#: 必须上盘的(否则产线上没人能自检)
+MUST_ON_STICK = ["check_deps.sh", "check_eth.sh"]
+
+
+def _exclusion_list(src):
+    """把构建脚本里那行排除清单**真抠出来**(按名字, 不是按「文件里出现过没有」)。
+
+    ⚠️ 抠的是**调用那一处**的实参 —— 只看「文件里有没有这个名字」是不够的:
+       名字出现在**别处**(比如注释里)不等于它在排除清单里。
+    """
+    i = src.find('copy_tree_except "$PROJECT_ROOT/scripts"')
+    if i < 0:
+        return []          # 调用那处没了 ⇒ 清单为空(下面的检查会一条条报出来)
+    j = src.index("\n", i)
+    while src[j - 1] == "\\":          # 续行 ⇒ 接着收
+        j = src.index("\n", j + 1)
+    call = src[i:j]
+    args = call.split()
+    # 前两个是源目录/目标目录 ⇒ 后面全是排除名
+    return [a for a in args[2:] if "." in a]
+
+
+def _build_script():
+    """构建脚本的全文(手册那节要拿它对账 ⇒ 单独一个函数)。"""
+    with open(os.path.join(REPO, "scripts", "build_usb_image.sh"),
+              encoding="utf-8") as f:
+        return f.read()
+
+
+def scripts_section():
+    print("\n① scripts/ 不整目录上盘")
+    path = os.path.join(REPO, "scripts", "build_usb_image.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    check("for d in server static docs scripts;" not in src,
+          "构建脚本不再整目录拷 scripts/(改成排除法)")
+    check("copy_tree_except" in src,
+          "构建脚本用 copy_tree_except 拷 scripts/")
+    check('copy_tree_except "$PROJECT_ROOT/scripts" "$OUT_DIR/scripts"' in src,
+          "scripts/ 那一处**确实**调的是 copy_tree_except(不是整目录的 copy_tree)")
+    excl = _exclusion_list(src)
+    for name in NOT_ON_STICK:
+        check(name in excl, "排除清单里有: %s" % name)
+    for name in MUST_ON_STICK:
+        check(name not in excl,
+              "该上盘的**没**被排除: %s" % name)
+
+    print("② 行为: 排除真的生效(把那个函数抠出来真跑一遍)")
+    i = src.index("copy_tree_except() {")
+    j = src.index("\n}\n", i) + len("\n}\n")
+    func = src[i:j]
+    with tempfile.TemporaryDirectory() as td:
+        sdir = os.path.join(td, "src")
+        ddir = os.path.join(td, "dst")
+        os.makedirs(sdir)
+        os.makedirs(ddir)
+        for name in ("keep.sh", "drop.sh", "also_drop.py"):
+            with open(os.path.join(sdir, name), "w", encoding="utf-8") as f:
+                f.write("# %s\n" % name)
+        harness = ("set -eu\n%s\ncopy_tree_except %s %s drop.sh also_drop.py\n"
+                   % (func, shlex.quote(sdir), shlex.quote(ddir)))
+        p = subprocess.run(["bash", "-c", harness], capture_output=True, text=True)
+        check(p.returncode == 0, "那个拷贝函数跑得起来", p.stderr[-300:])
+        got = sorted(os.listdir(ddir)) if os.path.isdir(ddir) else []
+        check(got == ["keep.sh"],
+              "排除清单里的文件**没有**被拷过去(其余照拷)", got)
+
+
+# ── 作业手册与脚本对得上(2026-11-10 加) ────────────────────────────────
+#
+#   手册在 docs/U盘版部署作业手册.md —— 产线照着它烧盘、照着它验收。
+#   手册跟脚本各说各话 = 工人照着一份过期的手册干活 ⇒ 这里查两件事:
+#     ① 手册里那些**关键命令/关键值**跟脚本一致;
+#     ② 手册没有把「红线」写成正面建议(比如把格式写成 FAT)。
+def _doc_excluded_list(doc):
+    """把手册里那份「不上盘」的名单抠出来(一个代码块, 一行一个名字)。
+
+    ⚠️ 抠的是**那一块**, 不是「全文里出现过没有」—— 名字出现在别处
+       (比如 §7 红线里也提到 install_deps.sh)不等于它在名单里。
+    """
+    i = doc.find("下面这九个")
+    if i < 0:
+        return []
+    j = doc.find("```", i)
+    if j < 0:
+        return []
+    k = doc.find("```", j + 3)
+    if k < 0:
+        return []
+    return [ln.strip() for ln in doc[j + 3:k].splitlines() if ln.strip()]
+
+
+def _doc_row(doc, prefix):
+    """手册 §4.3 验收清单里**以 prefix 开头的那一行**(表格行)。"""
+    for ln in doc.splitlines():
+        if ln.startswith(prefix):
+            return ln
+    return ""
+
+
+def manual_section():
+    print("\n③ 作业手册(docs/U盘版部署作业手册.md)跟脚本对得上")
+    path = os.path.join(REPO, "docs", "U盘版部署作业手册.md")
+    if not os.path.isfile(path):
+        check(False, "手册在: docs/U盘版部署作业手册.md")
+        return
+    with open(path, encoding="utf-8") as f:
+        doc = f.read()
+
+    for needle, why in (
+            ("mkfs.ext4 -L AGING", "烧盘: ext4 + 标签 AGING"),
+            ("wipefs -a", "烧盘: 先清掉旧的文件系统标记"),
+            ("cp -a", "烧盘: 拷镜像"),
+            ("chmod a+rwx", "烧盘: 挂载点本身也要可写"),
+            ("umount", "烧盘: 卸载之后断电再拔")):
+        check(needle in doc, "手册里有这一步: %s" % why)
+
+    check("mkfs.vfat" not in doc and "mkfs.exfat" not in doc,
+          "手册里没有把 FAT/exFAT 当格式的建议(FAT 建不起 venv)")
+
+    for name in NOT_ON_STICK:
+        check(name in doc, "手册里也写了(不上盘): %s" % name)
+
+    # 「不上盘」的名单: 手册那份**跟脚本那份逐个对得上**
+    script_excl = set(_exclusion_list(_build_script()))
+    doc_excl = set(_doc_excluded_list(doc))
+    check(doc_excl == script_excl,
+          "手册里那份「不上盘」的名单跟构建脚本的排除清单**完全一致**",
+          ("手册:", sorted(doc_excl), "脚本:", sorted(script_excl)))
+
+    # §4.3 验收清单: **逐行**查期望值(不是全文里找那个字符串)
+    row_threads = _doc_row(doc, "| 4 | 出厂默认核数")
+    check("`threads: 4`" in row_threads,
+          "验收清单: 出厂默认核数那行的期望值是 threads: 4", row_threads)
+    row_min = _doc_row(doc, "| 5 | 旋钮下界")
+    check('`min="1"`' in row_min,
+          "验收清单: 旋钮下界那行的期望值是 min=\"1\"", row_min)
+    row_mode = _doc_row(doc, "| 2 | **U 盘模式生效**")
+    check('"mode": "usb"' in row_mode,
+          "验收清单: U 盘模式那行的期望值是 mode=usb", row_mode)
+    row_fix = _doc_row(doc, "| 3 | **没有那条死命令**")
+    check('"fix_command": ""' in row_fix,
+          "验收清单: fix_command 那行的期望值是空", row_fix)
+
+    for needle, why in (
+            ("AGING_USB_MODE", "U 盘模式标记"),
+            ("UUID", "台账: 盘的身份 = 文件系统 UUID"),
+            ("启动老化测试", "工人入口: 原生启动器")):
+        check(needle in doc, "手册里有: %s" % why)
+
+
 def main():
     for rel, name, needle in ANCHORS:
         path = os.path.join(REPO, rel)
@@ -107,6 +288,9 @@ def main():
             src = f.read()
         n = src.count(needle)
         check(n == 1, f"锚点在且只在一处: {name}", n)
+
+    scripts_section()
+    manual_section()
 
     print("\n" + "─" * 60)
     if FAILS:

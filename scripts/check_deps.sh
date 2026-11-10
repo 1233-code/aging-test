@@ -34,6 +34,21 @@ done
 # 项目根目录 (config.yaml 的位置) —— 与 server/config.py 的 PROJECT_ROOT 一致
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# ⚠️ **U 盘版?** —— 盘根目录有个 AGING_USB_MODE 标记(start.sh 看到它就进
+#   U 盘模式)。两种形态的**补救办法不一样**, 别混:
+#   · 设备版(deb 装的): `scripts/install_deps.sh` 在安装目录里 ⇒ 能跑;
+#   · U 盘版: **盘上没有那个脚本** —— `scripts/build_usb_image.sh` **只往
+#     盘上拷「运行时 + 诊断」那几类脚本**, `install_deps.sh` 属于
+#     「打包/部署类」,**不带**(2026-11-10 起)⇒ 照着跑只会得到
+#     「No such file or directory」; 而且 U 盘版**本来也不该**在板子上
+#     apt 装(产线网络取不到公网; 装完拔盘就走, 白装)。
+# ⚠️ 这个判据**跟 Python 侧是同一个**(`server/tests/_tools.py:usb_mode()`:
+#   环境变量 `AGING_TOOL_DIR` 在、**或** 盘根目录有这个标记 ⇒ 取或)
+#   —— 以前两边各认各的 ⇒ 能同时对不上 ⇒ 盘上明明是 U 盘版, 这里却
+#   按设备版印出那条**盘上并不存在**的命令。
+USB_MODE=0
+[ -f "$PROJECT_ROOT/AGING_USB_MODE" ] && USB_MODE=1
+[ -n "${AGING_TOOL_DIR:-}" ] && USB_MODE=1
 # 配置文件位置: 环境变量 > /etc/aging-test/config.yaml (打包安装后的位置)
 #              > 代码根下的 config.yaml (开发机)
 CONFIG_FILE="${AGING_CONFIG:-}"
@@ -112,8 +127,11 @@ declare -A CRITICAL=(
 # §11.7 "依赖补位": libgpiod 系列是风扇的**诊断工具**, **不是备份路径** ——
 # 本板风扇由厂商私有内核驱动直接控制, 标准 gpiod 接口看不到它
 # (/sys/class/gpio/ 不存在), 代码里也明确禁止拿 gpioget 静默兼底成 skipped
-# (见 server/tests/fan.py 的错误文案)。装它们是为了 scripts/find_pi5_label.py
-# 能查 PI5 的 gpiod 标签。故缺了只警告不阻断。
+# (见 server/tests/fan.py 的错误文案)。装它们是为了**厂内诊断**时能查 PI5 的
+# gpiod 标签 ⇒ 故缺了只警告不阻断。
+# ⚠️ **2026-11-10**: 原来这句话里点名了 `scripts/find_pi5_label.py` ——
+#    但那个脚本**厂内才有**(U 盘版的盘上不带它, deb 的白名单里也没有它)
+#    ⇒ 照着这句话去盘上找, 只会多一次「No such file」⇒ 改成只说**用途**。
 declare -A BACKUP=(
     ["gpioget"]="GPIO 读 (风扇诊断工具, libgpiod-tools)"
     ["gpioinfo"]="GPIO 自动探测 (风扇诊断工具)"
@@ -348,12 +366,25 @@ if [ "$BLOCK" = "1" ]; then
     echo "==> ✗ 存在阻断项 —— 拒绝出货 (§11.7)"
     if [ ${#MISSING_CRIT[@]} -gt 0 ]; then
         echo "    缺失关键工具: $(printf '%s ' "${MISSING_CRIT[@]}")"
-        echo "    修复: sudo bash scripts/install_deps.sh"
+        # ⚠️ **2026-11-10**: 补救办法**按形态分开说** —— U 盘版的盘上**没有**
+        #   install_deps.sh ⇒ 照着跑只会得到「No such file or directory」
+        #   ⇒ **补救办法是死的**。U 盘版缺工具 = **这版出厂镜像没带齐**。
+        if [ "$USB_MODE" = "1" ]; then
+            echo "    修复: U 盘版: 盘上自带 fio / glmark2-es2, 其余工具用板子出厂那份 ⇒"
+            echo "          缺工具或工具起不来, 说明这版出厂镜像没带齐, 请改用设备版(deb)安装"
+        else
+            echo "    修复: sudo bash scripts/install_deps.sh"
+        fi
     fi
     echo ""
-    echo "  提示: libgpiod-tools 在 Ubuntu universe 仓库, 装它前需要:"
-    echo "    sudo apt install software-properties-common"
-    echo "    sudo add-apt-repository universe && sudo apt update"
+    if [ "$USB_MODE" = "1" ]; then
+        echo "  提示: U 盘版不在板子上装包(产线网络取不到公网, 拔盘也带不走) ⇒"
+        echo "        缺工具请回头找打包的人重做盘, 别在板子上 apt 装"
+    else
+        echo "  提示: libgpiod-tools 在 Ubuntu universe 仓库, 装它前需要:"
+        echo "    sudo apt install software-properties-common"
+        echo "    sudo add-apt-repository universe && sudo apt update"
+    fi
     echo ""
     echo "  提示: xrandr 属于 x11-xserver-utils; libdrm-tools / modetest 已"
     echo "        不再需要 —— HDMI 模式切换整块移除 (见 docs §6.7.1)"

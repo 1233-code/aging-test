@@ -454,6 +454,11 @@ createApp({
             // ⚠️ loadConfig() 只在挂载时调一次, goConfig() **不重载** ——
             //    所以这里预填的值不会把工人已经改好的名字冲掉。
             testerName.value = (data.report && data.report.operator) || '';
+            // 历史库坏过没有 —— **前端不留这一项**(2026-11-10 用户定:
+            // 界面一个字都不许提, 只在 logs/ 和文档里说)。留着它就等于
+            // 给「哪天又手痒加个提示」留了个口子 ⇒ 在这儿就掐掉。
+            // 要查就 curl /api/config(那儿的字段还在, 是给机器看的)。
+            delete data.history_db;
             testList.value = data.tests;
             testOrder.value = data.recommended_order && data.recommended_order.length
                 ? [...data.recommended_order]
@@ -484,6 +489,27 @@ createApp({
         };
 
         const startTest = async () => {
+            // 2026-11-10: 线程数夹到 **1~8**(用户: 「cpu核数控制在最低是1,
+            // 最高是8」)。以前下界是 0, 而 **0 = 「自动」= 按核数 = 满核 8**
+            // —— 那正是会把板子压死的那一档 ⇒ 现在 0 填不进来。
+            // ⚠️ **夹完要写回框里**(不静默改) —— 否则工人看见框里是 0、这一
+            //   轮实际压的是 1 核, 界面上就「对不上」了(这套系统栽过这种
+            //   「界面跟报告对不上」的跟头)。
+            // ⚠️ 后端也夹一道(`server/tests/cpu.py` 的 `_requested_threads`),
+            //   这里只负责让**看得见的那个框**先对上; 两边的 1 和 8 是同一
+            //   个数的两份拷贝(页面旋钮的 min/max ↔ 后端硬上限),
+            //   `scripts/build_usb_image.sh` 那道闸门会比对它们。
+            const THREADS_MIN = 1, THREADS_MAX = 8;
+            for (const name in tests) {
+                const cfg = tests[name];
+                if (!cfg || !('threads' in cfg)) continue;
+                const n = Math.round(Number(cfg.threads));
+                const v = Number.isFinite(n)
+                    ? Math.min(THREADS_MAX, Math.max(THREADS_MIN, n))
+                    : THREADS_MIN;
+                if (v !== cfg.threads) cfg.threads = v;
+            }
+
             // §8.2 本轮测试人员姓名随请求带上; 空字符串 = 后端回落到
             // config.yaml 的 report.operator, 再没有才在报告里写「未填写」。
             const req = {

@@ -32,7 +32,8 @@ from typing import List, Tuple
 from .base import (
     TestCase, TestContext, TestResult, register, OPERATOR_WAIT_SHORT_SEC,
 )
-from ._tools import find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable
+from ._tools import (find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable,
+                     deps_fix_hint)
 
 # §11.3: 用精确正则而非 substring 模糊匹配 —— 宽松 in 匹配会被无关文本骗到
 _RE_LINK = re.compile(r"^\s*Link detected:\s*(yes|no)\s*$", re.MULTILINE)
@@ -207,7 +208,7 @@ class EthTest(TestCase):
         if missing:
             result.status = "error"
             result.error = (
-                f"未找到: {', '.join(missing)}. 解决: sudo bash scripts/install_deps.sh "
+                f"未找到: {', '.join(missing)}. 解决: {deps_fix_hint()} "
                 "(见 docs/需求设计.md §11.7 —— udhcpc 由 busybox 提供, 不依赖镜像自带)"
             )
             await ctx.on_log(f"[网口] ✗ {result.error}")

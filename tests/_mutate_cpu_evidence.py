@@ -405,10 +405,16 @@ MUTATIONS = [
     #    板子照样死, 而报告上什么异常都看不出来。
     (
         "server/tests/cpu.py",
+        '    if req <= 0:\n        req = 1',
+        '    if True:\n        req = 1',
+        "CPU: **旋钮拧大也不管用**(不管填几一律 1 核 ⇒ 压力上不去, 测不出东西)",
+    ),
+    (
+        "server/tests/cpu.py",
+        '    if req <= 0:\n        req = 1',
         '    if req <= 0:\n        req = ncpu',
-        '    if True:\n        req = ncpu',
-        "CPU: **旋钮填小也不管用**(不管填几一律按核数来 ⇒ 工人拧小了也没用 "
-        "⇒ 板子照样死在满载)",
+        "CPU: **下界被放开**(0 又回到「自动 = 按核数 = 满核 8」⇒ 那正是 "
+        "2026-11-04 实测会把板子压死的那一档)",
     ),
     (
         "server/tests/cpu.py",
@@ -511,6 +517,52 @@ MUTATIONS = [
         "        shape = \"阶梯从 1 逐级爬到它\"",
         "CPU: 现场记录的**头**又写死成「阶梯」(而这一轮跑的是**连续加压**, "
         "压根没有阶梯 ⇒ 产线看报告会被带偏去查爬坡逻辑)",
+    ),
+    # ── 2026-11-10 加的: **下限夹住也要看得见**(`threads_floored`)──────
+    #
+    # 起因: 下界从 0 抬到 1 之后, 工人填 `0` 实际只压 1 核, 而
+    # `threads_capped` 只反映**上限** ⇒ 报告上写着「配置 0 / 实际 1」却
+    # **没有一句话解释这个 0 怎么变成 1 的** ⇒ 看着像老版本「0 = 自动」。
+    (
+        "server/tests/cpu.py",
+        "    return _parse_thread_request(requested) < 1",
+        "    return False",
+        "CPU: **被下限夹住这件事不再记**(指标里没有 threads_floored ⇒ "
+        "报告上看不出「配置 0 其实只压了 1 核」)",
+    ),
+    (
+        "server/tests/cpu.py",
+        "    return _parse_thread_request(requested) < 1",
+        "    return _parse_thread_request(requested) <= 1",
+        "CPU: 下限夹取的判据放宽到「≤ 1」(填 1 也被说成被夹 ⇒ "
+        "正常值被误报 ⇒ 工人不信这个指标)",
+    ),
+    (
+        "server/tests/cpu.py",
+        "    except (TypeError, ValueError):\n        return 0",
+        "    except (TypeError, ValueError):\n        return 1",
+        "CPU: 非法值被当成「已经夹过了」(填 'abc' 时 `threads_floored` 不再是"
+        "「是」⇒ 而实际压的确实是下限 1 核 ⇒ 指标跟事实对不上)",
+    ),
+    (
+        "server/tests/cpu.py",
+        "        threads_floored = _floor_applied(t_cfg.get(\"threads\", 0))",
+        "        threads_floored = False",
+        "CPU: 指标和日志都不再提「被下限夹住」(只有 threads_capped ⇒ "
+        "下限这一半的夹取彻底看不见)",
+    ),
+    (
+        "server/tests/cpu.py",
+        "        if threads_floored:\n            result.metrics[\"threads_floored\"] = \"是\"",
+        "        if False:\n            result.metrics[\"threads_floored\"] = \"是\"",
+        "CPU: 指标**不落库**(日志里说了、报告的指标表里没有 ⇒ "
+        "读报告的人看不到)",
+    ),
+    (
+        "server/tests/cpu.py",
+        "                f\"[CPU] ⚠️ 线程数被**下限 1 核**夹住: 页面填的是 \"",
+        "                f\"[CPU] ⚠️ 线程数被夹住: 页面填的是 \"",
+        "CPU: 日志里不再明说「**下限**」(读的人分不清是被上限夹的还是被下限夹的)",
     ),
 ]
 

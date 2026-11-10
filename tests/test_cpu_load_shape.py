@@ -269,7 +269,7 @@ check(_cpu_defaults.get("duration_sec") == 60,
 check(_cpu_defaults.get("abort_temp_c") == 95,
       "收手线还在(分片模式下有效)", _cpu_defaults.get("abort_temp_c"))
 
-section("【9】加压**封顶 8 核**(2026-11-09 晚放回满核; 当天白天是 5, 再之前是 6)—— 默认值 4、上限 8")
+section("【9】加压**封顶 8 核**(2026-11-09 晚放回满核; 当天白天是 5, 再之前是 6)—— 默认值 4、范围 1~8")
 
 # ⚠️ 实测依据(SN A10000000000010, 2026-11-04): **6 核稳, 第 7 核档起手约
 #    2 秒硬复位**(不是热 —— 起跑 60.9℃, critical trip 110℃); 而**人工在
@@ -298,6 +298,10 @@ section("【9】加压**封顶 8 核**(2026-11-09 晚放回满核; 当天白天�
 #    ⇒ 后来(同一晚更晚)又定: 「确定了, 默认四核, 但是像现在这样支持用户
 #      自己选择核数, 四核比较保险」⇒ **默认值改成 4**, 而**上限仍然是 8**
 #      (旋钮 max 还是 8 ⇒ 用户照样能自己拧)。
+#    ⇒ **2026-11-10 又定: 范围 1~8**(用户: 「cpu核数控制在最低是1,最高是8」)
+#      ⇒ **下界从 0 抬到 1**: 以前 `0` = 「自动」= 按核数 = **满核 8** ——
+#        那正是上面实测会把板子压死的那一档 ⇒ 0/负数/非法值一律夹到 **1**;
+#      ⇒ **上限一个字没动**(仍是 8, 用户要自己拧着找平衡点)。
 #    ⇒ 所以「**默认值 ≠ 上限**」: 上限 = 8 ⇒ 填 64 仍然被夹回 8; 填 6 就是 6。
 #    ⇒ 所以这里守的是「**上限还是硬的、还是同一个夹子**」, 而不是某个数:
 #      上限 = 8 ⇒ 填 64 仍然被夹回 8; 填 6 就是 6(不被乱夹)。
@@ -312,8 +316,9 @@ check(cpu_mod.MAX_STRESS_THREADS == 8,
 _real_cpu_count = os.cpu_count
 try:
     os.cpu_count = lambda: 32
-    check(cpu_mod._resolve_threads(0) == 8,
-          "0(自动)= 核数, 但被上限夹到 8", cpu_mod._resolve_threads(0))
+    check(cpu_mod._resolve_threads(0) == 1,
+          "**0 夹到下限 1**(2026-11-10: 「0 = 自动 = 满核」那条路封了)",
+          cpu_mod._resolve_threads(0))
     check(cpu_mod._resolve_threads(8) == 8,
           "填 8 就是 8(上限放回满核了)", cpu_mod._resolve_threads(8))
     check(cpu_mod._resolve_threads(64) == 8,
@@ -328,11 +333,11 @@ try:
           "填 5 就是 5", cpu_mod._resolve_threads(5))
     check(cpu_mod._resolve_threads(2) == 2,
           "填 2 就是 2(可以调小)", cpu_mod._resolve_threads(2))
-    check(cpu_mod._resolve_threads(-3) == 8,
-          "负数当自动(不能炸)", cpu_mod._resolve_threads(-3))
-    check(cpu_mod._resolve_threads("abc") == 8,
-          "非法值当自动(不能炸)", cpu_mod._resolve_threads("abc"))
-    check(cpu_mod._resolve_threads(0) >= 1,
+    check(cpu_mod._resolve_threads(-3) == 1,
+          "负数夹到下限 1(不能炸, 也不能变成满核)", cpu_mod._resolve_threads(-3))
+    check(cpu_mod._resolve_threads("abc") == 1,
+          "非法值夹到下限 1(不能炸, 也不能变成满核)", cpu_mod._resolve_threads("abc"))
+    check(cpu_mod._resolve_threads(0) == 1,
           "最少 1 线程(stress-ng --cpu 0 是非法参数)")
 
     # 端到端: 页面/配置填 16 ⇒ 真的只压 8, 而且报告上**看得见**这件事。
@@ -382,6 +387,95 @@ _h_sliced = cpu_mod._format_evidence_header(peak_threads=5,
                                             load_mode="sliced")
 check("阶梯" in _h_sliced,
       "分片模式的头里才写「阶梯」", _h_sliced.splitlines()[:4])
+
+section("【11】**下限夹住也要看得见** —— 2026-11-10 补的指标 "
+        "`threads_floored`(2026-11-10 起 0 = 下限 1, 不是「自动 = 按核数」)")
+
+# ⚠️ **为什么要有这个指标**(2026-11-10 自检时发现的洞):
+#    `threads_capped` 只反映**上限**被夹 ⇒ 工人填 `0`(2026-11-10 起实际
+#    只压 **1** 核)时它仍是「否」⇒ 报告上写着「配置 0 / 实际 1」而**没有
+#    一句话解释这个 0 是怎么变成 1 的** —— 看着像老版本「0 = 自动 = 按核数」
+#    的残留 ⇒ 读报告的人会以为这一轮压根没夹过, 或者以为 0 仍然表示满核。
+#    ⇒ 补 `threads_floored`(是/否)+ 日志里明说。
+check(cpu_mod._floor_applied(0) is True,
+      "填 0 ⇒ 被下限夹住", cpu_mod._floor_applied(0))
+check(cpu_mod._floor_applied(-3) is True,
+      "填负数 ⇒ 被下限夹住", cpu_mod._floor_applied(-3))
+check(cpu_mod._floor_applied("abc") is True,
+      "填非法值 ⇒ 被下限夹住", cpu_mod._floor_applied("abc"))
+check(cpu_mod._floor_applied(None) is True,
+      "填空 ⇒ 被下限夹住", cpu_mod._floor_applied(None))
+check(cpu_mod._floor_applied(1) is False,
+      "填 1 ⇒ 没被下限夹", cpu_mod._floor_applied(1))
+check(cpu_mod._floor_applied(4) is False,
+      "填 4 ⇒ 没被下限夹", cpu_mod._floor_applied(4))
+check(cpu_mod._floor_applied(8) is False,
+      "填 8 ⇒ 没被下限夹", cpu_mod._floor_applied(8))
+check(cpu_mod._floor_applied("4") is False,
+      "填字符串 '4' ⇒ 没被下限夹(能解析出来就不算夹)", cpu_mod._floor_applied("4"))
+
+# ── 端到端: 填 0 ⇒ 真的只压 1 核, 而且报告上**看得见这件事** ──
+_fbase = mkdtemp(prefix="aging-cpu-floor-")
+_ffake, _fargs = make_fake_env(_fbase)
+patch_cpu(_ffake, _fargs)
+result, logs = run_cpu({"times": 1, "duration_sec": 60, "threads": 0,
+                        "max_temp_c": 85, "abort_temp_c": 95})
+finv = fake_invocations(_fargs)
+check(bool(finv) and "--cpu 1" in finv[0],
+      "端到端: 填 0 线程 ⇒ stress-ng 实际拿到 --cpu 1(不是满核 8!)", finv)
+check(result.metrics.get("peak_threads") == 1,
+      "指标 peak_threads = 1(实际压了几核)", result.metrics.get("peak_threads"))
+check(result.metrics.get("peak_threads_configured") == 0,
+      "指标 peak_threads_configured = 0(配置里填的原始值)",
+      result.metrics.get("peak_threads_configured"))
+check(result.metrics.get("threads_floored") == "是",
+      "指标 threads_floored = 是(这一轮被**下限**夹过)",
+      result.metrics.get("threads_floored"))
+check(result.metrics.get("threads_capped") != "是",
+      "指标 threads_capped ≠ 是(这一轮没被**上限**夹 —— 两件事得分清)",
+      result.metrics.get("threads_capped"))
+check(any("下限" in l for l in logs),
+      "日志里明说「被下限夹住」", logs)
+
+# 填 4(正常值)⇒ 不该出现「被下限夹住」
+_nbase = mkdtemp(prefix="aging-cpu-nofloor-")
+_nfake, _nargs = make_fake_env(_nbase)
+patch_cpu(_nfake, _nargs)
+nresult, nlogs = run_cpu({"times": 1, "duration_sec": 60, "threads": 4,
+                           "max_temp_c": 85, "abort_temp_c": 95})
+check(nresult.metrics.get("threads_floored") != "是",
+      "填 4 ⇒ 指标 threads_floored ≠ 是(没被下限夹)",
+      nresult.metrics.get("threads_floored"))
+check(not any("下限" in l for l in nlogs),
+      "填 4 ⇒ 日志里没有「被下限夹住」那一句", nlogs)
+
+section("【12】**这一轮压在满核上**也要提醒 —— 2026-11-10 补的洞")
+
+# ⚠️ **为什么要有这句**(2026-11-10 自检时发现的):
+#    `threads_capped` 的判据是「夹完的核数 > 加压上限」, 而
+#    `_requested_threads` 先把请求夹到**核数** ⇒ 8 核板子上 want ≤ 8 = MAX
+#    ⇒ **capped 恒为「否」** ⇒ 原来那句「满核会压死板子」的提醒
+#    **在这台板子上永远走不到**(一直没响过)。
+#    ⇒ 「这一轮实际压到了满核」这件事, 得由另一条判据(`threads >= 上限`)
+#      来提醒 —— 跟打包脚本那条警告一个口径(看「拧得到几核/压了几核」,
+#      不看出厂默认)。
+_mbase = mkdtemp(prefix="aging-cpu-full-")
+_mfake, _margs = make_fake_env(_mbase)
+patch_cpu(_mfake, _margs)
+mresult, mlogs = run_cpu({"times": 1, "duration_sec": 60, "threads": 8,
+                          "max_temp_c": 85, "abort_temp_c": 95})
+check(any("满核" in l for l in mlogs),
+      "填 8(= 满核)⇒ 日志里明说「这一轮压的是满核」", mlogs)
+check(any("过应力" in l for l in mlogs),
+      "填 8 ⇒ 日志里点明「满核 = 过应力那一档」", mlogs)
+
+_kbase = mkdtemp(prefix="aging-cpu-notfull-")
+_kfake, _kargs = make_fake_env(_kbase)
+patch_cpu(_kfake, _kargs)
+kresult, klogs = run_cpu({"times": 1, "duration_sec": 60, "threads": 4,
+                          "max_temp_c": 85, "abort_temp_c": 95})
+check(not any("满核" in l for l in klogs),
+      "填 4 ⇒ 日志里没有「满核」那一句(别乱喊)", klogs)
 
 
 print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))

@@ -38,7 +38,7 @@ const MUTATIONS = [
         name: 'HTML: 「线程数」输入框整个没了 (旋钮不见了, 工人没法降压力)',
         file: 'index.html',
         from: `                            <span v-if="'threads' in tests[t.name]">
-                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="0" max="8" class="num-input" title="默认 4 核(上限 8); 0 = 自动(=8 满核)">
+                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="1" max="8" class="num-input" title="默认 4 核(范围 1~8; 拧到 8 = 满核, 过应力那一档)">
                             </span>
 `,
         to: ``,
@@ -56,10 +56,16 @@ const MUTATIONS = [
         to: `<span v-if="'duration_sec' in tests[t.name]">`,
     },
     {
-        name: 'HTML: min 改成 1 (0 = 自动 这个合法值被浏览器的下界校验挡住)',
+        name: 'HTML: min 改成 0 (下界又打开了 ⇒ 「0 = 自动 = 按核数 = 满核」那条路回来)',
         file: 'index.html',
-        from: `v-model.number="tests[t.name].threads" min="0"`,
-        to: `v-model.number="tests[t.name].threads" min="1"`,
+        from: `v-model.number="tests[t.name].threads" min="1"`,
+        to: `v-model.number="tests[t.name].threads" min="0"`,
+    },
+    {
+        name: 'JS: 前端那道 1~8 的夹子被拆了 (工人填 0 ⇒ 真按「自动 = 满核」发出去)',
+        file: 'app.js',
+        from: `            const THREADS_MIN = 1, THREADS_MAX = 8;`,
+        to: `            const THREADS_MIN = 0, THREADS_MAX = 999;`,
     },
     {
         name: 'JS: 默认值把工人填的数盖掉了(框还在, 但拧了没用 ⇒ 板子照样死在满载)',

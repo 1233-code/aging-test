@@ -302,8 +302,12 @@ copy_tree "$PROJECT_ROOT/server" "$PREFIX/server"
 copy_tree "$PROJECT_ROOT/static" "$PREFIX/static"
 
 # 脚本 —— **白名单**, 不整目录复制:
-#   probe_rp_gpio_write.py 写 /proc/rp_gpio/pi5 会让板子 kernel panic,
-#   绝对不能随包走 (docs §6.8); 其余是开发期诊断工具, 产线上用不上。
+#   probe_rp_gpio_write.py 是**开发期探针**, 产线上用不上 ⇒ 不随包走。
+#   ⚠️ 这里原来写的理由是「它写 /proc/rp_gpio/pi5 会让板子 kernel panic」
+#     —— **那条结论已经作废**(2026-10-22 终端实测连写 5 次板子都正常;
+#     脚本自己的 docstring 里已经更正过)⇒ 现在的理由只剩「开发期工具」。
+#     崩因至今没查清的是「UI 上单独跑风扇测试」那件事, 不是这个脚本。
+#   其余几个是产线上真用得上的(装依赖 / 自检 / 桌面图标)。
 mkdir -p "$PREFIX/scripts"
 for s in check_deps.sh install_deps.sh install_desktop_icon.sh; do
     [ -f "$PROJECT_ROOT/scripts/$s" ] && cp -p "$PROJECT_ROOT/scripts/$s" "$PREFIX/scripts/$s"

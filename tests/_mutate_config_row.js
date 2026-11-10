@@ -101,7 +101,7 @@ const MUTATIONS = [
         name: 'HTML: 「线程数」那一格被删了(CPU 的压力旋钮不见了 ⇒ 工人没法自己降压力)',
         file: 'index.html',
         from: `                            <span v-if="'threads' in tests[t.name]">
-                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="0" max="8" class="num-input" title="默认 4 核(上限 8); 0 = 自动(=8 满核)">
+                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="1" max="8" class="num-input" title="默认 4 核(范围 1~8; 拧到 8 = 满核, 过应力那一档)">
                             </span>
 `,
         to: ``,
@@ -180,29 +180,29 @@ const MUTATIONS = [
 `,
     },
     {
-        name: 'HTML: CPU「线程数」那条「默认 4 核(上限 8); 0 = 自动(=8 满核)」又被摆回版面上当提示词了',
+        name: 'HTML: CPU「线程数」那条「默认 4 核(范围 1~8; 拧到 8 = 满核, 过应力那一档)」又被摆回版面上当提示词了',
         file: 'index.html',
         from: `                            <span v-if="'threads' in tests[t.name]">
-                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="0" max="8" class="num-input" title="默认 4 核(上限 8); 0 = 自动(=8 满核)">
+                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="1" max="8" class="num-input" title="默认 4 核(范围 1~8; 拧到 8 = 满核, 过应力那一档)">
                             </span>
 `,
         to: `                            <span v-if="'threads' in tests[t.name]">
-                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="0" max="8" class="num-input">
-                                <span class="hint-tag">默认 4 核(上限 8); 0 = 自动(=8 满核)</span>
+                                线程数: <input type="number" v-model.number="tests[t.name].threads" min="1" max="8" class="num-input">
+                                <span class="hint-tag">默认 4 核(范围 1~8; 拧到 8 = 满核, 过应力那一档)</span>
                             </span>
 `,
     },
     {
         name: 'HTML: 「线程数」输入框的 title(悬停提示)被删了(满核那句就彻底没了)',
         file: 'index.html',
-        from: `v-model.number="tests[t.name].threads" min="0" max="8" class="num-input" title="默认 4 核(上限 8); 0 = 自动(=8 满核)"`,
-        to: `v-model.number="tests[t.name].threads" min="0" max="8" class="num-input"`,
+        from: `v-model.number="tests[t.name].threads" min="1" max="8" class="num-input" title="默认 4 核(范围 1~8; 拧到 8 = 满核, 过应力那一档)"`,
+        to: `v-model.number="tests[t.name].threads" min="1" max="8" class="num-input"`,
     },
     {
         name: 'HTML: 「线程数」的上界被从 8 改成 5(旋钮被改坏了 ⇒ 工人拧不了 6/7)',
         file: 'index.html',
-        from: `v-model.number="tests[t.name].threads" min="0" max="8"`,
-        to: `v-model.number="tests[t.name].threads" min="0" max="5"`,
+        from: `v-model.number="tests[t.name].threads" min="1" max="8"`,
+        to: `v-model.number="tests[t.name].threads" min="1" max="5"`,
     },
     {
         name: 'CSS: .test-item 不再用网格(右列塌了 ⇒ 旋钮掉回下面)',
