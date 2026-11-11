@@ -41,21 +41,28 @@ _COPY_TEST = "tests/test_bluetooth_verdict.py"
 MUTATIONS = [
     (
         "server/tests/bluetooth.py",
-        '    working = bool(controllers) and rf_state != "blocked"',
+        '    working = bool(active) and rf_state != "blocked"',
         '    working = False',
         "判定方向: 永远说「没在工作」⇒ 蓝牙真的在工作时也判合格",
     ),
     (
         "server/tests/bluetooth.py",
-        '    working = bool(controllers) and rf_state != "blocked"',
+        '    working = bool(active) and rf_state != "blocked"',
         '    working = True',
         "判定方向: 永远说「在工作」⇒ 板子上压根没蓝牙也判不合格",
     ),
     (
         "server/tests/bluetooth.py",
-        '    working = bool(controllers) and rf_state != "blocked"',
-        '    working = bool(controllers)',
+        '    working = bool(active) and rf_state != "blocked"',
+        '    working = bool(active)',
         "屏蔽不看: 射频被屏蔽着(soft/hard block)也算「在工作」",
+    ),
+    (
+        "server/tests/bluetooth.py",
+        "    active = sorted(set(hci_sysfs))",
+        "    active = controllers",
+        "又拿 /dev 里的残留节点当「活动的控制器」⇒ 蓝牙本来就该关着的"
+        "板子被判「蓝牙在工作」⇒ **冤枉好板子**",
     ),
     (
         "server/tests/bluetooth.py",

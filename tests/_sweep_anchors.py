@@ -34,6 +34,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MULTI_OK = "故意多改"
 
 
+#: MUTATIONS 里用了**变量**(不是字面量)的条目 —— 静态查不了锚点。
+#: 这本身就是要报的: 锚点查不了 ⇒ 那条变异**从来没被静态验过**。
+NON_LITERAL = []
+
+
 def mutations_of(path):
     """(文件, from, to, 说明) 四元组们。
 
@@ -41,6 +46,12 @@ def mutations_of(path):
     字段, 比如 _mutate_fan_gpu_verdict.py)的**也收** —— 锚点还是头四个里的
     第 2、3 个。2 元组(名字 + 一个改文件的函数)的**收不了** ⇒ 那种脚本
     没法静态查锚点, 在汇总里单独点出来, 不当成「锚点失效」。
+
+    ⚠️ **四个元素必须是字面量** —— 写成变量(`TOOL_REL` 那种)的话,
+       这里 `literal_eval` 会炸(2026-11-11 就炸过一次, 整个扫描停在那儿,
+       后面那些脚本**一个都没扫到** ⇒ 看着像「没问题」)。所以:
+       · 炸了就当「查不了」记下来, 报出来, **不**让整个扫描停摆;
+       · 变量写进 MUTATIONS 的一律改成字面量(见 _mutate_docs_consistency.py)。
     """
     tree = ast.parse(open(path, encoding="utf-8").read())
     for node in ast.walk(tree):
@@ -52,7 +63,11 @@ def mutations_of(path):
         for e in node.value.elts:
             if not isinstance(e, ast.Tuple) or len(e.elts) < 4:
                 continue
-            vals = tuple(ast.literal_eval(x) for x in e.elts[:4])
+            try:
+                vals = tuple(ast.literal_eval(x) for x in e.elts[:4])
+            except (ValueError, SyntaxError):
+                NON_LITERAL.append((path, len(e.elts)))
+                continue
             yield vals
 
 
@@ -164,6 +179,13 @@ def main():
                 print(f"    ⇒ 把 from 改长到唯一, 或者在说明里写「{MULTI_OK}」")
     print(f"\n{len(scripts)} 个变异脚本, {total} 条变异: "
           f"锚点失效 {dead} 条, 不唯一 {wide} 条")
+    if NON_LITERAL:
+        dead += len(NON_LITERAL)
+        print(f"✗ **有 {len(NON_LITERAL)} 条变异的锚点用了变量** ⇒ 静态查不了"
+              f" ⇒ 它们从来没被静态验过:")
+        for p, n in NON_LITERAL:
+            print(f"    {os.path.basename(p)}: {n} 条")
+        print("    ⇒ 把 MUTATIONS 里那几个元素改成**字面量**")
     if nosweep:
         print(f"⇒ 另有 {len(nosweep)} 个脚本的变异不是 from→to 形态, "
               f"锚点没法静态查: {', '.join(nosweep)}")

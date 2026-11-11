@@ -270,6 +270,24 @@ def manual_section():
     row_fix = _doc_row(doc, "| 3 | **没有那条死命令**")
     check('"fix_command": ""' in row_fix,
           "验收清单: fix_command 那行的期望值是空", row_fix)
+    row_deps = _doc_row(doc, "| 7 | 关键工具没缺位")
+    check(bool(row_deps) and "check_deps.sh" in row_deps,
+          "验收清单: 有一行是「跑一次 check_deps.sh」(缺位自检)", row_deps)
+    check(bool(row_deps) and ("退出码 0" in row_deps or "0" in row_deps),
+          "验收清单: check_deps 那行写清了期望(退出码 0)", row_deps)
+    check(bool(row_deps) and "不要在板子上 apt 装" in row_deps,
+          "验收清单: 缺工具时说清「不要在板子上 apt 装」", row_deps)
+
+    # 「换台板子还起得起吗」那道闸: **打包时**跑, 不是在板子上跑
+    check("check_usb_selfcontained.py" in _build_script(),
+          "构建脚本里确实调了 check_usb_selfcontained.py(手册说的那道闸真存在)")
+    check("退出码 3" in doc and "下不了结论" in doc,
+          "手册里说明了「在板子上跑 ⇒ 退出码 3 = 下不了结论」")
+    check("不要**拿它当验收判据" in doc or "不要拿它当验收判据" in doc
+          or "不作判据" in doc,
+          "手册里明说了盘上那份的结论**不作验收判据**")
+    check("基线闭包" in doc,
+          "手册 §2.2 关口一览里有「基线闭包」这一关(出厂镜像基线那一条)")
 
     for needle, why in (
             ("AGING_USB_MODE", "U 盘模式标记"),

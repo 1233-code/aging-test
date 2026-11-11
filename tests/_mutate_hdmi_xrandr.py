@@ -126,7 +126,12 @@ def main():
             f.write(orig.replace(frm, to))
         code, out = run_one(tmp)
         fails = out.count("✗")
-        if code != 0:
+        if code != 0 and fails == 0:
+            # 红了, 但**一个 ✗ 都没有** ⇒ **崩了**, 不是被断言咬住的 ⇒ 不算数。
+            print(f"\n✗ {desc}\n   → 红了, 但一个 ✗ 都没有 (exit={code}) —— "
+                  f"这是**崩了**, 不算数:\n{out[-600:]}")
+            bad += 1
+        elif code != 0:
             print(f"\n✓ {desc}\n   → 测试变红 (exit={code}, {fails} 项失败) —— 咬得动")
         else:
             print(f"\n✗ {desc}\n   → 测试还是绿的! 这个变异没被守住")

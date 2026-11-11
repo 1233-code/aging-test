@@ -301,14 +301,31 @@ check(result.metrics.get("bt_working") is False, "bt_working = False",
 board.cleanup()
 
 
-section("【6】只有 /dev/hci0(没有 sysfs 里的 hci)⇒ 也算「在工作」")
+section("【6】只有 /dev/hci0(没有 sysfs 里的 hci)⇒ **不算**「在工作」")
 
+# ⚠️ **2026-11-11 改**: 以前 `/dev/hci0` 也算「有活动的控制器」⇒
+#   一块**蓝牙本来就该关着**的板子(射频也没屏蔽着, 只是 /dev 里留着
+#   udev 建的老节点)会被判「蓝牙在工作」⇒ **failed ⇒ 冤枉好板子**
+#   (本机规格就是「不需要蓝牙」⇒ 它本来就合格)。
+#   ⇒ 「活动的控制器」只看**内核认得的** `/sys/class/bluetooth/hci*`。
 board = FakeBoard(bt_rfkill={"name": "sunxi-bt", "soft": 0, "hard": 0},
                   hci_dev=["hci0"])
 result, ctx = run(board)
-check(result.status == "failed", "判 failed", result.status)
-check(result.metrics.get("bt_hci_devices") == "hci0", "记下了 /dev 里的控制器",
+check(result.status == "passed",
+      "/dev 里那个残留节点不算「在工作」⇒ 判 passed(蓝牙确实没在工作)",
+      result.status)
+check(result.metrics.get("bt_working") is False, "bt_working = False",
+      result.metrics.get("bt_working"))
+check(result.metrics.get("bt_hci_devices") == "(无)",
+      "「蓝牙设备」报的是**活动的控制器** ⇒ 是空的(/dev 里那个残留节点"
+      "**不算控制器**, 报上去只会跟「已关闭」自相矛盾)",
       result.metrics.get("bt_hci_devices"))
+check("没有活动的控制器" in (result.metrics.get("bt_detail") or ""),
+      "详情写明是「没有活动的控制器」那一类",
+      result.metrics.get("bt_detail"))
+check("hci0" in (result.metrics.get("bt_detail") or ""),
+      "详情里把 /dev 里那个残留节点点名说明(信息不藏, 但说清它不算)",
+      result.metrics.get("bt_detail"))
 board.cleanup()
 
 

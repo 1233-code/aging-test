@@ -70,6 +70,44 @@ def fake_bin(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
 
 
+# ⚠️ **产线端口 —— 谁也不许在回归里碰它**。
+#   产线服务就跑在 8000 上(本机就是那块板子, 服务从 U 盘上跑)。
+PROD_PORT = 8000
+
+
+def free_port():
+    """找一个**空着的**端口, 保证不给产线服务(8000)招灾。
+
+    ⚠️ **2026-11-11 血的教训**: 这个测试原来**不设 PORT** ⇒ `start.sh`
+       用默认值 8000 ⇒ 而 `stop_service()` 在「PID 文件不在」时会去
+       **`kill_port_holder 8000`** ⇒ 回归套件**亲手把产线服务杀了**
+       (SIGTERM ⇒ uvicorn 优雅退出 ⇒ 产线当场断服务, 且日志里查不到是谁干的
+       —— 因为干活的正是测试自己)。
+       ⇒ 本测试**必须**显式指定一个自己的端口。
+    """
+    import socket
+    for _ in range(50):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        finally:
+            s.close()
+        if port != PROD_PORT:
+            return port
+    raise RuntimeError("找不到一个能用的测试端口")
+
+
+def port_holder_pid(port):
+    """谁占着这个端口(没有 = 空)。"""
+    try:
+        p = subprocess.run(["lsof", "-t", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+                           capture_output=True, text=True, timeout=20)
+        return (p.stdout or "").strip()
+    except Exception:
+        return ""
+
+
 # ══════════════════════════════════════════════════════════
 section("【1】工具目录优先 —— U 盘上的 fio 得比系统 PATH 先被找到")
 # ══════════════════════════════════════════════════════════
@@ -163,6 +201,16 @@ def t2_start_sh_usb_mode():
     env = {"FAKE_UVI_OUT": out_file,
            "PATH": fakebin + os.pathsep + os.environ.get("PATH", "")}
 
+    # ⚠️ **必须显式指定端口** —— 不指定就是 8000(默认值)⇒ `stop_service()`
+    #    会去 `kill_port_holder 8000` ⇒ **回归把产线服务杀了**
+    #    (2026-11-11 真的发生过一次, 产线当场断服务)。
+    prod_holder_before = port_holder_pid(PROD_PORT)
+    test_port = free_port()
+    env["PORT"] = str(test_port)
+    check(test_port != PROD_PORT,
+          "测试用的是**自己的端口** %d, 不是产线的 %d" % (test_port, PROD_PORT),
+          test_port)
+
     # **设备版(deb 装)的数据根在 /var/lib/aging-test**, 不在代码根 ——
     # 这里拿临时目录里一个同角色的目录来冒充它(别真往 /var/lib 里写)。
     device_data = os.path.join(tmp, "vardata")
@@ -211,6 +259,15 @@ def t2_start_sh_usb_mode():
           seen.get("ARGV"))
     check("U 盘模式" in out, "启动时打了「U 盘模式」的横幅", out[-300:])
     run(["bash", "start.sh", "stop"], cwd=tmp, env=env, timeout=60)
+
+    # ②' **产线端口必须原封不动** —— 这一条是本测试的**人命线**:
+    #    回归跑在产线板上, 一旦把 8000 上的服务杀了, 工人当场断服务,
+    #    而日志里**查不到是谁干的**(干活的正是这个测试自己)。
+    prod_holder_after = port_holder_pid(PROD_PORT)
+    check(prod_holder_after == prod_holder_before,
+          "**产线端口 %d 上的服务没被动过** (跑之前 %s / 跑之后 %s)"
+          % (PROD_PORT, prod_holder_before or "(空)", prod_holder_after or "(空)"),
+          "跑之前=%s 跑之后=%s" % (prod_holder_before, prod_holder_after))
 
     # ③ 语法检查
     code, out = run(["bash", "-n", os.path.join(REPO, "start.sh")])

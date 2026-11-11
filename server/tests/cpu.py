@@ -10,7 +10,7 @@ from ._tools import (
     find_tool, with_sudo, sudo_hint_if_unavailable, run_proc_with_progress,
     deps_fix_hint,
 )
-from ..boot_evidence import cpu_evidence_path
+from ..boot_evidence import cpu_evidence_path, current_boot_id
 
 # ── 热保护 (§6.2「不许把板子烤死」那一段) ─────────────────────────────────
 #
@@ -904,6 +904,16 @@ def _format_evidence_header(peak_threads: Optional[int] = None,
     state = _format_board_state(_read_board_state())
     if state:
         lines.append("# 进这一项时的板子状态: " + state)
+    # ⚠️ **开机 ID 必须写进头里** (2026-11-11 加):
+    #   「加压起手了、没跑完」有两种成因 —— **板子死了**(不合格), 或者
+    #   **服务自己没了**(工人重启服务 / 事件循环冻死 ⇒ 板子好好的,
+    #   **冤枉好板**)。光看这份记录分不出来 ⇒ 记下**当时的开机 ID**,
+    #   收尾时对一下现在的开机 ID: **一样** ⇒ 板子压根没重启过 ⇒
+    #   是服务自己没了 ⇒ 不赖板子。
+    #   (开机 ID **跟时钟无关** —— 这台板子的墙钟会倒退几十天。)
+    boot_id = current_boot_id()
+    if boot_id:
+        lines.append("# 本次开机 ID: " + boot_id)
     return "\n".join(lines) + "\n"
 
 

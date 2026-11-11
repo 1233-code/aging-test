@@ -229,6 +229,11 @@ def main():
                  "test_runner_alert.py"):
         shutil.copy2(os.path.join(REPO, "tests", name),
                      os.path.join(tmp, "tests", name))
+    # ⚠️ test_hdmi_replug.py 第 546 行读 <根>/config.yaml ⇒ 副本里**必须**有
+    #    config.yaml, 否则基线在第 20 节就 FileNotFoundError ⇒ 基线本来就是红的
+    #    ⇒ 「退出码非 0 = 咬得动」这个判据被一个**无关崩溃**满足 ⇒ 证据不成立。
+    shutil.copy2(os.path.join(REPO, "config.yaml"),
+                 os.path.join(tmp, "config.yaml"))
     print(f"副本在 {tmp}\n")
 
     bad = 0
@@ -244,7 +249,12 @@ def main():
             f.write(orig.replace(frm, to))
         code, out = run_one(tmp)
         fails = out.count("✗")
-        if code != 0:
+        if code != 0 and fails == 0:
+            # 红了, 但**一个 ✗ 都没有** ⇒ **崩了**, 不是被断言咬住的 ⇒ 不算数。
+            print(f"\n✗ {desc}\n   → 红了, 但一个 ✗ 都没有 (exit={code}) —— "
+                  f"这是**崩了**, 不算数:\n{out[-600:]}")
+            bad += 1
+        elif code != 0:
             print(f"\n✓ {desc}\n   → 测试变红 (exit={code}, {fails} 项失败) —— 咬得动")
         else:
             print(f"\n✗ {desc}\n   → 测试还是绿的! 这个变异没被守住")

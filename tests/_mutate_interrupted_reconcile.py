@@ -136,10 +136,10 @@ MUTATIONS = [
     ),
     (
         "server/main.py",
-        "                        if cut is not None:\n"
-        "                            hard_reset = True",
-        "                        if cut is not None:\n"
-        "                            hard_reset = False",
+        "                    if cut is not None:\n"
+        "                        hard_reset = True",
+        "                    if cut is not None:\n"
+        "                        hard_reset = False",
         "MAIN: 查到「加压起手了、没跑完」也**不改判**(还是 stopped ⇒ "
         "一块扛不住加压的板子照样被放行)",
     ),
@@ -158,9 +158,37 @@ MUTATIONS = [
     ),
     (
         "server/boot_evidence.py",
-        '    return last == "start"',
-        "    return last is not None",
-        "EVID: 只要有标记就当「死在加压途中」(加压**跑完了**也算 ⇒ 冤枉好板子)",
+        "    if last != \"start\":\n        return False",
+        "    if False:\n        return False",
+        "EVID: 只要有记录就当「死在加压途中」(加压**跑完了**也算 ⇒ 冤枉好板子)",
+    ),
+    # ── 2026-11-11 补的「开机 ID」护栏 ──
+    # ⚠️ 护栏**本身**的那条变异在 `tests/_mutate_boot_evidence.py` 里
+    #   (`cpu_evidence_cut_short` 直接被调用 ⇒ 删掉护栏当场变红)。
+    #   这儿**不重复**放它: 收尾这条路上还有**第二道**同样的关
+    #   (`main.py` 里「判不出软硬 ⇒ 要有板子重启过的实证」) ⇒ 单删护栏
+    #   在这条路上**看不出变化** ⇒ 那种红是假的(变异比说明里那处窄)。
+    (
+        "server/main.py",
+        "                                if kind != \"硬复位\":\n"
+        "                                    if boot_evidence."
+        "board_rebooted_since_evidence(\n"
+        "                                            r.get(\"id\")) is not True:\n"
+        "                                        continue",
+        "                                if False:\n"
+        "                                    if boot_evidence."
+        "board_rebooted_since_evidence(\n"
+        "                                            r.get(\"id\")) is not True:\n"
+        "                                        continue",
+        "MAIN: 「判不出软硬」那档**不再要求**「板子真的重启过」的实证 ⇒ "
+        "记录里没有开机 ID(老版本)时也敢判板子不合格 ⇒ 冤枉好板",
+    ),
+    (
+        "server/main.py",
+        "                elif kind == \"软重启\":",
+        "                elif kind == \"软重启\" and False:",
+        "MAIN: 「软重启」这一档**也去查**第二条通道(人为 reboot 发生在加压"
+        "途中 ⇒ 现场记录也是「起跑没结束」⇒ 把人为重启说成板子不合格)",
     ),
     (
         "server/boot_evidence.py",

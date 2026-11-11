@@ -54,6 +54,44 @@ _RE_PING_RTT = re.compile(
 )
 
 
+def _ip4_prefix(ip: str) -> str:
+    """取 IPv4 的前三段(当作「网段」)—— 不是合法 IPv4 就返回空串。"""
+    parts = (ip or "").strip().split(".")
+    if len(parts) != 4:
+        return ""
+    for p in parts:
+        if not p.isdigit() or not (0 <= int(p) <= 255):
+            return ""
+    return ".".join(parts[:3])
+
+
+def _static_ip_for_gateway(static_ip: str, gateway: str) -> str:
+    """静态兜底的地址得**落在工位的网段里** —— 配到别的网段等于没配。
+
+    ⚠️ **现场事实** (2026-11-11 实测, 本板):
+        工位网段是 **192.168.16.0/23**(网卡 192.168.16.26/23,
+        网关 192.168.16.1)⇒ 而配置里写死的静态兜底是 **192.168.1.50/24**
+        ⇒ 两者**不搭界** ⇒ 静态兜底配上去, 网卡是有地址了, 但跟网关
+        **不在同一个网段** ⇒ 一格都发不出去 ⇒ 静态兜底**白配**;
+        再加上「静态 IP 配上了仍 ping 不通」那条判定 ⇒ **判 failed**
+        ⇒ **冤枉好板子**(真正的原因是工位网段跟配置对不上)。
+
+    ⇒ 拿**网关所在的网段**来定地址:
+        · 网关跟配置里那个地址**同一网段** ⇒ 用配置里那个(不动);
+        · **不同网段** ⇒ 按网关的地址段推一个(末位取 50);
+        · 网关读不到 / 不是 IPv4 ⇒ 用配置里那个(**不瞎猜**)。
+    """
+    gw = (gateway or "").strip()
+    gw_net = _ip4_prefix(gw)
+    if not gw_net:
+        return static_ip
+    if _ip4_prefix(static_ip.split("/")[0]) == gw_net:
+        return static_ip
+    # ⚠️ 前缀长度按 /24 —— 现场是 /23, /24 落在它里面 ✓;
+    #   网段本身从**网关**取(那才是工位的网段)。
+    return f"{gw_net}.50/24"
+
+
 def _parse_ethtool(text: str) -> dict:
     """解析 ethtool 输出 —— 精确正则, 不做 substring 匹配 (§11.3)."""
     out = {"link_detected": False, "speed_mbps": 0}
@@ -104,6 +142,8 @@ class EthTest(TestCase):
     def __init__(self):
         self.proc = None
         self.cancel_done = False
+        #: **我们自己加上去的静态地址**(静态兜底用的)—— 收尾要删掉它
+        self._added_static = ""
 
     async def cancel(self):
         if self.proc and self.proc.returncode is None and not self.cancel_done:
@@ -186,6 +226,48 @@ class EthTest(TestCase):
         return agg
 
     async def _run_once(self, ctx: TestContext) -> TestResult:
+        """跑一轮 —— **收尾**: 我们自己加上去的静态地址要删掉。
+
+        ⚠️ **为什么必须删** (2026-11-11 查出来的):
+            静态兜底是 `ip addr add <addr> dev <iface>` —— 这个地址是
+            **我们**加的, 不是板子原本就有的 ⇒ 测完不删, 它就**留在板子上**:
+              · 下一轮 DHCP 拿到 lease, 网卡上**同时有两个地址**;
+              · 别的工位/别的工具看到那个静态地址, 以为工位配置就是这样;
+              · 工人查网卡时看到「自己没配过的地址」⇒ 排查方向跑偏。
+            ⇒ 收尾(不管这一轮是过是失败、是取消还是抛异常)都把它删掉。
+        """
+        self._added_static = ""
+        try:
+            return await self._run_once_inner(ctx)
+        finally:
+            await self._cleanup_static(ctx)
+
+    async def _cleanup_static(self, ctx: TestContext) -> None:
+        """把我们自己加上去的静态地址删掉(没加过就什么都不做)。"""
+        addr = self._added_static
+        self._added_static = ""
+        if not addr:
+            return
+        iface = ctx.config.get("eth", {}).get("iface", "eth0")
+        ip_bin = find_tool("ip")
+        if not ip_bin:
+            return
+        try:
+            rc, text = await self._run(
+                with_sudo([ip_bin, "addr", "del", addr.split("/")[0],
+                           "dev", iface]), 5)
+            if rc == 0:
+                await ctx.on_log(
+                    f"[网口] ✓ 收尾: 静态兜底地址 {addr.split('/')[0]} 已从 "
+                    f"{iface} 上删掉(自己加的, 不留在板子上)")
+            else:
+                await ctx.on_log(
+                    f"[网口] ⚠ 收尾: 静态兜底地址 {addr.split('/')[0]} 删不掉"
+                    f"(rc={rc})—— 手工查一下 {iface}")
+        except Exception as e:
+            await ctx.on_log(f"[网口] ⚠ 收尾: 删静态地址时出错(不影响结论): {e!r}")
+
+    async def _run_once_inner(self, ctx: TestContext) -> TestResult:
         result = TestResult()
         eth_cfg = ctx.config.get("eth", {})
 
@@ -288,14 +370,37 @@ class EthTest(TestCase):
             await ctx.on_log(f"[网口] ⚠️ DHCP 未拿到 lease ({dhcp_ms}ms), 走静态兜底")
             await ctx.on_progress(30, "② DHCP 失败 → 静态兜底")
             # 2b 静态兜底
+            #    ⚠️ **地址要跟工位的网段走** (2026-11-11 改): 配置里写死的
+            #    `192.168.1.50/24` 跟现场工位(192.168.16.0/23)**不搭界**
+            #    ⇒ 配上去也发不出去(静态兜底白配)⇒ 再按「静态 IP 配上了
+            #    仍 ping 不通」判 failed ⇒ **冤枉好板子**。
+            #    ⇒ 先看**默认网关**在哪个网段, 不一致就按它推一个。
+            gw_static = ""
+            try:
+                _, text_gw = await self._run(
+                    with_sudo([ip_bin, "route", "show", "default"]), 5)
+                m_gw = _RE_ROUTE_DEFAULT.search(text_gw)
+                if m_gw:
+                    gw_static = m_gw.group(1)
+            except Exception:
+                gw_static = ""
+            static_ip_use = _static_ip_for_gateway(static_ip, gw_static)
+            if static_ip_use != static_ip:
+                await ctx.on_log(
+                    f"[网口] ⚠ 配置里的静态地址 {static_ip} 跟工位网段"
+                    f"(网关 {gw_static or '(取不到)'})**不搭界** ⇒ 改用 "
+                    f"{static_ip_use}(同一个网段才发得出去)")
             rc2, text2 = await self._run(
-                with_sudo([ip_bin, "addr", "add", static_ip, "dev", iface]), 5
+                with_sudo([ip_bin, "addr", "add", static_ip_use, "dev", iface]), 5
             )
             if rc2 == 0:
                 await self._run(with_sudo([ip_bin, "link", "set", iface, "up"]), 5)
                 ip_mode = "static"
-                ip_addr = static_ip.split("/")[0]
+                ip_addr = static_ip_use.split("/")[0]
                 result.metrics["static_fallback_used"] = True
+                result.metrics["static_ip"] = static_ip_use
+                # ⚠️ **记下来 —— 收尾要把它删掉**(别把自加的地址留在板子上)
+                self._added_static = static_ip_use
                 await ctx.on_log(f"[网口] ✓ 静态兜底 IP 配上去: {ip_addr}")
             else:
                 # 2c DHCP 与静态兜底均失败 → 环境完全不具备取 IP 条件

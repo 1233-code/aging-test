@@ -30,7 +30,7 @@
 | 2 | eMMC 存储 | `fio` (稀疏文件) | ✅ |
 | 3 | TF 卡 (自动探卡 + 自己挂载) | `fio` | ✅ |
 | 4 | HDMI 输出 | `xrandr` (读当前实际输出) + 1 轮自动断开/恢复 | ✅ |
-| 5 | USB 枚举+读写 | `lsusb` + `fio` (写30s + 读30s) | ✅ |
+| 5 | USB 枚举+读写 | `lsusb` + `fio` (**只写 30s** —— **只写不读**, docs §6.5) | ✅ |
 | 6 | 网口 链路+ping | `ethtool` + `ping` | ✅ |
 | 7 | 风扇 GPIO | `/proc/rp_gpio/pi5` (echo 拉高/拉低轮转 2 轮) | ✅ |
 | 8 | WiFi 验证 (扫描+切换) | `iw` / `ip` / `rfkill` | ✅ |
@@ -40,6 +40,11 @@
 
 > **打包出货** — 在**同架构 (aarch64) + Ubuntu 20.04 + python3.8** 的联网打包机上跑 `bash scripts/build_deb.sh`,得到 `dist/aging-test_<版本>_arm64.deb`; 目标机上 `sudo dpkg -i aging-test_*.deb` 一步装完, **全程不联网** (工具 .deb 与 python wheel 都随包带走)。详见 `docs/需求设计.md` §11.7。
 
+> **U 盘版出货 (设备上零安装)** — 工人照着 **`docs/U盘版部署作业手册.md`** 做:
+> 打镜像 → 烧盘 → 上板验收 → 批量多根盘 + UUID 台账。**流程只有这一份文档**,
+> 别另建第二份; 手册里的关键值由 `tests/test_usb_image_anchors.py` 跟构建脚本
+> **逐条对账**。构建脚本: `bash scripts/build_usb_image.sh`。
+
 ## 🚀 快速开始
 
 ### 1. 安装系统依赖 (在被测设备上)
@@ -48,7 +53,14 @@
 sudo bash scripts/install_deps.sh
 ```
 
-关键工具: `stress-ng` (CPU), `glmark2-es2` / `glmark2-es2-wayland` (GPU), `fio` (存储), `memtester` (内存), `ethtool`, `iputils-ping` (`ping`), `busybox` (`udhcpc`), `iw`, `rfkill` (WiFi), `iproute2`, `usbutils` (`lsusb`), `util-linux` (`lsblk`), `x11-xserver-utils` (`xrandr`, HDMI 读当前实际输出), `chromium-browser` (PDF 报告导出 + 自动打开界面), `fonts-wqy-zenhei` (中文报告字体 —— **缺了 PDF 报告会静默变成全空白**, 见 docs §8.2.1), `libgpiod-tools` / `libgpiod2-tools` (**风扇的诊断工具, 不是备份路径** —— 本板风扇是厂商私有驱动, 标准 gpiod 接口看不到它; 缺不阻断) 等 (与 docs/需求设计.md §11.7 一致)。
+关键工具: `stress-ng` (CPU), `glmark2-es2` / `glmark2-es2-wayland` (GPU), `fio` (存储), `memtester` (内存), `ethtool`, `iputils-ping` (`ping`), `busybox` (`udhcpc`), `iw`, `rfkill` (WiFi), `iproute2`, `usbutils` (`lsusb`), `util-linux` (`lsblk`), `x11-xserver-utils` (`xrandr`, HDMI 读当前实际输出), `fonts-wqy-zenhei` (中文报告字体 —— **缺了 PDF 报告会静默变成全空白**, 见 docs §8.2.1), `libgpiod-tools` / `libgpiod2-tools` (**风扇的诊断工具, 不是备份路径** —— 本板风扇是厂商私有驱动, 标准 gpiod 接口看不到它; 缺不阻断) 等 (与 docs/需求设计.md §11.7 一致)。
+
+> ⚠️ **chromium 不在这份清单里, 而且不许 apt 装** —— 出厂镜像**自带** chromium 112。
+> Ubuntu 20.04 仓库里那个 `chromium-browser` 是个 **48KB 的 snap 过渡空壳**,
+> `apt-get install chromium-browser` 会把镜像里那份**能用的** chromium 换成它
+> ⇒ **PDF 报告静默变成空白**(不报错, 只是没内容, docs §8.2.1)。
+> ⇒ `install_deps.sh` 现在**只查不装**(找到就提醒你别装), `build_deb.sh` 那边
+> 也有同样的**禁止闸**。
 
 > **不再需要 `libdrm-tools` / `modetest`** —— HDMI 模式切换已整块移除(改用 sysfs + xrandr 读当前状态), 详见 docs §6.7.1。
 
@@ -142,6 +154,7 @@ aging-test/
 ├── docs/
 │   ├── 需求设计.md              # 需求 + 设计 (合并文档)
 │   ├── 部署方式对比.md          # 「设备本地安装」 vs 「U 盘运行」 可行性分析 + 四方案对比
+│   ├── U盘版部署作业手册.md     # **U 盘版出货的唯一流程文档** (打镜像/烧盘/上板验收/批量多根盘 + UUID 台账)
 │   └── 项目介绍.pptx
 ├── server/
 │   ├── main.py                  # FastAPI 入口
@@ -160,13 +173,30 @@ aging-test/
 │   ├── app.js
 │   └── style.css
 ├── scripts/
-│   ├── install_deps.sh          # apt 装系统工具 (与 §11.7 清单一致)
+│   ├── install_deps.sh          # apt 装系统工具 (与 §11.7 清单一致; **chromium 只查不装**)
 │   ├── check_deps.sh            # 关键工具缺位自检 (装机末尾 / 产线 debug 用; --packages-only 只查包类)
 │   ├── build_deb.sh             # 打包 → dist/aging-test_*.deb (§11.7)
 │   ├── build_usb_image.sh       # 「U 盘版应用」镜像构建 (§4.1.1) —— 拷代码 + 解 14 个 deb + 生成 wrapper
 │   ├── verify_deb.sh            # 出货前的校验闸 (禁入 / 必入 / 元数据)
 │   ├── deploy.sh                # 发布辅助
-│   └── install_desktop_icon.sh  # 装桌面图标 (可选)
+│   ├── install_desktop_icon.sh  # 装桌面图标 (可选)
+│   ├── check_eth.sh             # 网口自检 (链路 + ping)
+│   ├── check_service.sh         # 服务在不在 (产线 debug 用)
+│   ├── check_history_db.py      # 历史库体检 (0 好 / 1 坏 / 2 用法 / **3 下不了结论**)
+│   ├── check_usb_selfcontained.py # U 盘工具「换台板子还起得起吗」静态查 (读 ELF, 不执行盘里的二进制)
+│   ├── force_restart.sh         # 强制重启服务
+│   ├── prepare_for_firmware.sh  # 固件构建机: 校验关键文件 + 打印固件打包清单
+│   ├── usb_launcher.c           # U 盘版一键启动器**源码** (打成原生二进制, 工人双击它)
+│   ├── usb_wrapper.sh.tpl       # wrapper 模板 (build_usb_image.sh 生成盘上的那个)
+│   └── 诊断类(产线 debug 用, 不是运行时依赖):
+│       ├── probe_cpu_ramp.py         # CPU 加压台阶 (线程数 ↔ 温度)
+│       ├── probe_app_vs_terminal.py  # 应用加压 vs 终端加压 (对照实验)
+│       ├── probe_fan_driver.py       # 风扇驱动探针
+│       ├── probe_rp_gpio_write.py    # GPIO 写探针 (**已停用**: 崩因不明, 别在产线上跑)
+│       ├── find_pi5_label.py         # 找 GPIO 标签
+│       ├── pdf_report_text.py        # 报告 PDF 文本抽检 (空白报告自查)
+│       ├── calibrate_gpu_benchmarks.py # GPU 基准标定
+│       └── verify_gpu_cancel_live.py  # GPU 取消真机验证
 ├── deb/                         # deb 的元数据与维护脚本
 │   ├── control / conffiles      # 包元数据 (Depends 故意不含工具与 chromium)
 │   ├── postinst / prerm / postrm  # 装机 / 卸载 / 清场

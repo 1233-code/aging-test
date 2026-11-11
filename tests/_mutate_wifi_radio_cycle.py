@@ -34,6 +34,16 @@ TEST = "tests.test_wifi_radio_cycle"
 
 # 每个变异: (文件, from, to, 说明)。from 必须在源文件里**找得到**, 否则算失败。
 MUTATIONS = [
+    # ── 2026-11-11: 收尾判「恢复没恢复」看**管理状态**, 不看载波 ──
+    (
+        "server/tests/wifi.py",
+        "            admin, carrier, _ms = await self._wait_state_up("
+        "ctx, ip_bin, iface, 5.0)\n        return admin, carrier",
+        "            admin, carrier, _ms = await self._wait_state_up("
+        "ctx, ip_bin, iface, 5.0)\n        return carrier, carrier",
+        "WIFI: 收尾又拿**载波**当判据(没网的工位上载波恒是 DORMANT ⇒ "
+        "明明恢复好了却报「没能把接口恢复成 UP」⇒ 假警报 ⇒ 冤枉好板子)",
+    ),
     (
         "server/tests/wifi.py",
         "        elif busy is not False and not force:",

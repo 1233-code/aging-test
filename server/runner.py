@@ -147,6 +147,12 @@ class TestRunner:
         self.started_at: float = 0
         self.finished_at: float = 0
         self.status: str = "idle"   # idle / running / passed / failed / stopped / error
+        # 「**正在开跑**(还没进 running)」的同步占位 ——
+        # 闸门(`status == "running"`)和真正把 status 设成 "running" 之间
+        # **隔着 await**(建库记录、取父轮配置…)⇒ 那段时间里 status 还是旧的
+        # ⇒ 第二个 start()/start_mini() 会**同时**挤进来。
+        # ⇒ 用这个**同步**占位把那段窗口关上(见 start()/start_mini())。
+        self._starting: bool = False
         self._task: Optional[asyncio.Task] = None
         # 正在跑的那一项的**真实实例** —— stop() 要靠它 kill 子进程。
         # 不能用 `cls().cancel()`: 那是新建一个空实例, self.proc 是 None,
@@ -269,18 +275,34 @@ class TestRunner:
         return snap
 
     async def start(self, config: dict):
-        """启动一次完整测试运行.
+        """启动一次完整测试运行 —— 真正的活儿在 `_start_body()` 里。
+
+        这里只干两件事:
+          ① **同步占位**(`self._starting = True`)—— 见 `start_mini()` 里的
+             说明: 「闸门过了」和「真的开跑了」之间隔着 await ⇒ 那段时间里
+             第二个 start()/start_mini() 会**同时**挤进来 ⇒ 两轮一起跑
+             (后一个把前一个的 `self._task` 顶掉 ⇒ 前一轮的结果写不回去)。
+          ② 把活儿交给 `_start_body()`; 它抛异常 ⇒ 占位自动放掉(不会把
+             runner 永久卡成「开不了跑」)。
+        """
+        if self.status == "running" or self._starting:
+            return {"ok": False, "error": "已有测试在运行"}
+        self._starting = True
+        try:
+            return await self._start_body(config)
+        finally:
+            self._starting = False
+
+    async def _start_body(self, config: dict) -> dict:
+        """开跑前的准备(原来 start() 的正文)。
 
         config 格式:
         {
-          "tests": { "cpu": {"enabled": true, "duration_sec": 60}, ... },
+          "tests": {"cpu": {"enabled": true, "duration_sec": 60}, ... },
           "project_root": "...",
           ...
         }
         """
-        if self.status == "running":
-            return {"ok": False, "error": "已有测试在运行"}
-
         self.cancelled = False
         self.results = {}
         self._logs = {}          # 新的一轮, 日志留档从头开始
@@ -331,8 +353,18 @@ class TestRunner:
         - 按父 run 的配置跑指定测试
         - 每个测试完成后, 结果**就地更新**回 parent run 的对应行
         - mini-run 自己也有独立 summary
+
+        ⚠️ **闸门要「同步占位」**(2026-11-11 查出来的竞态):
+           下面 `_start_mini_body()` 里, 从「取父轮配置」到「把 status 设成
+           running」中间**隔着好几个 await**(取父轮、取父轮已试次数、
+           建 mini 轮记录)⇒ 这段时间里 status 还是旧的 ⇒
+           工人**连点两下「重测」**(或前端重复发请求)⇒ 两个 mini **都过了
+           闸门** ⇒ 两轮重测一起跑, 第二个把第一个的 `self._task` 顶掉 ⇒
+           第一轮的结果写不回父轮、轮次记录也乱了。
+           ⇒ 占位必须**同步**做: 占位和放位之间一行 await 都没有 ⇒
+           不可能有第二个 start_mini 插进来。
         """
-        if self.status == "running":
+        if self.status == "running" or self._starting:
             return {"ok": False, "error": "已有测试在运行"}
 
         if not test_names:
@@ -346,6 +378,16 @@ class TestRunner:
         # 把整次重测打回: 其余项照测, 把丢掉的项告诉前端, 由它显示出来。
         dropped_names = [n for n in test_names if n not in TEST_REGISTRY]
 
+        self._starting = True
+        try:
+            return await self._start_mini_body(parent_run_id, valid_names,
+                                                dropped_names)
+        finally:
+            self._starting = False
+
+    async def _start_mini_body(self, parent_run_id: int,
+                               valid_names: List[str],
+                               dropped_names: List[str]) -> dict:
         # 拿父 run 配置 (用于复用 defaults 等)
         parent = await Database.get_run(parent_run_id)
         if not parent:

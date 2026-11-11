@@ -478,6 +478,10 @@ class TFCardTest(TestCase):
         round_sec = duration * 2
         test_file = os.path.join(mount, ".aging_test_tf.bin")
         all_passed = True
+        # ⚠️ **失败原因要攒起来** —— 只判「不通过」不写原因, 报告里这一项
+        #    就是一句「failed」+ 空的错误栏 ⇒ 工人看到「不合格」却不知道
+        #    差在哪儿(读速度不够? 卡坏了?)⇒ 只能重测一遍碰运气。
+        fail_reasons: list = []
         await ctx.on_log(
             f"[TF] {times} 轮 × (写 {duration}s + 读 {duration}s)"
             f" = 约 {round_sec * times}s, 工作集 {size_mb}MB"
@@ -488,6 +492,7 @@ class TFCardTest(TestCase):
             for i in range(times):
                 if await ctx.is_cancelled():
                     result.status = "stopped"
+                    result.error = "用户中途停止 (本项未跑完)"
                     all_passed = False
                     break
 
@@ -520,6 +525,10 @@ class TFCardTest(TestCase):
 
                 if read_mbps < min_read:
                     await ctx.on_log(f"[TF] ❌ 读速度 {read_mbps:.1f} < {min_read} MB/s")
+                    fail_reasons.append(
+                        f"第 {round_idx} 轮读速度 {read_mbps:.1f} MB/s "
+                        f"< 门槛 {min_read:.1f} MB/s"
+                    )
                     all_passed = False
 
                 result.metrics[f"round_{round_idx}_read_mbps"] = read_mbps
@@ -561,6 +570,10 @@ class TFCardTest(TestCase):
             result.status = "passed"
         elif result.status == "pending":
             result.status = "failed"
+            # ⚠️ **判不合格必须带上原因** —— 否则报告里这一项只有「failed」
+            #    两个字, 错误栏是空的 ⇒ 工人无从判断是卡慢还是卡坏。
+            result.error = ("；".join(fail_reasons)
+                            or "TF 卡测试没通过(详见本项日志)")
 
         await ctx.on_progress(100, "完成")
         return result

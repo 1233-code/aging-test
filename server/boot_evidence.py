@@ -323,6 +323,37 @@ def _line_ts(line: str) -> str:
     return m.group(1) if m else ""
 
 
+#: 跨重启累积的日志里, **一次开机**的开头长什么样 ——
+#: 内核每次开机第一件事就是打印自己的版本:
+#:     "[    0.000000] Linux version 5.10.160 (…)"      (kern.log)
+#:     "Oct 30 09:45:00 host kernel: [    0.000000] Linux version …" (syslog)
+#: ⇒ 拿它当「切段的刀」, 把累积日志切成**一次一次的开机**。
+_BOOT_MARK_RE = re.compile(r"Linux version |Booting Linux|Kernel command line:")
+
+
+def _previous_boot_segment(text: str) -> Optional[str]:
+    """从**跨重启累积**的日志里切出「上一次开机」那一段(切不出来就 None)。
+
+    ⚠️ **为什么必须切** (2026-11-11 查出来的):
+        累积文件里留着**很多次**开机的内容。前面某次开机留下的
+        「有序关机序列」(Reached target Shutdown. / Rebooting.)会被
+        `_SUSPECT_RE` 一起挑成可疑行 ⇒ `classify_reboot` 一看见它就判
+        「**软重启**」⇒ **把这一次的硬复位整个翻掉** ⇒ 死在加压途中的板子
+        判成「不赖板子」⇒ **放行坏板子**。
+
+        ⇒ 用开机标记把文件切成一段一段的「一次开机」, 只拿**倒数第二段**
+        (上一次开机)去判软/硬 —— 最后一段是**本次开机**(尾巴本来就是它)。
+
+    切不出来(文件里一次开机标记都没有 / 只有一次)⇒ 返回 None ⇒
+    **判不出来**, 不乱猜(宁可少判, 不冤枉板子)。
+    """
+    lines = (text or "").splitlines()
+    idxs = [i for i, ln in enumerate(lines) if _BOOT_MARK_RE.search(ln)]
+    if len(idxs) < 2:
+        return None
+    return "\n".join(lines[idxs[-2]:idxs[-1]])
+
+
 # ── 「板子死在第几级加压」: 从**上一次启动的日志**里读出来 ──────────────
 #
 # 为什么要有**第二份来源**: 「加压现场记录」(温度/负载/频率)是**边跑边落
@@ -464,6 +495,48 @@ def read_cpu_evidence(run_id: int) -> str:
     return _read_text_lenient(cpu_evidence_path(run_id))
 
 
+# ── 「板子重启过没有」: 开机 ID ───────────────────────────────────────
+#
+# ⚠️ **为什么需要它**: 「加压起手了、没跑完」有两种**完全不同的**成因 ——
+#   · **板子死了**(掉电 / PMIC 复位 / 看门狗)⇒ 被测设备不合格;
+#   · **服务被杀/被重启了**(工人重启服务 / 事件循环冻死 / 窗口被关) ——
+#     板子好好的, 是**我们**的进程没了。
+# ⇒ 光看现场记录分不出来 —— 两种情况下它都是「起跑没结束」。
+# ⇒ 用**开机 ID**分: `/proc/sys/kernel/random/boot_id` **每次开机换一次**
+#   (板子重启过 ⇒ 现在这个 ID 跟当时记下的**不是**一个)⇒ **跟时钟无关**
+#   (这台板子的墙钟会倒退几十天, 拿时间戳比是比不出来的)。
+#
+# ⇒ 现场记录的文件头里记下当时的开机 ID; 收尾时对一下:
+#   **ID 变了 ⇒ 板子真的重启过** ⇒ 死在加压途中 ⇒ 赖到板子头上;
+#   **ID 没变 ⇒ 板子没重启过** ⇒ 是服务自己没了 ⇒ **不赖板子**(冤枉好板)。
+#
+#: 开机 ID 那个文件 —— 内核给的, 每次开机换一个随机值
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+
+def current_boot_id() -> str:
+    """**这一次**开机的 ID(读不到就空串 —— 空串 = 「不知道」, 别瞎猜)。
+
+    ⚠️ 这个值**跟墙钟无关** —— 板子的时钟会倒退, 但开机 ID 不会。
+    """
+    try:
+        return Path(BOOT_ID_PATH).read_text().strip()
+    except OSError:
+        return ""
+
+
+#: 现场记录文件头里记开机 ID 的那一行
+_EVID_BOOT_ID_MARK = "# 本次开机 ID:"
+
+
+def evidence_boot_id(text: str) -> str:
+    """从现场记录里读出「写这份记录时板子的开机 ID」(没有就空串)。"""
+    for line in (text or "").splitlines()[:20]:
+        if line.startswith(_EVID_BOOT_ID_MARK):
+            return line[len(_EVID_BOOT_ID_MARK):].strip()
+    return ""
+
+
 #: 「加压现场记录」的三种状态 —— **「没有」和「有但是空的」是两回事**。
 #:
 #: ⚠️ 2026-11-02 13:50 实测踩过的坑: 新板死在 2 线程那片, 板子上的
@@ -528,7 +601,16 @@ def cpu_evidence_cut_short(run_id: int) -> bool:
     文件里会同时有「加压结束」(上一轮)和「起跑」(这一轮) ⇒ 最后一个标记
     是「起跑」才算是死在加压途中。
 
-    返回 False = 没有这份记录 / 没起跑 / 跑完了 / 读不出来 —— **绝不编**。
+    返回 False = 没有这份记录 / 没起跑 / 跑完了 / **板子没重启过** /
+    读不出来 —— **绝不编**。
+
+    ⚠️ **还要过「板子真的重启过没有」这一关** (2026-11-11 加):
+        「起跑没结束」有两种成因 —— **板子死了**(不合格), 或者**服务自己
+        没了**(工人重启服务 / 事件循环冻死 ⇒ 板子好好的, **冤枉好板**)。
+        ⇒ 现场记录的文件头里记着**当时的开机 ID**; 现在这一次的 ID 跟它
+        **一样** ⇒ 板子压根没重启过 ⇒ 是**我们**的进程没了 ⇒ 判 False。
+        (开机 ID **跟时钟无关** —— 这台板子的墙钟会倒退几十天, 拿时间戳
+        比是比不出来的。)
     """
     text = read_cpu_evidence(run_id)
     if not text:
@@ -539,7 +621,39 @@ def cpu_evidence_cut_short(run_id: int) -> bool:
             last = "done"
         elif _EVID_LOAD_START in line:
             last = "start"
-    return last == "start"
+    if last != "start":
+        return False
+    # ⚠️ 板子**真的重启过**吗? (服务被杀 ≠ 板子死了)
+    if board_rebooted_since_evidence(run_id, text=text) is False:
+        return False     # 开机 ID 没变 ⇒ 板子没重启过 ⇒ 是服务自己没了
+    return True
+
+
+def board_rebooted_since_evidence(run_id: int,
+                                  text: Optional[str] = None) -> Optional[bool]:
+    """「写这份现场记录之后, 板子**真的重启过**没有?」
+
+    返回:
+        True  = 板子确实重启过(开机 ID 变了)⇒ 死在加压途中, 赖板子;
+        False = 板子**没**重启过(开机 ID 没变)⇒ 是**我们**的进程没了
+                ⇒ **不许**赖到板子头上(冤枉好板);
+        None  = **不知道**(现场记录里没记开机 ID —— 老版本写的记录 /
+                读不到开机 ID)⇒ 调用方自己拿主意(别乱猜)。
+
+    ⚠️ 为什么返回「不知道」而不是当成「没重启」:
+        老版本写的现场记录里**没有**开机 ID ⇒ 只能靠调用方那条**别的**
+        证据(比如 journal 明明白白写着「上一次是硬复位」)来定 ⇒
+        这里**不替它猜**(宁可少判, 不冤枉板子)。
+    """
+    if text is None:
+        text = read_cpu_evidence(run_id)
+    if not text:
+        return None
+    rec_boot = evidence_boot_id(text)
+    cur_boot = current_boot_id()
+    if not rec_boot or not cur_boot:
+        return None
+    return rec_boot != cur_boot
 
 
 # ── pstore: 硬复位后可能还留着的内核崩溃记录 ──────────────────────────
@@ -1032,13 +1146,30 @@ async def previous_boot_evidence(max_lines: int = 3000,
                 continue
             if cumulative:
                 # 跨重启累积的文件: 尾巴是**本次开机**的内容, 得挑可疑行
-                text = _pick_suspect_lines(text, label)
+                raw = text
+                text = _pick_suspect_lines(raw, label)
                 if not text:
                     continue
             else:
                 # BT 噪音收成一行 —— 别让重复的失败/电源轨切换淹掉真死因
                 text = _collapse_bt_noise(text)
-            kind, why = classify_reboot(text)
+            if cumulative:
+                # ⚠️ **软/硬只能拿「上一次开机」那一段来判** (2026-11-11):
+                #   累积文件里前面某次开机留下的「有序关机序列」会被一起
+                #   挑成可疑行 ⇒ 直接判就变成「**软重启**」⇒ 把这一次的
+                #   **硬复位整个翻掉** ⇒ 死在加压途中的板子判成「不赖板子」
+                #   ⇒ **放行坏板子**。
+                # ⇒ 切出上一次开机那一段再判; 切不出来就**判不出来**
+                #   (不乱猜 —— 宁可少判, 不冤枉板子)。
+                seg = _previous_boot_segment(raw)
+                if seg is None:
+                    kind = "看不出来"
+                    why = ("跨重启累积的日志里切不出「上一次开机」是哪一段"
+                           " ⇒ 不乱判软/硬")
+                else:
+                    kind, why = classify_reboot(seg)
+            else:
+                kind, why = classify_reboot(text)
             head = f"[{label}]\n【上一次是{kind}】{why}\n"
             if cumulative:
                 return head + text + _pstore_block(pstore)

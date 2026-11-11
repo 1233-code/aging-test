@@ -272,6 +272,30 @@ MUTATIONS = [
         "    fs = 0.0",
         "EVID: fsync 间隔读成 0 ⇒ 框的上界等于下界 ⇒ 死亡时刻又被钉死了",
     ),
+    # ── 2026-11-11: 累积日志切段 + 开机 ID 护栏 ──
+    (
+        "server/boot_evidence.py",
+        "                seg = _previous_boot_segment(raw)\n"
+        "                if seg is None:",
+        "                seg = raw\n"
+        "                if seg is None:",
+        "EVID: 累积日志**不切段**了(老账里那次「有序关机」把这一次的硬复位"
+        "翻成「软重启」⇒ 死在加压途中的板子判成不赖板子 ⇒ **放行坏板子**)",
+    ),
+    (
+        "server/boot_evidence.py",
+        "    if board_rebooted_since_evidence(run_id, text=text) is False:",
+        "    if False:",
+        "EVID: 开机 ID 那道护栏被删了(板子没重启过、只是服务自己没了 ⇒ "
+        "也判板子不合格 ⇒ **冤枉好板**)",
+    ),
+    (
+        "server/boot_evidence.py",
+        "    return rec_boot != cur_boot",
+        "    return None",
+        "EVID: 「板子重启过没有」**永远说不知道**(判不出软硬那档永远不敢"
+        "判失败 ⇒ 死在加压途中的板子又被放行)",
+    ),
 ]
 
 

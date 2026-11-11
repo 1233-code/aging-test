@@ -236,6 +236,11 @@ def main():
     os.makedirs(os.path.join(tmp, "tests"), exist_ok=True)
     shutil.copy2(os.path.join(REPO, "tests", "test_history_retest_merge.py"),
                  os.path.join(tmp, "tests", "test_history_retest_merge.py"))
+    # ⚠️ 测试文件第 51 行 `from tests._tmp import mkdtemp` ⇒ 副本里**必须**有
+    #    tests/_tmp.py, 否则副本**一启动就 ModuleNotFoundError** ⇒ 基线本来就红
+    #    ⇒ 26 条变异不管改对改错都报「咬得动」⇒ **证据链整条是空的**。
+    shutil.copy2(os.path.join(REPO, "tests", "_tmp.py"),
+                 os.path.join(tmp, "tests", "_tmp.py"))
     print(f"副本在 {tmp}\n")
 
     bad = 0
@@ -253,7 +258,13 @@ def main():
             f.write(orig.replace(frm, to))
         code, out = run_one(tmp)
         fails = out.count("✗")
-        if code != 0:
+        if code != 0 and fails == 0:
+            # 红了, 但**一个 ✗ 都没有** ⇒ 这是**崩了**(导入错/文件缺/语法错),
+            # 不是被断言咬住的 ⇒ **不算数**。
+            print(f"\n✗ {desc}\n   → 红了, 但一个 ✗ 都没有 (exit={code}) —— "
+                  f"这是**崩了**, 不是被断言咬住的, 不算数:\n{out[-600:]}")
+            bad += 1
+        elif code != 0:
             print(f"\n✓ {desc}\n   → 测试变红 (exit={code}, {fails} 项失败) —— 咬得动")
         else:
             print(f"\n✗ {desc}\n   → 测试还是绿的! 这个变异没被守住")

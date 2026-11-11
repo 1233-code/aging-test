@@ -36,6 +36,20 @@ def run(cmd, env=None):
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+# ⚠️ **产线端口** —— 本机就是产线板, 服务跑在 8000 上。
+PROD_PORT = 8000
+
+
+def port_holder(port=PROD_PORT):
+    """谁占着这个端口(空 = 没人占)。"""
+    try:
+        p = subprocess.run(["lsof", "-t", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+                           capture_output=True, text=True, timeout=20)
+        return (p.stdout or "").strip()
+    except Exception:
+        return ""
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else ""
     failed = []
@@ -45,6 +59,7 @@ def main():
         return not only or only in f
 
     print(f"{DIM}== Python 测试 =={OFF}")
+    holder_before = port_holder()
     for f in collect(".py"):
         if not wanted(f):
             continue
@@ -70,6 +85,19 @@ def main():
             failed.append(f)
             print(f"  {RED}✗{OFF} {f}")
             print("    " + out.strip().replace("\n", "\n    ")[-1500:])
+
+    # ⚠️ **绊线**: 产线服务不该被回归套件动过。
+    #   2026-11-11 真的出过这事: 套件里有个测试拿临时目录里的 start.sh
+    #   跑 `stop`, 没改 PORT ⇒ 默认 8000 ⇒ `kill_port_holder 8000`
+    #   ⇒ **产线服务被 SIGTERM 掉了** ⇒ 产线当场断服务, 而日志里查不到
+    #   凶手(凶手就是套件自己)。⇒ 跑之前/跑之后对一次账, 不一样就**报出来**。
+    holder_after = port_holder()
+    if holder_before != holder_after:
+        print(f"\n{RED}✗ 绊线: 产线端口 {PROD_PORT} 上的服务被回归套件动过了!{OFF}")
+        print(f"    跑之前: {holder_before or '(空)'}")
+        print(f"    跑之后: {holder_after or '(空)'}")
+        print("    ⇒ 产线服务可能被回归**杀掉了**。查: 哪个测试碰了 %d?" % PROD_PORT)
+        failed.append("⚠️ 绊线: 产线端口 %d 的占用者变了" % PROD_PORT)
 
     print()
     if failed:

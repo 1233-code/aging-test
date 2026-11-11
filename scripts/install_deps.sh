@@ -80,11 +80,18 @@ CRITICAL_PKGS=(
     "x11-xserver-utils"
     "libgpiod-tools"
     "libgpiod2-tools"
-    # §8.2 PDF 报告导出。**两个都是硬依赖**: chromium 走 --headless
-    # --print-to-pdf 出报告(§11.7 已从"任一浏览器"收紧为 chromium 必装);
-    # 字体是 PDF 里中文能不能显示出来的前提 —— 缺了不会报错, 只会静默导出一份
-    # 全空白的中文报告(详见 docs §8.2.1)。
-    "chromium-browser"
+    # §8.2 PDF 报告导出。**字体是硬依赖**: 它是 PDF 里中文能不能显示出来的
+    # 前提 —— 缺了不会报错, 只会静默导出一份全空白的中文报告(详见 docs §8.2.1)。
+    #
+    # ⚠️ **这里原来还有 "chromium-browser", 现在去掉了** —— 2026-11-11 查出来:
+    #   出厂镜像**自带** chromium 112(focal 的 `chromium-browser` 只是
+    #   **snap 过渡空壳**, 48KB 的壳 ⇒ 真浏览器得靠 snap 自己拉);
+    #   `apt-get install -y chromium-browser` 在 focal 上会把镜像里那份
+    #   **能用的 chromium 112 换成 snap 过渡包**(1:85 那版)⇒ **PDF 报告
+    #   静默变成空白** —— 不报错, 只是没内容。
+    #   ⇒ `scripts/build_deb.sh` 早就把 chromium 列进**禁止清单**了(die),
+    #      这边是**同一类坑的另一扇门** ⇒ 同样不许装。
+    #   ⇒ 改用下面那段「只查不装」的自检来把这件事说清楚。
     "fonts-wqy-zenhei"
 )
 
@@ -119,7 +126,6 @@ declare -A CATEGORY=(
     [x11-xserver-utils]="HDMI 读当前实际输出 (xrandr)"
     [libgpiod-tools]="GPIO 工具 v1 (gpioget, gpioinfo)"
     [libgpiod2-tools]="GPIO 工具 v2 (Ubuntu 20.04 universe)"
-    [chromium-browser]="PDF 报告导出 + UI 打开 (§4.4 / §8.2)"
     [fonts-wqy-zenhei]="中文报告字体 (PDF 用; 缺了报告全是空白)"
 )
 
@@ -151,6 +157,33 @@ for pkg in "${CRITICAL_PKGS[@]}"; do
         FAIL_CRIT+=("$pkg")
     fi
 done
+
+# ── PDF 导出用的 chromium: **只查, 不装** ────────────────────────────
+# ⚠️ 为什么单独拎出来说(2026-11-11 查出来的):
+#   出厂镜像**自带** chromium 112 ⇒ 正常情况下什么都不用做。
+#   但 focal 的 `chromium-browser` 只是个 **snap 过渡空壳**(48KB)⇒
+#   `apt-get install chromium-browser` 会把镜像里那份**能用的** chromium
+#   112 换掉 ⇒ **PDF 报告静默变成空白**(不报错, 只是没内容)。
+#   ⇒ 所以这里**只报告状态**, **绝不 apt 装 chromium**。
+echo ""
+echo "── PDF 导出用的 chromium (只查, 不装) ──"
+CHROME_BIN=""
+for c in chromium chromium-browser google-chrome; do
+    if command -v "$c" > /dev/null 2>&1; then
+        CHROME_BIN="$c"
+        break
+    fi
+done
+if [ -n "$CHROME_BIN" ]; then
+    echo "  ✓ 找到 chromium: $CHROME_BIN (PDF 报告能导)"
+    echo "    ⚠ **别再 apt 装 chromium-browser** —— focal 上那是 snap 过渡空壳,"
+    echo "      装它会把这份能用的 chromium 换掉 ⇒ PDF 报告静默变空白"
+else
+    echo "  ⚠ 没找到 chromium ⇒ PDF 报告会静默失败(不报错, 只是导不出/空白)"
+    echo "    出厂镜像**自带** chromium 112 ⇒ 找不到 = 这块板子的镜像不对"
+    echo "    ⇒ **不要**用 apt 的 chromium-browser 顶(snap 空壳, 换了更糟)"
+    echo "    ⇒ 换一块出厂镜像正常的板子, 或单独装一个真 chromium"
+fi
 
 # 基础包
 echo ""

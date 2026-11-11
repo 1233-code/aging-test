@@ -541,13 +541,119 @@ async def case13():
           "只有文件头那行「起跑时板子背景负载」⇒ 不算起手 ⇒ stopped", st5)
 
 
+section("【14】第二通道只在**板子真的重启过**时才敢用(不许冤枉好板)")
+
+
+# ── 「加压现场记录」的开机 ID 那行 (2026-11-11 加) ──
+_BOOT_ID_LINE = "# 本次开机 ID: "
+
+
+def _ev_with_boot_id(boot_id):
+    """一份**格式对**的现场记录, 带一个指定的开机 ID。"""
+    return (_EV_HEAD + _BOOT_ID_LINE + boot_id + "\n"
+            + _EV_LINE_START + _EV_LINE_SAMPLE)
+
+
+#: 「**判不出软硬**」—— 日志读到了, 但里面**认不出**软/硬
+#: (journald 没持久化 / 权限不够 ⇒ 拿不到上一次开机的尾巴)
+_EV_UNKNOWN_KIND = (
+    "[上一次启动的 journal]\n"
+    "Nov 02 11:47:55 ubuntu2004 kernel: [drm] hdmi probe ok\n"
+    "Nov 02 11:47:56 ubuntu2004 kernel: [drm] fb0: DRM driver\n")
+
+
+async def case14():
+    """「加压起手了、没跑完」⇒ **板子死了**还是**服务自己没了**?
+
+    ⚠️ 这两种成因在现场**长得一模一样**(现场记录都是「起跑没结束」):
+      · **板子死了**(掉电 / PMIC / 看门狗)⇒ 被测设备不合格;
+      · **服务自己没了**(工人重启服务 / 事件循环冻死)⇒ 板子好好的,
+        是**我们**的进程没了 ⇒ 拿它判板子不合格 = **冤枉好板**。
+    ⇒ 加一条**跟时钟无关**的判据: **开机 ID**
+      (`/proc/sys/kernel/random/boot_id`, 每次开机换一个随机值 ——
+       这台板子的**墙钟会倒退几十天**, 拿时间戳比是比不出来的)。
+    """
+    from server import boot_evidence as BE
+
+    cur = BE.current_boot_id()
+    check(bool(cur), "读得到开机 ID(跟时钟无关, 板子重启就换)", cur)
+
+    other = "00000000-0000-0000-0000-000000000000"
+    if other == cur:
+        other = "11111111-1111-1111-1111-111111111111"
+
+    # ① 判不出软硬 + 现场记录「起跑没结束」+ **板子真的重启过**(ID 变了)
+    #    ⇒ 赖到板子头上 ⇒ failed
+    rid = await _startup_with_evidence(_EV_UNKNOWN_KIND,
+                                       _ev_with_boot_id(other))
+    st, _, err = await get_row(rid)
+    check(st == "failed",
+          "板子真的重启过(开机 ID 变了)+ 死在加压途中 ⇒ 判 failed", st)
+    check("被测设备不合格" in (err or ""),
+          "轮级写明「被测设备不合格」", err)
+
+    # ② 同样场景, 但开机 ID **没变** ⇒ 板子压根没重启过 ⇒ 是服务自己没了
+    #    ⇒ stopped(**不冤枉好板**)
+    rid2 = await _startup_with_evidence(_EV_UNKNOWN_KIND,
+                                        _ev_with_boot_id(cur))
+    st2, _, err2 = await get_row(rid2)
+    check(st2 == "stopped",
+          "开机 ID 没变(板子没重启过)⇒ 照旧 stopped(不冤枉好板)", st2)
+    check("不代表被测设备不合格" in (err2 or ""),
+          "说的是「不代表被测设备不合格」(没赖到板子头上)", err2)
+
+    # ③ 记录里**没有**开机 ID(老版本写的记录)⇒ **不知道** ⇒ 不乱判
+    rid3 = await _startup_with_evidence(_EV_UNKNOWN_KIND, _EV_CUT_SHORT)
+    st3, _, _ = await get_row(rid3)
+    check(st3 == "stopped",
+          "记录里没有开机 ID ⇒ 判不出「板子重启过没有」⇒ 不乱判(stopped)",
+          st3)
+
+
+section("【15】**软重启**不赖到板子头上 —— 哪怕现场记录看起来像死在加压里")
+
+
+#: 「上一次是**软重启**」—— 有人/有服务执行了 reboot, 板子自己没崩
+_EV_SOFT_REBOOT = (
+    "[上一次启动的 journal]\n"
+    "【上一次是软重启】上一次启动的日志里有**完整的关机序列** ⇒ 板子是"
+    "**被软件重启**的(有人/有服务执行了 reboot), 板子本身没崩:\n"
+    "    Oct 30 09:46:30.012588 ubuntu2004 systemd[1]: "
+    "Reached target Shutdown.\n"
+    "Nov 02 11:47:55 ubuntu2004 stress-ng[23114]: memory (MB): "
+    "total 3902.11\n")
+
+
+async def case15():
+    """人为 reboot ≠ 板子不合格 —— 软重启那一档**刻意不查**第二条通道。
+
+    ⚠️ 为什么刻意: 工人/服务在加压途中执行了 reboot ⇒ 现场记录同样是
+    「起跑没结束」⇒ 拿它当证据 = 把一次**人为重启**说成板子不合格。
+    ⇒ 「软重启」这一档**不查**现场记录, 照旧 stopped。
+    """
+    from server import boot_evidence as BE
+
+    cur = BE.current_boot_id()
+    other = "22222222-2222-2222-2222-222222222222"
+    if other == cur:
+        other = "33333333-3333-3333-3333-333333333333"
+
+    rid = await _startup_with_evidence(_EV_SOFT_REBOOT,
+                                       _ev_with_boot_id(other))
+    st, _, err = await get_row(rid)
+    check(st == "stopped",
+          "上一次是软重启(板子自己没崩)⇒ 照旧 stopped(不赖板子)", st)
+    check("不代表被测设备不合格" in (err or ""),
+          "说的是「不代表被测设备不合格」", err)
+
+
 async def main():
     tmp = mkdtemp(prefix="aging_reconcile_")
     DB.DB_PATH = Path(tmp) / "history.db"
     await Database.init()
 
     for c in (case1, case2, case3, case4, case5, case6, case7, case8, case9,
-              case10, case11, case12, case13):
+              case10, case11, case12, case13, case14, case15):
         await c()
 
     # 启动钩子起了 idle watchdog —— 事件循环关掉前把它取消掉, 免得刷一屏

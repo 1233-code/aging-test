@@ -72,6 +72,8 @@ bash scripts/build_usb_image.sh --out <目录> --no-venv
 | §⑧ 核心库 | `libc` / `libstdc++` / `ld-linux` 混进镜像 | 解包来源不对 —— 盘上那份会盖住系统那份 |
 | §⑩ 自检 | fio 起不来 / glmark2 不认 `--data-path` | sysroot 里的 `.so` 齐不齐；glmark2 版本对不对 |
 | §⑩b 可搬迁 | 某个依赖库**只能靠库里写死的绝对路径**找到 | 换台没那个目录的板子就 rc=127 ⇒ 存储项 error ⇒ 好板子被返修 |
+| §⑩c 基线闭包 | 某个依赖库**这台打包机上有、但出货镜像基线里没有**（开发期 `apt install fio` 拖进来的那一族） | 换台没装那套库的板子就 rc=127（2026-11-06 实测：fio 硬链 `librbd.so.1`）⇒ 存储项 error ⇒ **好板子被返修** ⇒ 把提供这些库的 .deb 也解进 `tools/root` |
+| §⑩c' 基线前提 | **出货镜像基线**（`deb/image-baseline.txt`）不在 / 认不出归属包 ⇒ 这一关**判不了**（退出码 3） | 停手 —— 别出一个**没判过**的镜像（判据缺一半 = 假绿 = 坏镜像出厂）。⚠️ **退出码 3 ≠「板子坏了」**，它只表示「这次判不了」 |
 | 出厂断言 | 出厂默认**超过核数**；出厂默认**读不到** | `config.yaml` 的 `defaults.cpu.threads` 写成一个 1~8 的整数 |
 | 旋钮闸门 | 页面旋钮 `min≠1`；旋钮 `max` 超过代码硬上限；前端夹子的常量跟旋钮对不上；旋钮 title 里的「默认 N 核」跟 `config.yaml` 对不上 | 「范围 1~8」这个事实散在**四处**（`static/index.html` 的 min/max、`static/app.js` 的 `THREADS_MIN/MAX`、`server/tests/cpu.py` 的 `MAX_STRESS_THREADS`、`config.yaml` 的 `defaults.cpu.threads`），四处要一起改 |
 | console script 闸门 | `start.sh` 直接调 venv 里的 console script | 一律 `python3 -m`（shebang 写死构建路径 ⇒ 换设备必坏） |
@@ -183,8 +185,16 @@ sudo umount /mnt/aging
 | 4 | 出厂默认核数 | `grep -m1 "threads:" <盘>/config.yaml` | `threads: 4`（**旧盘是 8** ⇒ 板子会成批硬复位） |
 | 5 | 旋钮下界 | `grep -m1 -oE 'tests\[t\.name\]\.threads[^>]*min="[0-9]+"' <盘>/static/index.html` | `min="1"`（0 = 「0 = 自动 = 满核」那条路还开着） |
 | 6 | 盘的身份（**记这个**） | `lsblk -o UUID,LABEL,FSTYPE` | 该盘的 UUID |
+| 7 | 关键工具没缺位 | `bash <盘>/scripts/check_deps.sh` | 末行 `==> ✓ 全部就位, 可以跑测试`（退出码 0）—— **有阻断项缺失时它退出码 1** 并点名缺什么；缺工具 = **这版出厂镜像没带齐**，**不要在板子上 apt 装**，回头找打包的人重做盘 |
 
 `版本.txt` 里还记着构建时间、代码版本、出厂默认核数、代码硬上限、以及「怎么确认手上这根盘是哪一版」的自查命令。
+
+> **「换台板子还起得起吗」那道闸在**打包时**就过了** —— `build_usb_image.sh` 出镜像时
+> 会跑 `scripts/check_usb_selfcontained.py`（逐个 ELF 读 NEEDED，对照**出货镜像基线**
+> `deb/image-baseline.txt`）⇒ **构建机**上退出码 0 才出得了镜像。
+> ⚠️ **在产线板子上跑盘上那份脚本 ⇒ 退出码 3（= 下不了结论）**，不是 1：
+> 盘上**没带** `deb/image-baseline.txt` ⇒ 判据不全 ⇒ 判不了。
+> **退出码 3 不等于「板子坏了」**，**不要**拿它当验收判据。
 
 ### 4.4 停服务
 
@@ -248,12 +258,13 @@ grep -m1 "threads:" <盘>/config.yaml
 |---|---|---|
 | 双击「启动老化测试」没反应 | 没有那个二进制（构建机没 gcc）或 Nautilus 设置 | 看盘上有没有 `启动老化测试`；没有就用终端 `bash <盘>/start.sh` |
 | 终端里跑起来了但浏览器打不开 | 用了 `localhost`（有的机器先解析成 ::1，而服务只听 IPv4） | 改打 `http://127.0.0.1:8000` |
-| 界面显示「服务已关闭」但服务在跑 | 前端脚本挂了（老版本从公网取 Vue） | 看 `logs/server.log` 里有没有 `/api/config` 和 `WebSocket /ws` |
+| 界面显示「服务已关闭」但服务在跑 | 前端脚本挂了（老版本从公网取 Vue） | 看 `logs/server.log` 里有没有 `/api/config` 和 `WebSocket /ws`<br>⚠️ **grep 要带 `-a`**(`grep -a ...`): 万一日志里有 NUL 字节的空洞, **不带 `-a` 的 GNU grep 只会打一行「Binary file … matches」, 把真正的行全吞掉** —— 看着像「日志里没有」, 其实有 80 多条就在那儿 ⇒ 会去追一个**不存在的故障**(2026-11-11 产线盘上实测; 服务启动时会自动把空洞补上, 但**老日志**仍需 `-a`) |
 | fio / glmark2 那两项显示 **error** | 工具起不来（缺共享库） | 盘上 `tools/bin/fio --version` 试一下；`版本.txt` 旁的自检结果；换一根完整的盘 |
 | 缺工具时给的办法是「sudo bash scripts/install_deps.sh」 | 那是**设备版**的办法，U 盘版不该给（盘上没这个脚本） | 确认 `/api/deps/check` 的 `mode` 是 `usb` 且 `fix_command` 是空 |
 | `/api/history` 500 | 数据根失效（挂载点漂了）或盘被拔了 | `lsblk` 看盘还在不在；应用记设备不记路径 ⇒ 重插即可 |
 | 报告没落到盘上 | 没检测到 U 盘 | 日志里会写「未检测到 U 盘 —— 报告仍在本机 reports/pdf/」 |
 | 板子在加压途中硬复位 | **满核 8 线程**是过应力那一档（2026-11-04 实测，死因还没查清） | 出厂默认 4 核；开跑前在页面上把「线程数」调低；**别填 0**（下限是 1） |
+| 报告上**没有**「⚠ 本报告的时间戳是推算值」那条黄条, 但这一轮明明是硬复位后跑的 | 盘上那轮的**时钟旁挂文件**(`logs/clock_skew_run<轮号>.txt`)**被写坏了** ⇒ 整份读不出来 ⇒ 横幅**静默消失** ⇒ 工人以为时间是准的 ⇒ 拿推算值当准点用 | 查 `ls -l <盘>/logs/clock_skew_run*.txt` —— 文件在、但内容是乱码就对了(2026-11-11 产线盘上实测: 有几份整个是 `ff ff ff ff` 开头的随机二进制)。**别删**(删了更说不清)⇒ 重导一份报告即可(新版读它是容错的, 横幅会回来); ⚠️ **更常见的是盘被写坏的那一段时间里别的日志也坏了** —— `logs/server.log` 里整段是随机二进制(实测有一段 4096 字节, 正好一个 ext4 块)⇒ 这种只能靠 `start.sh` 启动时自动补 NUL, **随机二进制补不了** ⇒ 那一段日志的证据**没有**了 |
 | 收尾残留轮次失败 `database disk image is malformed` | 盘上的历史库坏了 —— 多半是**拔盘时写到一半**，大字段的溢出页断了一截（不是「整个库烂了」：表、索引、甚至写入**都还正常**，只有读某几行旧日志才炸） | 新版**启动时自动体检**：坏库**改名**成 `history.db.corrupt-<时间戳>`（**不删**），另建新库 ⇒ **盘照常能用**，只是**之前那批历史记录**读不出来了。⚠️ **界面上不会提示**（挂出来会被误会成「这根盘坏了不能用」）⇒ 要查就看 `logs/server.log` 里的 `[db]` 那几行，或 `curl 127.0.0.1:8000/api/config` 的 `history_db` 字段。手工体检（只读）：`python3 scripts/check_history_db.py <盘>/reports/history.db` |
 
 ---

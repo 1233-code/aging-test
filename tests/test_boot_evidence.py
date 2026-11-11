@@ -831,6 +831,101 @@ check(be.capture_enabled() is True, "现场写 true ⇒ 开")
 Config._data = _SAVED_CFG
 
 
+section("【11】跨重启累积的日志: 软/硬只认「上一次开机」那一段(老账不算数)")
+
+# ⚠️ 2026-11-11 查出来的缺陷: 累积文件(kern.log / syslog)里留着**很多次**
+#   开机的内容。前面某次开机留下的「**有序关机序列**」会被一起挑成可疑行
+#   ⇒ 直接拿整份文件判就变成「**软重启**」⇒ 把这一次的**硬复位整个翻掉**
+#   ⇒ 死在加压途中的板子判成「不赖板子」⇒ **放行坏板子**。
+_LINUX_VER = "[    0.000000] Linux version 5.15.0-91-generic (buildd@lcy02)\n"
+_ORDERLY_OLD = ("Oct 30 09:46:30.012588 ubuntu2004 systemd[1]: "
+                "Reached target Shutdown.\n"
+                "Oct 30 09:46:30.068521 ubuntu2004 systemd[1]: "
+                "Shutting down.\n")
+_HARD_DEATH = "Oct 30 10:03:58.101112 ubuntu2004 kernel: [drm] hdmi probe ok\n"
+#: 三次开机: 老的一次(有序关机) → 上一次(**硬复位**, 没有关机序列)
+#:          → 本次开机(文件尾巴)
+_CUM = (_LINUX_VER + _ORDERLY_OLD + _LINUX_VER + _HARD_DEATH
+        + _LINUX_VER + "Oct 31 09:00:00 ubuntu2004 systemd[1]: Started.\n")
+
+
+def handler_cum(cmd):
+    if cmd[0] == "journalctl":
+        return (0, "No journal files were found", "")
+    return (0, _CUM, "")
+
+
+patch_cmds(handler_cum)
+got = asyncio.run(be.previous_boot_evidence())
+check("【上一次是硬复位】" in got,
+      "上一次开机是硬复位(老账里那次「有序关机」不算数)", got[:200])
+check("【上一次是软重启】" not in got,
+      "**没有**被老账翻成「软重启」(翻了 = 放行坏板子)", got[:200])
+
+#: 只有**一次**开机标记 ⇒ 切不出「上一次开机」⇒ **判不出来**(不乱猜)
+def handler_cum_one(cmd):
+    if cmd[0] == "journalctl":
+        return (0, "No journal files were found", "")
+    return (0, _LINUX_VER
+            + "Oct 30 10:03:58 ubuntu2004 kernel: Kernel panic - not syncing\n",
+            "")
+
+
+patch_cmds(handler_cum_one)
+got2 = asyncio.run(be.previous_boot_evidence())
+check("【上一次是看不出来】" in got2,
+      "切不出「上一次开机」⇒ 判不出来(不拿老账乱判软/硬)", got2[:200])
+
+# 还原命令桩
+be.find_tool = _orig_find_tool
+be.run_cmd = _orig_run_cmd
+be.with_sudo = _orig_with_sudo
+
+
+section("【12】开机 ID —— 判「板子重启过没有」(跟时钟无关)")
+
+cur = be.current_boot_id()
+check(bool(cur), "读得到开机 ID", cur)
+check(cur == be.current_boot_id(), "同一次开机里 ID 不变", cur)
+
+# 现场记录里**没**写开机 ID(老版本)⇒ **不知道** ⇒ None(不瞎猜)
+check(be.evidence_boot_id("# 加压现场记录 —— 板子 …\nt=+0.2s …\n") == "",
+      "记录里没有那一行 ⇒ 读出来是空串", "")
+check(be.evidence_boot_id("# 本次开机 ID: abc-123\nt=+0.2s …\n") == "abc-123",
+      "读得出记录里那个开机 ID",
+      be.evidence_boot_id("# 本次开机 ID: abc-123\nt=+0.2s …\n"))
+
+check(be.board_rebooted_since_evidence(999999) is None,
+      "压根没有这份记录 ⇒ 不知道(None)", None)
+
+# 真写几份记录, 把三种结果都走一遍
+_p = be.cpu_evidence_path(999001)
+_p.parent.mkdir(parents=True, exist_ok=True)
+_p.write_text("# 本次开机 ID: %s\nt=+0.2s threads=4 hot=50.0 起跑 4 线程\n" % cur,
+               encoding="utf-8")
+check(be.board_rebooted_since_evidence(999001) is False,
+      "记录里的开机 ID == 现在的 ⇒ 板子**没**重启过 ⇒ 是服务自己没了",
+      be.board_rebooted_since_evidence(999001))
+check(be.cpu_evidence_cut_short(999001) is False,
+      "⇒ 第二条通道不生效(不许赖到板子头上)",
+      be.cpu_evidence_cut_short(999001))
+
+_p.write_text("# 本次开机 ID: 别的-ID-0000\n"
+              "t=+0.2s threads=4 hot=50.0 起跑 4 线程\n", encoding="utf-8")
+check(be.board_rebooted_since_evidence(999001) is True,
+      "记录里的开机 ID != 现在的 ⇒ 板子**真的**重启过",
+      be.board_rebooted_since_evidence(999001))
+check(be.cpu_evidence_cut_short(999001) is True,
+      "⇒ 第二条通道生效(死在加压途中 ⇒ 板子不合格)",
+      be.cpu_evidence_cut_short(999001))
+
+_p.write_text("# 加压现场记录 —— 板子 …\n"
+              "t=+0.2s threads=4 hot=50.0 起跑 4 线程\n", encoding="utf-8")
+check(be.board_rebooted_since_evidence(999001) is None,
+      "老版本的记录(没写开机 ID)⇒ 不知道(None), 不瞎猜",
+      be.board_rebooted_since_evidence(999001))
+
+
 print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))
 for f in FAILS:
     print("  ✗ " + f)

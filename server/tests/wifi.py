@@ -267,7 +267,7 @@ class WiFiTest(TestCase):
 
     async def _restore(self, ctx: TestContext, ip_bin: str,
                        nmcli_bin: Optional[str], iface: str,
-                       nm_type: Optional[str]) -> str:
+                       nm_type: Optional[str]) -> Tuple[str, str]:
         """把接口恢复成 UP —— **开关做完必须恢复**。
 
         ⚠️ 2026-11-06 实测: 以前开关失败就直接返回, **接口留在 DOWN**
@@ -277,15 +277,25 @@ class WiFiTest(TestCase):
            **自我强化**: 同一个缺陷会连着几轮一直报, 看着像「板子坏了」。
            ⇒ 不管开关成没成, 收尾都要把接口拉回 UP; 拉不回来就在报告里
            **大声说清楚**(那是操作事故, 不是设备缺陷)。
+
+        返回 **(管理状态, 载波状态)** —— 判「起来没」看**管理状态**
+        (flags 里有没有 UP); 载波(有没有连上 AP)只是**附带**信息,
+        **没网的工位上它恒是 DORMANT** ⇒ 拿它当判据 = 假警报。
         """
         # 先等 NM 自己把它弄起来(它知道该连哪个 AP), 再手工拉一把。
         # ⚠️ 判「起来没」看**管理状态** —— 没网的时候链路状态是 DORMANT,
         #    那也说明接口已经起来了(见 `_wait_state_up` 的说明)。
+        #
+        # ⚠️ **2026-11-11 修**: 以前这里返回的是 **carrier**(链路状态)
+        #    ⇒ 收尾拿它跟 "UP" 比 ⇒ 在**没网的工位**上 carrier 恒是
+        #    DORMANT/UNKNOWN ⇒ 明明接口已经恢复成 UP, 却报
+        #    「⚠ 收尾没能把接口恢复成 UP」⇒ **假警报**(工人以为板子坏了)。
+        #    ⇒ 返回**管理状态**(那才是「接口起来没」的判据), 载波另记一笔。
         admin, carrier, _ms = await self._wait_state_up(ctx, ip_bin, iface, 5.0)
         if admin != "UP":
             await self._run(with_sudo([ip_bin, "link", "set", iface, "up"]), 5)
             admin, carrier, _ms = await self._wait_state_up(ctx, ip_bin, iface, 5.0)
-        return carrier
+        return admin, carrier
 
     async def run(self, ctx: TestContext) -> TestResult:
         """按 `times` 跑多轮, 每轮一整套 §6.4 的 4 步 (开关→状态→射频→扫描)。
@@ -610,13 +620,15 @@ class WiFiTest(TestCase):
             ⇒ 恢复不回来就在指标和日志里写清楚(那是**操作事故**, 不是缺陷)。
             """
             if switched:
-                restored = await self._restore(
+                restored, restored_carrier = await self._restore(
                     ctx, ip_bin, nmcli_bin, iface, nm_type)
                 result.metrics["restored_state"] = restored
+                result.metrics["restored_carrier"] = restored_carrier
                 if restored != "UP":
                     result.metrics["restore_failed"] = True
                     await ctx.on_log(
-                        f"[WiFi] ⚠ 收尾没能把接口恢复成 UP(现在是 {restored})"
+                        f"[WiFi] ⚠ 收尾没能把接口恢复成 UP(管理态 {restored}, "
+                        f"载波 {restored_carrier})"
                         " —— 这块板子的无线现在是断的"
                     )
             return result

@@ -135,10 +135,18 @@ def main():
     v, w = C.classify_needed("libbar.so.1", stick, board, [])
     check(v == "stick", "真实文件名带版本号也能认(soname → 真实文件)",
           f"{v}/{w}")
-    v, w = C.classify_needed("libX11.so.6", stick, board, [])
+    v, w = C.classify_needed("libX11.so.6", stick, board, [],
+                             image_owner={"libX11.so.6": "libx11-6"},
+                             baseline={"libx11-6"})
     check(v == "board", "出厂镜像标准目录里有的 → board", f"{v}/{w}")
     v, w = C.classify_needed("libnope.so.1", stick, board, [])
     check(v == "missing", "哪儿都找不到 → missing", f"{v}/{w}")
+    # ⚠️ 2026-11-11: 「board」这一档现在**要判据**(出货镜像基线 + 归属包)
+    #    —— 判据不全不许说「出厂镜像提供」(那是假绿)⇒ 归到 unknown。
+    v, w = C.classify_needed("libX11.so.6", stick, board, [])
+    check(v == "unknown",
+          "判据不全(没给基线)⇒ 归到「下不了结论」, **不**说「出厂镜像提供」",
+          f"{v}/{w}")
 
     # 「只能靠库里写死的绝对路径找到」—— 2026-11-06 那个坑
     os.makedirs("/tmp", exist_ok=True)
@@ -163,10 +171,15 @@ def main():
     check("libceph-common.so.2" not in C.ALWAYS,
           "libceph-common.so.2 **不在**那个名单里(它不该被当成「到处都有」)")
     # libc 在板子的标准目录里 ⇒ 判成 board(不是 missing)
+    # ⚠️ 2026-11-11: 「board」要**判据**(基线 + 归属包)⇒ 这儿用真的那份
     real_board = C.build_index([d for d in C.STD_DIRS if os.path.isdir(d)])
-    v, _w = C.classify_needed("libc.so.6", {}, real_board, [])
+    owner = C.load_image_owner() or {}
+    baseline = C.load_baseline() or set()
+    v, _w = C.classify_needed("libc.so.6", {}, real_board, [],
+                               image_owner=owner, baseline=baseline)
     check(v == "board", "libc.so.6 在出厂镜像里 ⇒ board(不是 missing)", v)
-    v, _w = C.classify_needed("libX11.so.6", {}, real_board, [])
+    v, _w = C.classify_needed("libX11.so.6", {}, real_board, [],
+                               image_owner=owner, baseline=baseline)
     check(v == "board", "libX11.so.6 在出厂镜像里 ⇒ board", v)
 
     print("\n" + "=" * 60)

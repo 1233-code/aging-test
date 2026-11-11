@@ -623,6 +623,40 @@ def output_dir() -> Path:
     return p / "pdf"
 
 
+def resolve_pdf_path(stored: str) -> Optional[Path]:
+    """把库里存的路径还原成一个**现在真的存在**的报告文件。
+
+    ⚠️ **为什么要有这么个函数**: 库里存过三种路径, 都能碰上 ——
+      · **相对数据根**(`reports/pdf/x.pdf`)—— 现在新写进去的;
+      · **绝对路径**, 还在(挂载点没漂)—— 老记录;
+      · **绝对路径**, **已经失效** —— 盘昨天挂在 `/media/User/AGING`,
+        今天挂在 `/media/User/AGING1` ⇒ 库里那条 `/media/User/AGING/reports/
+        pdf/x.pdf` 指向一个**不存在**的地方 ⇒ 工人点「打开 PDF 报告」打不开
+        (2026-11-11 实况: Nov 10 15:14 那轮就是这样)。
+
+    ⇒ 第三种**按文件名**在当前报告目录里找回同一个文件
+      (文件名 = SN + 收尾时间戳, 盘上唯一) ⇒ **老记录不用改库也能打开**。
+
+    找不到就返回 None —— 由调用方决定报 404 还是别的。
+    """
+    if not stored:
+        return None
+    p = Path(stored)
+    if not p.is_absolute():
+        # 相对路径一律相对**数据根** —— 报告就落在数据根下的 reports/pdf/。
+        p = Config.data_root() / p
+    if p.exists():
+        return p
+    # 绝对路径失效了(挂载点漂了) ⇒ 按文件名在当前报告目录里找同一个
+    try:
+        cand = output_dir() / p.name
+    except Exception:
+        return None
+    if cand.exists():
+        return cand
+    return None
+
+
 def _run_finished_ts(run: dict) -> float:
     """文件名时间戳优先用**结束**时间 —— 名字要对应报告真正成形的那一刻。"""
     try:

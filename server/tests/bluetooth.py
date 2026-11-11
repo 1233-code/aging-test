@@ -171,13 +171,25 @@ def _judge(rfkill_entries: List[dict], hci_sysfs: List[str],
     # 「在工作」= 有活动的控制器 **且** 射频没被屏蔽。
     # ⚠️ rf_state=unknown(屏蔽状态读不出来)不构成 blocked ⇒ 仍然按
     #    「可能在工作」处理 —— 但日志和指标里会明写状态读不出来。
-    working = bool(controllers) and rf_state != "blocked"
+    #
+    # ⚠️⚠️ **「活动的控制器」只看 sysfs** (2026-11-11 改):
+    #   `/dev/hci*` 是 **udev 建的设备节点** —— 控制器被关掉之后**它还留着**
+    #   (这正是 `_read_hci_dev` 注释里那句话)。⇒ 拿它当「有活动的控制器」
+    #   ⇒ 一块**蓝牙本来就该关着**的板子(射频也没屏蔽着, 只是 /dev 里
+    #   留了个旧节点)会被判「蓝牙在工作」⇒ **failed ⇒ 冤枉好板子**
+    #   (本机的规格就是「不需要蓝牙」⇒ 它本来就是合格的)。
+    #   ⇒ 真正说明「控制器是活的」的是 **内核认得的**它:
+    #     `/sys/class/bluetooth/hci*` —— hci 设备一注册, 内核就建这个 class
+    #     条目; 蓝牙**关着**时它没有。
+    active = sorted(set(hci_sysfs))
+    working = bool(active) and rf_state != "blocked"
 
     return {
         "hw_present": hw_present,
         "rf_state": rf_state,
         "rf_names": [e.get("name") or "" for e in rfkill_entries],
         "controllers": controllers,
+        "active_controllers": active,
         "working": working,
     }
 
@@ -209,7 +221,13 @@ def _detail_text(v: dict) -> str:
         return "蓝牙硬件在, 但射频被屏蔽着(soft/hard block)"
     if v["rf_state"] == "unknown":
         return "蓝牙硬件在, 但射频的屏蔽状态读不出来 —— 按「没在工作」处理"
-    return "蓝牙硬件在, 但没有活动的控制器(射频没开 / 蓝牙服务没起来)"
+    # ⚠️ `/dev` 里的残留节点**要说明白** —— 否则工人看到「蓝牙设备: (无)」
+    #    而 `/dev/hci0` 明明在, 会以为工具看错了。
+    leftovers = [c for c in v["controllers"] if c not in v["active_controllers"]]
+    extra = ("(但 `/dev` 里还留着 %s —— 那是 udev 的残留节点, **不算控制器**)"
+             % ", ".join(leftovers)) if leftovers else ""
+    return ("蓝牙硬件在, 但没有活动的控制器(射频没开 / 蓝牙服务没起来)"
+            + extra)
 
 
 @register
@@ -253,7 +271,12 @@ class BluetoothTest(TestCase):
         result.metrics["bt_present"] = v["hw_present"]
         result.metrics["bt_rf_state"] = v["rf_state"]
         result.metrics["bt_working"] = v["working"]
-        result.metrics["bt_hci_devices"] = ", ".join(v["controllers"]) or "(无)"
+        # ⚠️ 这里报的是**活动的控制器**(内核认得的那几个), 不是 `/dev` 里
+        #    的全部节点 —— /dev 里那个残留节点**不是控制器**(见 `_judge`
+        #    的注释)⇒ 报出来会让工人以为「蓝牙设备还在」⇒ 而结论是
+        #    「已关闭」⇒ 两处对不上。/dev 里残留的东西在**详情**里说明。
+        result.metrics["bt_hci_devices"] = (
+            ", ".join(v["active_controllers"]) or "(无)")
         result.metrics["bt_rf_name"] = ", ".join(v["rf_names"]) or "(无)"
         result.metrics["bt_service_masked"] = (
             "unknown" if masked is None else masked

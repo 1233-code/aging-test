@@ -49,6 +49,50 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 USB_MODE=0
 [ -f "$PROJECT_ROOT/AGING_USB_MODE" ] && USB_MODE=1
 [ -n "${AGING_TOOL_DIR:-}" ] && USB_MODE=1
+
+# ───────────────── 找工具: **随包工具目录**(盘上的 tools/bin)也得认 ─────
+#
+# ⚠️ **为什么必须认** (2026-11-11 查出来的):
+#   U 盘版里 **fio / glmark2-es2 / glmark2-es2-wayland 是「盘上」的**
+#   (`<盘>/tools/bin/`, 由 `scripts/build_usb_image.sh` 生成的 wrapper)
+#   ⇒ **系统 PATH 里压根没有它们** ⇒ 这个脚本只 `command -v` ⇒ 一律报
+#   「缺关键工具」⇒ **拒绝出货** —— 而工具**好好地**在盘上, 测试项也真
+#   调得到它(测试项走的是 Python 侧 `find_tool`, 认 AGING_TOOL_DIR)。
+#   ⇒ 同一台机器、同一个工具, 配置页说「有」、这个脚本说「缺」⇒ 互相打脸。
+#
+# ⇒ 口径跟 Python 侧 `server/tests/_tools.py:find_tool()` **一致**:
+#   ① **随包工具目录优先**(盘上那份才是这一版的工具, 板子上碰巧也装了
+#      一份旧的也不该用它) ② PATH ③ /usr/local/sbin /usr/sbin /sbin
+#      /usr/local/bin
+#
+# 随包工具目录从哪来: 环境变量 `AGING_TOOL_DIR`(start.sh 导出的)优先;
+# 没设的话, **盘根下的 tools/bin**(脚本自己就在盘上 ⇒ 找得到)。
+TOOL_DIR="${AGING_TOOL_DIR:-}"
+if [ -z "$TOOL_DIR" ] && [ -d "$PROJECT_ROOT/tools/bin" ]; then
+    TOOL_DIR="$PROJECT_ROOT/tools"
+fi
+
+# find_tool <名字> ⇒ 打得开就打出绝对路径, 打不开返回 1
+find_tool() {
+    local name="$1" p d
+    if [ -n "$TOOL_DIR" ] && [ -x "$TOOL_DIR/bin/$name" ]; then
+        printf "%s" "$TOOL_DIR/bin/$name"
+        return 0
+    fi
+    p="$(command -v "$name" 2>/dev/null)"
+    if [ -n "$p" ]; then
+        printf "%s" "$p"
+        return 0
+    fi
+    for d in /usr/local/sbin /usr/sbin /sbin /usr/local/bin; do
+        if [ -x "$d/$name" ]; then
+            printf "%s" "$d/$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # 配置文件位置: 环境变量 > /etc/aging-test/config.yaml (打包安装后的位置)
 #              > 代码根下的 config.yaml (开发机)
 CONFIG_FILE="${AGING_CONFIG:-}"
@@ -142,8 +186,9 @@ declare -A BACKUP=(
 echo "==> ① 包类·关键工具 (§11.7 打包必装清单)"
 MISSING_CRIT=()
 for cmd in "${!CRITICAL[@]}"; do
-    if command -v "$cmd" > /dev/null 2>&1; then
+    if _p="$(find_tool "$cmd")"; then
         printf "    ✓ %-14s %s\n" "$cmd" "${CRITICAL[$cmd]}"
+        printf "        %s\n" "$_p"
     else
         MISSING_CRIT+=("$cmd")
         printf "    ✗ %-14s %s\n" "$cmd" "${CRITICAL[$cmd]}"
@@ -154,8 +199,9 @@ echo ""
 echo "==> ② 包类·诊断工具 (缺不阻断)"
 MISSING_BAK=()
 for cmd in "${!BACKUP[@]}"; do
-    if command -v "$cmd" > /dev/null 2>&1; then
+    if _p="$(find_tool "$cmd")"; then
         printf "    ✓ %-14s %s\n" "$cmd" "${BACKUP[$cmd]}"
+        printf "        %s\n" "$_p"
     else
         MISSING_BAK+=("$cmd")
         printf "    ⚠ %-14s %s\n" "$cmd" "${BACKUP[$cmd]}"
@@ -270,7 +316,7 @@ else
     for _v in wayland x11; do
         if [ "$_v" = "x11" ]; then _e=DISPLAY; _b=glmark2-es2
         else _e=WAYLAND_DISPLAY; _b=glmark2-es2-wayland; fi
-        if [ -n "$(_gpu_env_val "$_e")" ] && command -v "$_b" >/dev/null 2>&1; then
+        if [ -n "$(_gpu_env_val "$_e")" ] && find_tool "$_b" >/dev/null 2>&1; then
             GPU_PICK="$_v"; GPU_ENV="$_e"; GPU_BIN="$_b"; GPU_WHY="auto 选中 $_v 会话"
             break
         fi
@@ -288,7 +334,7 @@ fi
 
 if [ -z "$GPU_PICK" ]; then
     sc_block "GPU 图形会话前置 (§6.3)" err "$GPU_WHY, GPU 项将判 error"
-elif ! command -v "$GPU_BIN" >/dev/null 2>&1; then
+elif ! find_tool "$GPU_BIN" >/dev/null 2>&1; then
     sc_block "GPU 渲染二进制 $GPU_BIN" err "未安装, GPU 项将判 error (§6.3)"
 elif [ -z "$(_gpu_env_val "$GPU_ENV")" ]; then
     sc_block "GPU 图形会话 ($GPU_ENV)" err "为空, 无 GLES 上下文, GPU 项将判 error (§6.3 前置 2)"
@@ -329,7 +375,7 @@ else
 fi
 
 # chromium headless 真能跑 —— 光看命令在不在不够
-if command -v chromium-browser > /dev/null 2>&1; then
+if find_tool chromium-browser > /dev/null 2>&1; then
     if timeout 30 chromium-browser --headless --disable-gpu --version > /dev/null 2>&1; then
         sc_block "chromium headless 可用" ok
     else

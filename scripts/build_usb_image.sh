@@ -656,14 +656,43 @@ fi
 # ⚠️ 搜索路径**必须**跟 §⑦ wrapper 里那份一致(两边都写着同一串 glob)
 #    ⇒ `tests/test_usb_image_anchors.py` 会静态比对这两份, 不一致就红。
 log "⑩b 检查「换台板子还能用吗」(静态解析 ELF, 不执行盘里的二进制)"
+#
+# ⚠️ **这一关的判据前提**(2026-11-11 补): 「出厂镜像提供」那一档要拿
+#    **出货镜像基线**(`deb/image-baseline.txt`)对账 —— 提供这个库的**包**
+#    在基线里才算「出厂镜像提供」。
+#    ⇒ 拿「这台构建机的 /lib 里有没有」当判据 = **假绿**(开发期
+#      `apt install fio` 拖进来的 ceph/gluster 那一族根本不在出厂镜像里
+#      ⇒ 换台没装 ceph 的板子 fio rc=127 ⇒ **好板子被返修**;
+#      2026-11-06 实测就是这个坑)。
+#    ⇒ **基线读不到 ⇒ 这一关「判不了」⇒ 停手**, 绝不能出一个
+#      「没判过」的镜像(判据缺一半 = 假绿 = 坏镜像出厂)。
+USB_BASELINE="$PROJECT_ROOT/deb/image-baseline.txt"
+if [ ! -f "$USB_BASELINE" ]; then
+    die "找不到出货镜像基线 $USB_BASELINE ⇒ 「这个库在别的板子上还找得到吗」
+     这一关**判不了**⇒ 不能出这个镜像。
+     修法: 生成基线(deb/gen_image_baseline.py)或把它放进仓库。"
+fi
 if [ -f "$PROJECT_ROOT/scripts/check_usb_selfcontained.py" ]; then
-    if ! python3 "$PROJECT_ROOT/scripts/check_usb_selfcontained.py" "$TOOLS"; then
+    _rc=0
+    python3 "$PROJECT_ROOT/scripts/check_usb_selfcontained.py" "$TOOLS" || _rc=$?
+    # ⚠️ 退出码有**三档**(见那个脚本的说明):
+    #   0 = 每个库在别的板子上都找得到
+    #   1 = **真问题**(靠写死的路径 / 镜像里没有 / 缺)
+    #   3 = **下不了结论**(判据不全: 读不到基线 / 认不出归属包)⇒ **不是**「板子坏了」
+    if [ "$_rc" = "3" ]; then
+        die "「换台板子还能用吗」这一关**下不了结论**(判据不全)⇒ 不能出这个镜像。
+     查: ① 上面那行有没有说「读不到基线 / 认不出归属包」
+         ② 这台构建机上有没有 dpkg 的 files-list(/var/lib/dpkg/info/*.list)
+         ③ $USB_BASELINE 在不在(上面已经查过)"
+    elif [ "$_rc" != "0" ]; then
         die "这根盘在**别的板子**上起不来(见上面)⇒ 不能出这个镜像。
    修法: ① wrapper 的搜索路径带上库所在的**子目录**(§⑦)
-        ② 或者把缺的 .deb 也解进 tools/root(§⑥ USB_PKGS)"
+        ② 或者把缺的 .deb 也解进 tools/root(§⑥ USB_PKGS)
+        ③ 「⚠ **镜像里没有**」那一档 ⇒ 提供这些库的 .deb 也解进 tools/root"
     fi
 else
-    warn "   找不到 scripts/check_usb_selfcontained.py —— 跳过「换台板子」检查"
+    die "找不到 scripts/check_usb_selfcontained.py ⇒ 「换台板子」这一关
+     **压根没跑**⇒ 不能出这个镜像(以前是 warn ⇒ 坏镜像照样出厂)。"
 fi
 
 # ⭐⭐⭐ **可搬迁自检** —— 把镜像**整个挪到另一个目录**再跑一遍。

@@ -105,13 +105,92 @@ port_holder_pid() {
     fi
 }
 
+# 日志里长出了「空洞」(一串 NUL 字节)⇒ 把整份日志修好, 免得 grep 对它静默罢工。
+#
+# ⚠️ **为什么要有这道工序**(2026-11-11 产线盘上实测):
+#   `logs/server.log` 里有一段 **956 个 NUL 字节**(21 KB 的空洞)。
+#   ⇒ **grep 把整个文件当成二进制** ⇒ `grep 什么 logs/server.log`
+#      **一个字都不输出**(连「没有匹配」都不说!)
+#   ⇒ 而部署作业手册**教工人去 grep 这个日志** ⇒ 工人得到「静默的空」
+#      ⇒ 合理反应是「日志里没有 ⇒ 这条路不通」⇒ **去追一个不存在的故障**
+#      (84 条 'WebSocket /ws' 就在那儿, 只是 grep 不肯说)
+#   ⇒ 2026-11-11 那次停产事故的排查也被它拖了后腿。
+#
+# 空洞是怎么来的: 现在的写方**全都是追加写**(`>>` / `open(..., "a")`)
+#   ⇒ 追加写不会留空洞 ⇒ 那段空洞是**老账**(早期那轮「盘换了挂载点、
+#   日志被拷来拷去」留下的)。⚠️ **成因没钉死** —— 所以这儿的做法是
+#   **治标也治本**: 每次启动都把洞补上 ⇒ 活着的日志永远是能 grep 的。
+#
+# 做法: **原件留一份**(不删!), 再把 NUL 换成换行 ⇒ 内容一行不少, 只是
+#   空洞那几行变成空行 ⇒ grep 恢复正常。
+repair_log_holes() {
+    [ -f "$LOG_FILE" ] || return 0
+    local raw clean
+    raw=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    # ⚠️ **不能把 NUL 放进 grep 的参数里**(参数里放不下 NUL)⇒
+    #   改用「去掉 NUL 之后还剩多少字节」来判。
+    clean=$(tr -d '\000' < "$LOG_FILE" 2>/dev/null | wc -c)
+    if [ "$raw" = "$clean" ]; then
+        return 0                      # 没有空洞 ⇒ 什么都不用做
+    fi
+    local keep="$LOG_FILE.holes-$(date +%Y%m%d-%H%M%S)"
+    cp "$LOG_FILE" "$keep" 2>/dev/null || keep=""
+    if tr '\000' '\n' < "$LOG_FILE" > "$LOG_FILE.fix" 2>/dev/null; then
+        if mv "$LOG_FILE.fix" "$LOG_FILE" 2>/dev/null; then
+            log "⚠ 日志里有空洞(NUL 字节)⇒ 已修好(grep 能用了)"
+            # ⚠️ **别写 `[ -n "$keep" ] && log ...`** —— 那个链在 keep 为空时
+            #   返回非零 ⇒ `set -e` 会**把整个脚本带走** ⇒ 恰恰在"修日志"的
+            #   时候把服务起不来 ⇒ 一律用 if。
+            if [ -n "$keep" ]; then
+                log "  原件留着: $(basename "$keep")"
+            fi
+        fi
+    else
+        rm -f "$LOG_FILE.fix" 2>/dev/null || true
+        log "⚠ 日志里有空洞, 但没能修好(原文件没动)"
+    fi
+    return 0
+}
+
+# 这个进程**是不是我们自己的服务**(uvicorn 起的那种)?
+#
+# ⚠️ **2026-11-11: 为什么要加这道闸** —— 原来 `kill_port_holder` 是
+#   「端口上是谁就杀谁」⇒ **会杀掉任何一个占着端口的进程**。
+#   ⇒ 一次回归(`tests/test_usb_app_mode.py` 拿临时目录里那份 start.sh
+#      跑 `start`/`stop`, 而没改 PORT ⇒ 默认 8000)在 `stop` 时把
+#      **产线上正在跑的服务** SIGTERM 掉了 —— 产线当场断服务, 而且
+#      **日志里查不到是谁干的**(干活的正是测试自己)。
+#   ⇒ 现在只杀**像我们自己这个服务**的进程; 别的东西占着端口 ⇒
+#      **不杀**, 如实报出来让人看。
+#
+# 认得出来的两种起法:
+#   · `python3 -m uvicorn server.main:app ...`   ← 现在用的
+#   · `venv/bin/uvicorn server.main:app ...`      ← 老写法
+# ⇒ cmdline 里带 "uvicorn" 或 "server.main" 都算。
+is_our_server() {
+    local pid=$1 cl
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    cl="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    case "$cl" in
+        *uvicorn*|*server.main*) return 0 ;;
+    esac
+    return 1
+}
+
 # 杀占端口的进程 (用来清理启动失败后的僵尸)
 kill_port_holder() {
     local port=$1
     local holder
     holder=$(port_holder_pid "$port")
     if [ -n "$holder" ] && [ "$holder" != "$$" ] && [ "$holder" != "$(cat "$PID_FILE" 2>/dev/null)" ]; then
-        log "⚠️ 端口 $port 被 PID $holder 占用, 杀掉"
+        if ! is_our_server "$holder"; then
+            # ⚠️ **不是我们的服务 ⇒ 不杀** —— 宁可启动失败, 也不误杀别人的进程
+            log "✗ 端口 $port 被 PID $holder 占用, 但**不是本服务**, 不动它"
+            log "  (cmdline: $(tr '\0' ' ' < "/proc/$holder/cmdline" 2>/dev/null | cut -c1-120))"
+            log "  ⇒ 请先处理占用者(或者换个 PORT), 再起服务。"
+            return 1
+        fi
+        log "⚠️ 端口 $port 被 PID $holder 占用(是本服务的旧进程), 杀掉"
         # 优先软杀
         kill "$holder" 2>/dev/null || true
         for _ in 1 2 3 4 5; do
@@ -125,6 +204,7 @@ kill_port_holder() {
         fi
         sleep 0.5
     fi
+    return 0
 }
 
 # PID 文件的 PID 是否真的活着
@@ -214,12 +294,17 @@ start_service() {
         rm -f "$PID_FILE"
     fi
 
-    # 清理: 端口 8000 被别的进程占 (但不是我们服务) → 杀
+    # 清理: 端口 8000 被**我们自己的旧服务**占 (PID 文件丢了/盘换了) → 杀。
+    # ⚠️ **不是我们的 ⇒ 不杀**(见 is_our_server) —— 宁可起不来, 也不误杀。
     local port_holder
     port_holder=$(port_holder_pid "$PORT")
     if [ -n "$port_holder" ] && [ "$port_holder" != "$(cat "$PID_FILE" 2>/dev/null)" ]; then
         log "⚠️ 端口 $PORT 被 PID $port_holder 占, 清理..."
-        kill_port_holder "$PORT"
+        if ! kill_port_holder "$PORT"; then
+            fail_visible "端口 $PORT 被别的程序占用 (PID $port_holder), 本服务不乱杀别人的进程。
+请先处理占用者, 或者用 PORT=<别的端口> 起。"
+            return 1
+        fi
     fi
 
     # ── 在线判定: 以 /api/health 为准, **不能只看 pid_alive** ──
@@ -270,6 +355,11 @@ start_service() {
         # setsid: 新会话, 完全脱离调用方
         # nohup: 忽略 SIGHUP
         # < /dev/null: 关闭 stdin
+        #
+        # ⚠️ **先把日志里的「空洞」修好, 再让服务往里写** ——
+        #   见上面 repair_log_holes() 的说明(空洞会让 grep 对整个文件
+        #   静默无输出 ⇒ 工人按手册查日志 ⇒ 「查不到」⇒ 追不存在的故障)。
+        repair_log_holes
         setsid nohup "$VENV_DIR"/bin/python3 -m uvicorn server.main:app \
             --host 0.0.0.0 \
             --port "$PORT" \
@@ -341,9 +431,12 @@ stop_service() {
         log "已停止"
     else
         rm -f "$PID_FILE"
-        # 顺便清端口占的进程
-        kill_port_holder "$PORT"
-        log "服务未运行 (端口已清理)"
+        # 顺便清端口占的进程 —— ⚠️ **只清我们自己的**(见 is_our_server)
+        if kill_port_holder "$PORT"; then
+            log "服务未运行 (端口已清理)"
+        else
+            log "服务未运行 (端口上的东西**不是本服务**, 没动它)"
+        fi
     fi
 }
 

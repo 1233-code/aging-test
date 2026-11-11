@@ -273,13 +273,22 @@ section("【4】两个诊断脚本(check_deps.sh / check_eth.sh)按形态分开�
 #    ① 不会在这台板子上误判「工具齐了」而走不到那条分支;
 #    ② 仓库里那个脚本一个字都不动。
 _SCRIPT_PATCHES = {
+    # ⚠️ 2026-11-11: 这一处**跟着 check_deps.sh 一起改过** ——
+    #   找工具的口径从 `command -v` 换成了 `find_tool`(认盘上的
+    #   tools/bin ⇒ U 盘版的 fio 才不会被说成「缺」)⇒ 补丁锚点跟着换。
     "check_deps.sh": (
         'for cmd in "${!CRITICAL[@]}"; do\n'
-        '    if command -v "$cmd" > /dev/null 2>&1; then',
+        '    if _p="$(find_tool "$cmd")"; then',
         'for cmd in "${!CRITICAL[@]}"; do\n    if false; then',
     ),
+    # ⚠️ 2026-11-11: 这一处**跟着 check_eth.sh 一起改过** ——
+    #   找工具的口径从 `command -v ethtool` 换成了 `find_tool ethtool`
+    #   (跟 Python 侧 `_tools.py:find_tool()` 对齐 ⇒ 不再误报「未装」)
+    #   ⇒ 补丁锚点跟着换。
     "check_eth.sh": (
-        'if ! command -v ethtool > /dev/null 2>&1; then',
+        'ETHTOOL="$(find_tool ethtool || true)"\n'
+        'if [ -z "$ETHTOOL" ]; then',
+        'ETHTOOL="$(find_tool ethtool || true)"\n'
         'if true; then',
     ),
 }

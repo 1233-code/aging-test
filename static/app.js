@@ -141,6 +141,17 @@ createApp({
         // 工人会以为刚刚又测了一遍。
         const runSn = ref('');
         const runFinishedAt = ref(0);
+        // 「工人是从哪一轮**主动走开**的」—— 记下来, 好让**那一轮**后来才到的
+        // 快照别把他拽回去(2026-11-11 查出来的):
+        //   工人跑完一轮 → 点「← 返回配置」回到配置页, 准备测**下一台** ⇒
+        //   这时 WS 抖一下重连, 服务端补推一帧**上一轮**的快照 ⇒
+        //   applySnapshot 看见「整轮已结束 + 有 run_id」⇒ 把界面拽到**上一轮**
+        //   的总结页 ⇒ 工人正填下一台的 SN, 界面却跳到上一轮的「全部通过」
+        //   ⇒ **可能把上一轮的结论当成这一轮的** ⇒ 放过坏板子。
+        // ⇒ 走开的那一轮(id)记在这儿 ⇒ 它的快照**整条丢掉**。
+        //   (工人**没**走开的那一轮 —— 比如他压根没看见结果 —— 快照照常把
+        //    总结页摆出来, §7.6「运行态必须能靠快照恢复」不受影响。)
+        const leftRunId = ref(null);
         // ── §10.5 本轮总耗时 ──
         //
         // 口径跟报告里的「总耗时」**完全一致**: finished_at - started_at,
@@ -631,9 +642,43 @@ createApp({
             // 已经对过一次, 这里再对一次是为了覆盖「页面刚打开 / 刷新后
             // 主动补查」这条路 —— 那条路没有 WS 消息经过)。
             if (msg.server_now) syncServerClock(msg.server_now);
+            // ⚠️ **快照必须是「当前这一轮」的** —— 晚到的旧快照会把界面
+            //    拽回上一轮(2026-11-11 查出来的):
+            //    工人开了**第二轮**, 第一轮的快照(排队中的 / 重连补查的)
+            //    这时才到 ⇒ 界面把第二轮的进度抹掉、换成第一轮的结果 ⇒
+            //    工人眼前是**上一轮**的结论 ⇒ 可能拿上一轮的「全部通过」
+            //    当这一轮的结论 ⇒ **放过坏板子**。
+            //
+            //    判据 = **轮次号**: 轮次号是自增的 ⇒ 快照的轮次号比当前小
+            //    ⇒ 它是**更早那一轮**的 ⇒ 整条丢掉(连 run_id 都不许改,
+            //    免得把当前这一轮的编号也换掉)。
+            //
+            //    · 比当前**大** ⇒ 是**更新的一轮**(比如服务重启后接着跑)
+            //      ⇒ 照常采用(顺手把 runId 更新过去);
+            //    · **一样** ⇒ 就是当前这一轮 ⇒ 照常采用;
+            //    · 认不出来(不是数字) ⇒ 保守起见**丢掉**。
+            const snapRunId = (msg.mode === 'mini' && msg.parent_run_id)
+                ? msg.parent_run_id : msg.run_id;
+            if (runId.value && snapRunId && snapRunId !== runId.value) {
+                const cur = Number(runId.value);
+                const snap = Number(snapRunId);
+                const stale = (Number.isFinite(cur) && Number.isFinite(snap))
+                    ? (snap < cur) : true;
+                if (stale) {
+                    // 旧快照 ⇒ **整条丢掉**, 界面一个字都不改。
+                    return;
+                }
+            }
+            // ⚠️ **工人已经从这一轮走开了** ⇒ 它的收尾快照(WS 重连补推的)
+            //    **不许**把界面拽回上一轮的总结页(见 leftRunId 的注释)。
+            //    判据用 **父轮号**(mini-run 按父轮算), 跟上面同一个口径。
+            if (leftRunId.value !== null && snapRunId
+                && Number(snapRunId) === Number(leftRunId.value)) {
+                return;
+            }
             // mini-run 时 runId 仍指向父轮 —— 跟 run_started 的约定一致。
             // 以前这里是无条件 runId = msg.run_id, mini-run 时会跟那条约定
-            // 打架(一会儿指父轮一会儿指自己), 顺着改掉。
+            // 打架(一会儿指父轮一会儿指自己), 顺手改掉。
             if (msg.run_id) {
                 runId.value = (msg.mode === 'mini' && msg.parent_run_id)
                     ? msg.parent_run_id
@@ -823,6 +868,11 @@ createApp({
             // 按钮已经 disable 了, 这里再挡一道(按钮 disable 只挡点击,
             // 挡不住代码里别处调 goConfig)。
             if (isRunning.value) return;
+            // ⚠️ 记住「我们是从哪一轮走开的」—— 这一轮**后来才到的**快照
+            //    (WS 重连补推的)不许再把工人拽回它的总结页(见 leftRunId)。
+            if (runId.value !== null && runId.value !== undefined) {
+                leftRunId.value = runId.value;
+            }
             view.value = 'main';
             isRunning.value = false;
             resultList.value = [];
@@ -1468,7 +1518,7 @@ createApp({
             usbReportNote,
             tfPrompt, ethPrompt, currentTestIndex, lastStatus,
             depsInfo, shuttingDown,
-            runSn, runFinishedAt, runError, mergedParent,
+            runSn, runFinishedAt, runError, mergedParent, leftRunId,
             runStartedAt, clockNow, startClock, stopClock, fmtHms, fmtDur,
             serverNow, syncServerClock, perfNow,
             // computed

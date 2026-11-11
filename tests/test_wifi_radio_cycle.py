@@ -107,7 +107,8 @@ class FakeBoard:
                  scan_out=SCAN_WITH_AP, has_ip=False, ip_addr_fails=False,
                  state_seq=None, nm_type=None, rfkill_blocked=False,
                  fail_up_once=False, nm_keeps_down=False,
-                 rfkill_stays_blocked=False, up_no_effect=False):
+                 rfkill_stays_blocked=False, up_no_effect=False,
+                 up_gives_dormant=False):
         self.radio_connected = radio_connected
         self.link_state = link_state
         self.cur_state = link_state    # 当前状态(被 `ip link set` 改)
@@ -122,6 +123,8 @@ class FakeBoard:
         self.fail_up_once = fail_up_once   # 第一次 `set up` 失败(退出码非 0)
         self.up_no_effect = up_no_effect   # `set up` 退出 0 但接口**纹丝不动**
                                            # (驱动没反应 ⇒ 管理态一直 DOWN)
+        self.up_gives_dormant = up_gives_dormant   # `set up` 之后接口起来了,
+                                           # 但**没载波**(没连上 AP)⇒ DORMANT
         self.up_failed = False
         self.calls = []
         self.link_set_log = []      # 每次 `ip link set` 做了什么, 按顺序
@@ -198,7 +201,11 @@ class FakeBoard:
                     if self.up_no_effect:
                         pass            # 驱动没反应: 退出 0, 但接口纹丝不动
                     elif not (self.nm_type and self.nm_keeps_down):
-                        self.cur_state = "UP"
+                        # ⚠️ `up_gives_dormant`: 工位没网 ⇒ 接口起来了,
+                        #   但**没有载波**(没连上 AP)⇒ 链路状态 DORMANT。
+                        #   管理态仍是 UP —— 判「起来没」要看管理态。
+                        self.cur_state = ("DORMANT" if self.up_gives_dormant
+                                          else "UP")
             return 0, "", ""
         if base == "rfkill" and args[:1] == ["list"]:
             # ⚠️ 格式照真机: 设备名单独一行, Soft/Hard blocked 各自缩进一行
@@ -706,6 +713,33 @@ check(result.metrics.get("skipped_reason") == "iface_not_up",
       "跳过原因码单开一格", result.metrics.get("skipped_reason"))
 check(result.metrics.get("ip_link_admin") == "DOWN",
       "管理态记的是 DOWN(跟链路的 DORMANT 分开)", result.metrics.get("ip_link_admin"))
+
+
+section("【17】收尾判「恢复没恢复」看**管理状态**, 不看载波")
+
+
+# ⚠️ **2026-11-11 查出来的假警报**: 收尾拿的是**载波**(carrier),
+#   拿它跟 "UP" 比 ⇒ 在**没网的工位**上载波恒是 DORMANT ⇒ 明明接口
+#   已经恢复成 UP, 却报「⚠ 收尾没能把接口恢复成 UP」⇒ 工人以为板子坏了
+#   ⇒ **冤枉好板子**(跟 WiFi 那条「我们动过它吗」是同一个道理)。
+#
+# 剧本: 工位没网 ⇒ 载波一直是 DORMANT; 但**管理状态**(flags 里的 UP)是好的。
+board = FakeBoard(radio_connected=False, up_gives_dormant=True)
+with patched(board, carrier=False):
+    result, ctx = asyncio.run(run_item(board, {"switch_settle_sec": 0.1}))
+
+check(result.metrics.get("restored_state") == "UP",
+      "管理态是 UP ⇒ 收尾判「恢复好了」(不拿载波当判据)",
+      result.metrics.get("restored_state"))
+check("restore_failed" not in result.metrics,
+      "没有「恢复失败」的标记(没网的工位上不该有)",
+      result.metrics.get("restore_failed"))
+check(result.metrics.get("restored_carrier") == "DORMANT",
+      "载波另记一笔(DORMANT = 没连上 AP, 跟恢复成没成功无关)",
+      result.metrics.get("restored_carrier"))
+check(not any("没能把接口恢复成 UP" in ln for ln in ctx.logs),
+      "日志里没有那句假警报", [ln for ln in ctx.logs
+                             if "恢复" in ln])
 
 
 print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))

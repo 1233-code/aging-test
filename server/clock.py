@@ -369,11 +369,45 @@ def write_run_skew(run_id: int) -> Optional[Path]:
 
 
 def read_run_skew(run_id: int) -> str:
-    """读某一轮的时钟旁挂文件 —— 读不到/没写过就是空串。"""
+    """读某一轮的时钟旁挂文件 —— 读不到/没写过就是空串。
+
+    ⚠️ **必须容错解码, 不能严格解码** (2026-11-11 实测踩到):
+        产线 U 盘上的旁挂文件**会被写坏** —— 实测盘上
+        `logs/clock_skew_run20.txt` 整个 258 字节全是乱码
+        (开头 4 个字节是 `ff ff ff ff`, 后面全是随机二进制),
+        同一批盘上的 `cpu_evidence_run20.txt` 尾巴有 173 个 NUL 字节。
+        ⇒ `read_text(encoding="utf-8")` **抛 UnicodeDecodeError**
+        ⇒ 旧代码 `except Exception: return ""` ⇒ **整份旁挂文件静默消失**
+        ⇒ 报告上**「本轮时间戳是推算值」那条横幅不见了**
+        ⇒ 工人以为时间戳是真的 ⇒ **拿推算值当准点用**。
+
+        ⇒ 跟 `boot_evidence._read_text_lenient` 一个口径:
+           读字节 + `errors="replace"` ⇒ 坏的那几个字节变成 �,
+           **前面的正经内容照样读得到**。
+
+    ⚠️ **文件在、内容空 ⇒ 结论照样成立, 横幅不许消失** (2026-11-11 实测):
+        产线盘上另有 **3 个 0 字节**的旁挂文件(`clock_skew_run19/36/38.txt`)
+        —— `write_run_skew()` 是 `write_text()`, **先建/截断文件再写**,
+        写到一半断电 ⇒ 留下一个**空文件**。
+        ⇒ 空文件**仍然说明「这一轮是推算值」**(时钟正常时压根不写这个文件)
+        ⇒ 但旧代码读回 `""` ⇒ **横幅照样消失** ⇒ **同一个后果**。
+        ⇒ 所以: **文件不存在 ⇒ 空串(不打横幅)**; **文件在但读不出内容 ⇒
+        照样给一句话**(横幅在, 只是细节丢了)。
+        ⚠️ **别改成「先写 .tmp 再 rename」那种原子写法** —— 那样断电时
+        主文件压根不会出现 ⇒ 「这一轮是推算值」这个信号**一起没了**
+        ⇒ 又变成静默消失。
+    """
     try:
-        return run_skew_path(run_id).read_text(encoding="utf-8").strip()
-    except Exception:
+        raw = run_skew_path(run_id).read_bytes()
+    except OSError:
         return ""
+    text = raw.decode("utf-8", errors="replace").strip()
+    if text:
+        return text
+    # 文件在, 但内容是空的 ⇒ 这一轮**确实写过**旁挂文件 ⇒ 时间戳是推算值
+    # ⇒ 横幅必须还在(细节丢了就说细节丢了, 不许连结论一起丢)
+    return ("本轮时间戳是推算值 —— 但旁挂文件内容是空的(写入时中断), "
+            "推算细节已丢失; 归档顺序可信, 但**不能当准点用**。")
 
 
 # ==================== A1: 让板子自己把时间存下来 ====================

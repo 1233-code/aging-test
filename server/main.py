@@ -84,50 +84,72 @@ async def startup():
             try:
                 evidence_text = await boot_evidence.previous_boot_evidence()
                 kind = boot_evidence.classify_evidence_text(evidence_text)
-                if kind == "硬复位":
+                # ── ① 第一条通道: 日志尾巴里看得见我们自己的测试 ──────
+                if kind == "硬复位" and boot_evidence.our_run_at_death(evidence_text):
                     # 「板子被硬拉死」还不够 —— 还得**死的时候我们的测试
                     # 正在上面跑**。
                     # 「服务自己死了、板子后来才被硬拉死」也是「没有关机
                     # 序列」, 那种判成「板子不合格」就是冤枉好板子。
-                    if boot_evidence.our_run_at_death(evidence_text):
-                        hard_reset = True
-                        print("[server] 上一次是**硬复位**, 而且日志尾巴里看得见"
-                              "我们自己的测试 ⇒ 正在跑的那一项判 failed"
-                              "(板子被硬拉死的, 被测设备不合格)")
-                    else:
-                        # ⚠️ **journal 的尾巴认不出来时的第二条通道**
-                        # (2026-11-04 实测踩出来的):
-                        #   硬复位时 **journald 还没落盘的那几秒, 尾巴里是
-                        #   没有的** —— 而那几秒**正好**是「加压刚起手」的
-                        #   窗口(实测板子死在起手约 2 秒)⇒ 尾巴里连一条
-                        #   stress-ng 都没有 ⇒ 照旧 stopped ⇒ **不计入通过率
-                        #   分母** ⇒ 一块在满载下硬复位的板子, 只要其它项
-                        #   都过, 报告上看着像**合格**的 ⇒ 产线会放行它。
-                        # ⇒ 改看**加压现场记录**: 它逐行 fsync 落盘, 硬复位
-                        #   **带不走**; 「起跑」在、「加压结束」不在 ⇒ 加压
-                        #   **没跑完** ⇒ 板子死在加压途中 ⇒ 判 failed。
-                        cut = None
-                        for r in stuck:
-                            try:
-                                if boot_evidence.cpu_evidence_cut_short(r.get("id")):
-                                    cut = r.get("id")
-                                    break
-                            except Exception:
-                                continue
-                        if cut is not None:
-                            hard_reset = True
-                            print("[server] 上一次是**硬复位**, journal 尾巴里"
-                                  "看不见我们的测试(硬复位时最后几秒没落盘), "
-                                  f"但**加压现场记录**显示第 {cut} 轮的加压"
-                                  "起手了、没跑完 ⇒ 板子死在加压途中 ⇒ "
-                                  "正在跑的那一项判 failed(被测设备不合格)")
-                        else:
-                            print("[server] 上一次是**硬复位**, 但日志尾巴里看不见"
-                                  "我们自己的测试, 加压现场记录也看不出"
-                                  "「起手了没跑完」 ⇒ 不赖到板子头上, 照旧 stopped")
+                    hard_reset = True
+                    print("[server] 上一次是**硬复位**, 而且日志尾巴里看得见"
+                          "我们自己的测试 ⇒ 正在跑的那一项判 failed"
+                          "(板子被硬拉死的, 被测设备不合格)")
+                elif kind == "软重启":
+                    # ⚠️ **软重启不赖到板子头上** —— 有人/有服务执行了
+                    #    reboot, 板子自己没崩 ⇒ 照旧 stopped(不冤枉板子)。
+                    #    ⚠️ 这里**刻意不去查「加压现场记录」**: 工人/服务在
+                    #    加压途中执行了 reboot, 现场记录同样是「起跑没结束」
+                    #    ⇒ 拿它当证据 = 把一次人为重启说成板子不合格。
+                    print("[server] 上一次是**软重启** ⇒ 照旧 stopped"
+                          "(不冤枉板子)")
                 else:
-                    print(f"[server] 上一次是**{kind}** ⇒ 照旧 stopped"
-                          f"(不冤枉板子)")
+                    # ── ② 第二条通道: 加压现场记录(逐行 fsync, 硬复位带不走) ──
+                    #    **什么时候都要查, 不管 journal 判出了什么**:
+                    #      · 硬复位, 但**尾巴里没有**我们的进程 —— 硬复位时
+                    #        journald 最后几秒还没落盘, 而那几秒**正好**是
+                    #        「加压刚起手」的窗口(实测板子死在起手约 2 秒)
+                    #        ⇒ 尾巴里连一条 stress-ng 都没有;
+                    #      · **判不出软硬**(日志读不到 / 认不出来) —— 这时
+                    #        唯一的证据就是它(§9.3 的规定: 判不出软硬 ⇒
+                    #        **先走第二条通道**)。
+                    #    ⇒ 现场记录里「起跑」在、「加压结束」不在 ⇒ 加压没跑完
+                    #      ⇒ 板子死在加压途中 ⇒ 那一项判 failed。
+                    #    ⚠️ 这一关自己还带着「**板子真的重启过没有**」的
+                    #        护栏(见 boot_evidence.cpu_evidence_cut_short)
+                    #        —— 服务被杀/被重启时现场记录也是「起跑没结束」,
+                    #        那时候**不许**赖到板子头上(冤枉好板)。
+                    cut = None
+                    for r in stuck:
+                        try:
+                            if boot_evidence.cpu_evidence_cut_short(r.get("id")):
+                                # ⚠️ **「判不出软硬」这一档要额外一道**:
+                                #    日志读不到 ⇒ 我们**不知道**板子死没死过
+                                #    ⇒ 光凭「现场记录起跑没结束」就判板子不合格
+                                #    = **冤枉好板**(服务被杀时那份记录也一样)。
+                                #    ⇒ 还要有「**板子真的重启过**」的**实证**
+                                #      (开机 ID 变了 —— 跟时钟无关, 板子的墙钟
+                                #      会倒退, 拿时间戳比是比不出来的)。
+                                #    「硬复位」那一档不用加这道 —— journal 已经
+                                #    证明板子确实重启过了。
+                                if kind != "硬复位":
+                                    if boot_evidence.board_rebooted_since_evidence(
+                                            r.get("id")) is not True:
+                                        continue
+                                cut = r.get("id")
+                                break
+                        except Exception:
+                            continue
+                    if cut is not None:
+                        hard_reset = True
+                        print("[server] 上一次是**%s**, 但日志尾巴里看不见我们"
+                              "自己的测试(硬复位时最后几秒没落盘), "
+                              f"**加压现场记录**显示第 {cut} 轮的加压"
+                              "起手了、没跑完 ⇒ 板子死在加压途中 ⇒ "
+                              "正在跑的那一项判 failed(被测设备不合格)" % kind)
+                    else:
+                        print("[server] 上一次是**%s**, 但日志尾巴里看不见我们"
+                              "自己的测试, 加压现场记录也看不出「起手了没跑完」"
+                              " ⇒ 不赖到板子头上, 照旧 stopped" % kind)
             except Exception as e:
                 print(f"[server] ⚠ 取上一次启动的日志失败(不影响收尾): {e!r}")
 
@@ -682,14 +704,17 @@ async def history_pdf(run_id: int):
     path = data.get("pdf_path")
     if not path:
         raise HTTPException(404, "该轮次还没导出 PDF, 请点「重新导出」")
-    p = Path(path)
-    if not p.is_absolute():
-        p = Config.project_root() / p
+    # ⚠️ **还原成「现在真的存在」的那个文件** —— 库里可能存着**已经失效**的
+    #    绝对路径(盘换了挂载点), 那样工人点「打开报告」就打不开。
+    #    见 report.resolve_pdf_path()。
+    p = report.resolve_pdf_path(path)
+    if p is None:
+        raise HTTPException(404, "PDF 文件已不在磁盘上, 请重新导出")
     # 库里的路径理论上只会是本工具写的, 但万一被手改过 —— 别让它变成一个
     # 能读 /etc/passwd 的任意文件下载口。
     #
     # 边界取 **report.output_dir()** —— 只有报告目录及其子目录可下载:
-    #   · 默认 output_dir="reports" → 解析后是 <项目根>/reports/pdf, 落在项目根
+    #   · 默认 output_dir="reports" → 解析后是 <数据根>/reports/pdf, 落在数据根
     #     之内, 所以行为不变, 但比"项目根之内"**更严**(仓库里其他文件不会被
     #     这个端点读出去);
     #   · 产线把 output_dir 指到 U 盘/网络盘(绝对路径)归档时, 那个目录本身
@@ -705,8 +730,6 @@ async def history_pdf(run_id: int):
         inside = False
     if not inside:
         raise HTTPException(403, "PDF 路径不在报告目录内")
-    if not p.exists():
-        raise HTTPException(404, "PDF 文件已不在磁盘上, 请重新导出")
     return FileResponse(str(p), media_type="application/pdf",
                         filename=p.name)
 

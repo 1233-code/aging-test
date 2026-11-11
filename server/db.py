@@ -31,6 +31,30 @@ CORRUPT_SUFFIX = ".corrupt-"
 #: 运行时报错兜底。
 PROBE_MAX_BYTES = 256 * 1024 * 1024
 
+#: 体检结果里「**被占着**(不是坏了)」的标记前缀 —— 用它把「locked」和
+#: 「损坏」分开: locked 的库**一个字都不许动**(改了就是好板子被冤枉,
+#: 工人整盘历史归零)。
+LOCKED_PREFIX = "locked"
+LOCKED_REASON = LOCKED_PREFIX + ": 库正被别的进程占着(不是坏了) —— %s"
+
+
+def _looks_locked(exc: Exception) -> bool:
+    """这个异常是不是「库被占着」(而不是「库坏了」)。
+
+    SQLite 报占用的说法有好几种:
+      · `database is locked`        —— 别的进程持有写锁
+      · `database table is locked`  —— 别的进程正写同一张表
+      · `database is busy`          —— 忙
+    ⇒ 一律按「占着」处理, **不隔离**。
+    """
+    msg = str(exc).lower()
+    return ("locked" in msg) or ("busy" in msg)
+
+
+def is_locked_reason(reason: str) -> bool:
+    """这条体检结论是不是「被占着」(= 不是坏了)。"""
+    return bool(reason) and reason.startswith(LOCKED_PREFIX)
+
 #: 本次启动隔离过库的话记在这儿 —— 给 `/api/config` 报, 界面挂横幅。
 QUARANTINED: list = []
 
@@ -99,6 +123,30 @@ def _quarantine_prefix(path: Path) -> str:
     return path.name + CORRUPT_SUFFIX
 
 
+def _pdf_path_for_db(pdf_path: str) -> str:
+    """存进库的 PDF 路径 —— **相对数据根**, 不是绝对路径。
+
+    ⚠️ **为什么**: 绝对路径会**跟着挂载点一起失效** ——
+       U 盘昨天挂在 `/media/User/AGING`, 今天挂在 `/media/User/AGING1`
+       ⇒ 库里那条 `/media/User/AGING/reports/pdf/x.pdf` 就指向一个**不存在**
+       的地方 ⇒ 工人点「打开 PDF 报告」打不开(2026-11-11 实况: Nov 10 15:14
+       那轮就是这样)。相对路径 ⇒ 挂到哪儿都对。
+
+    不在数据根下的(比如 `output_dir` 指到别处)只能存绝对 —— 相对了就没法
+    还原回去。
+    """
+    if not pdf_path:
+        return pdf_path
+    p = Path(pdf_path)
+    if not p.is_absolute():
+        return pdf_path          # 本来就是相对的 ⇒ 照旧
+    try:
+        root = Config.data_root().resolve()
+        return str(p.resolve().relative_to(root))
+    except (ValueError, OSError):
+        return str(p)             # 不在数据根下 ⇒ 只能存绝对
+
+
 def find_quarantined(path: Path) -> list:
     """盘上**已经**隔离过的库(新的在前) —— 那是「这根盘的历史重置过」的
     **永久证据**: 盘一直在, 下一个人接手也知道。
@@ -127,6 +175,12 @@ async def probe_health(path: Path) -> tuple:
        会留下一个「热日志」, 只读打开**没法回滚**(直接报错)⇒ 读写打开
        能让 **SQLite 自己把热日志回滚掉** —— 回滚成功的话这个库其实
        **是好的**, 根本不用隔离。
+
+    ⚠️ **「被占着」和「坏了」要分开**(2026-11-11 查出来的): 体检撞上
+       `database is locked`(上一个进程没退干净 / 别的工具开着它)时,
+       **那不是损坏** ⇒ 结论是「好的, 但正被占着」, 结论字符串带
+       `locked:` 前缀 ⇒ 上层**不会**去隔离它。
+       (混为一谈 ⇒ 好端端的库被改名隔离 ⇒ 工人整盘历史归零。)
     """
     if not path.exists():
         return True, "新库(还没有)"          # 还没建过 ⇒ 没坏
@@ -144,6 +198,14 @@ async def probe_health(path: Path) -> tuple:
                 row = await cur.fetchone()
             verdict = (row[0] if row else "") or ""
     except Exception as e:
+        # ⚠️ **「被占着」≠「坏了」** —— 这是两个完全不同的事, 混在一起会
+        #    **把好端端的库改名隔离掉** ⇒ 工人的历史记录整个归零, 而板子
+        #    一点毛病都没有。
+        #    「locked」的典型来源: 上一个服务进程还没退干净(重启竞态)、
+        #    另一个工具正开着这个库、或者体检正好撞上别人在写。
+        #    ⇒ 这种情况下**一律不动这个库**, 照常往上开。
+        if _looks_locked(e):
+            return True, LOCKED_REASON % e
         return False, "%s: %s" % (type(e).__name__, e)
     if verdict.strip().lower() == "ok":
         return True, "ok"
@@ -184,9 +246,18 @@ def isolate_corrupt_db(path: Path, reason: str) -> Optional[Path]:
 
 
 async def _isolate_if_corrupt(path: Path) -> None:
-    """体检不过就把坏库隔离掉, 另起一个空的。"""
+    """体检不过就把坏库隔离掉, 另起一个空的。
+
+    ⚠️ **「被占着」不是「坏了」** —— 库被别人开着(上一个进程没退干净、
+       别的工具开着它)的时候, 体检会撞上 `database is locked`。
+       那**不是损坏** ⇒ **一个字都不许动它** —— 隔离掉的话工人整盘历史
+       归零, 而板子一点毛病都没有 ⇒ **冤枉好板子**。
+    """
     ok, reason = await probe_health(path)
     if ok:
+        if is_locked_reason(reason):
+            print("[db] ⚠ 历史库正被别的进程占着(locked, **不是坏了**) —— "
+                  "先不动它: %s" % reason)
         return
     dest = isolate_corrupt_db(path, reason)
     if dest is None:
@@ -386,11 +457,18 @@ class Database:
 
         导出失败时**不要**调用 —— pdf_path 留空本身就代表"没导出",
         不用再造一个 error 列去记失败原因(日志和 UI warning 已经带了)。
+
+        ⚠️ **存的是「相对数据根」的路径, 不是绝对路径** ——
+           绝对路径会**跟着挂载点一起失效**: 盘昨天挂在 /media/User/AGING,
+           今天挂在 /media/User/AGING1 ⇒ 库里那条绝对路径就指向一个不存在的
+           地方 ⇒ 工人点「打开 PDF 报告」打不开(2026-11-11 实况)。
+           相对路径 ⇒ 挂到哪儿都对。
+           (不在数据根下的 —— 比如 output_dir 指到别处 —— 只能存绝对。)
         """
         async with aiosqlite.connect(_db_path()) as db:
             await db.execute(
-                "UPDATE runs SET pdf_path=? WHERE id=?", (pdf_path, run_id)
-            )
+                "UPDATE runs SET pdf_path=? WHERE id=?",
+                (_pdf_path_for_db(pdf_path), run_id))
             await db.commit()
 
     @staticmethod

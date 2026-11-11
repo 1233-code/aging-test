@@ -23,14 +23,22 @@
 ⚠️ **要在库正被服务写的时候用它, 先把文件拷一份再查** —— 拷贝本身更可靠,
 而且查坏了也不影响生产库。
 
+⚠️ **旁边有「热日志」(`-journal`)时, 本工具下不了结论**(退出码 3):
+   热日志 = 拔盘时写到一半留下的 ⇒ **只读**打开回滚不了它 ⇒ 每一个查询都会
+   抛 `attempt to write a readonly database` ⇒ 那些「读不出来」是**只读**造成
+   的, **不是**「库坏了」的证据 ⇒ 此时**以应用启动时的体检为准**(应用是**读写**
+   打开的 ⇒ SQLite 自己把热日志回滚掉 ⇒ 回滚成功的话这个库其实是好的)。
+
 用法:
     python3 scripts/check_history_db.py <history.db 路径>
     python3 scripts/check_history_db.py <路径> --json
 
 退出码:
     0  库是好的(能读、也能写)
-    1  库坏了(读不了 / 有坏页 / 表读不出来 / 写不进去)
+    1  库坏了(读不了 / 有坏页 / 表读不出来 / 写不进去 / **索引坏了** /
+              空闲页链不自洽 / `results.log` 有行读不出来)
     2  用法错或文件不在
+    3  **下不了结论**(旁边有热日志, 只读回滚不了 —— 见上面那段)
 """
 import json
 import os
@@ -59,6 +67,22 @@ def _open_ro(path):
 
 def _quote_ident(name):
     return '"' + str(name).replace('"', '""') + '"'
+
+
+#: 回滚日志(Rollback Journal)文件头的 magic —— 见 SQLite 文件格式 §
+#: «Rollback Journal Format»。头 8 字节是这个 ⇒ 这才是一个**热日志**
+#: (SQLite 自己认的、开机要回滚的); 不是 ⇒ 那是个 SQLite 压根不理的文件。
+JOURNAL_MAGIC = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7"
+
+
+def _journal_looks_hot(path):
+    """这个 `-journal` 文件**看着像热日志**吗(头 8 字节是不是 magic)。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return False
+    return head == JOURNAL_MAGIC
 
 
 # ── SQLite 自己的权威结论 ────────────────────────────────────────────
@@ -144,6 +168,12 @@ def _probe_sqlite_sequence(conn):
         rows = conn.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
         return {"readable": True, "rows": rows, "error": None}
     except Exception as e:
+        msg = str(e)
+        # 「压根没有 sqlite_sequence 这张表」= 这个库里没有 AUTOINCREMENT 的表
+        # ⇒ **不是缺陷**(只是用不上自增计数器) ⇒ 不许算进「坏」。
+        if "no such table" in msg:
+            return {"readable": True, "rows": [], "error": None,
+                    "note": "这个库没有 AUTOINCREMENT 的表(没有 sqlite_sequence)"}
         return {"readable": False, "rows": None,
                 "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -346,11 +376,30 @@ def diagnose(path, write_test=True):
         "bad_pages": [],
         "overflow_pages": [],
         "write_test": None,
+        "hot_journal": False,
+        "hot_journal_size": 0,
+        "journal_looks_hot": False,
+        "indeterminate": False,
         "problems": [],
     }
     if not out["exists"]:
         out["problems"].append("文件不存在")
         return out
+
+    # ⚠️ **热日志**(拔盘时写到一半留下的 `-journal`)在**只读**打开时
+    #    **回滚不了** ⇒ 后面每一个 PRAGMA / 查询都会抛
+    #    `attempt to write a readonly database` ⇒ 那**不是库坏了的证据**,
+    #    是**只读**造成的 ⇒ 这种情况下这个脚本**下不了结论**。
+    #    (应用启动时的体检是**读写**打开的 ⇒ SQLite 自己把热日志回滚掉 ⇒
+    #     回滚成功的话这个库其实是好的。)
+    jpath = path + "-journal"
+    if os.path.isfile(jpath):
+        out["hot_journal"] = True
+        try:
+            out["hot_journal_size"] = os.path.getsize(jpath)
+        except OSError:
+            out["hot_journal_size"] = 0
+        out["journal_looks_hot"] = _journal_looks_hot(jpath)
 
     try:
         conn = _open_ro(path)
@@ -463,6 +512,26 @@ def diagnose(path, write_test=True):
                 "**写不进去** —— %s 那一步就炸了: %s"
                 % (out["write_test"].get("stage"),
                    out["write_test"].get("error")))
+
+    # ⑧ **热日志还在** ⇒ 这个脚本**下不了结论** —— 只读打开回滚不了它,
+    #    上面那些「读不出来」是**只读**造成的, 不是「库坏了」的证据。
+    #    ⚠️ 「看着像热日志」的判据 = 文件头的 magic(见 SQLite 文件格式 §
+    #    Rollback Journal)。magic 不在 ⇒ 那是 SQLite 压根不认的残留文件 ⇒
+    #    结论照常成立(只是提一句)。
+    readonly_problems = [p for p in out["problems"]
+                         if "readonly database" in p or "read-only" in p]
+    if out["hot_journal"] and (out["journal_looks_hot"] or readonly_problems):
+        out["indeterminate"] = True
+        out["problems"].insert(0,
+            "这个库旁边有**热日志**(-journal, %d 字节)⇒ **只读**打开回滚不了它"
+            " ⇒ 上面那些「读不出来」是**只读**造成的, **不能**当成「库坏了」的"
+            "证据 ⇒ 本次**下不了结论**(应用启动时是**读写**打开的 ⇒ SQLite 自己"
+            "把热日志回滚掉 ⇒ 回滚成功的话这个库其实是好的 ⇒ **以应用启动体检的"
+            "结论为准**)" % out["hot_journal_size"])
+    elif out["hot_journal"]:
+        out["problems"].append(
+            "旁边有个 -journal 文件(%d 字节, 但**不像是热日志**)⇒ SQLite 不会"
+            "去回滚它 ⇒ 结论不受影响" % out["hot_journal_size"])
     return out
 
 
@@ -531,7 +600,10 @@ def _fmt(out):
             else:
                 lines.append("     ✗ %s —— %s" % (s["name"], s["error"]))
     if out["problems"]:
-        lines.append("  ⇒ 结论: **这个库是坏的**")
+        if out.get("indeterminate"):
+            lines.append("  ⇒ 结论: **下不了结论**(见下面第一条)")
+        else:
+            lines.append("  ⇒ 结论: **这个库是坏的**")
         for prob in out["problems"]:
             lines.append("     · %s" % prob)
     else:
@@ -552,10 +624,24 @@ def main(argv):
         print(_fmt(out))
     if not out["exists"]:
         return 2                      # 文件不在 = 用法/路径不对, 不是「库坏了」
+    if out.get("indeterminate"):
+        # 「热日志还在, 只读回滚不了」⇒ **下不了结论** —— 不能说它坏, 也不能
+        # 说它好(退出码 0 = 「库是好的」, 那是撒谎)⇒ 单独一个码。
+        return 3
+    # ⚠️ **这四项以前不在退出码里** ⇒ 脚本文案明明写着「这个库是坏的」,
+    #    退出码却是 0(「库是好的」)⇒ **按退出码判断的流程会把坏库当成好库**。
+    #    ① `integrity_check` 失败(只有**索引**坏了时 quick_check 看不出来);
+    #    ② `sqlite_sequence` 读不出来(插行必碰它 ⇒ 写不进去);
+    #    ③ `results.log` 有行读不出来(大字段溢出页断链);
+    #    ④ 空闲页链不自洽(读没事、写要翻它 ⇒ 会炸)。
     healthy = (out["quick_check_ok"]
+               and (out.get("integrity_check") or {}).get("ok")
                and all(i["readable"] for i in out["tables"].values())
                and all(i["readable"] for i in out["indexes"].values())
                and not out["bad_pages"]
+               and out.get("freelist_chain_ok") is not False
+               and (out.get("sqlite_sequence") or {}).get("readable") is not False
+               and (out.get("payload_probe") or {}).get("ok") is not False
                and (out["write_test"] or {}).get("ok"))
     return 0 if healthy else 1
 
