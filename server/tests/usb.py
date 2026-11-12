@@ -10,7 +10,8 @@ from .base import TestCase, TestContext, TestResult, register
 from ._tools import (
     find_tool, with_sudo, sudo_hint_if_unavailable,
     run_proc_with_progress, fio_runtime_args, fio_timeout_sec,
-    loader_error_message,
+    loader_error_message, deps_fix_hint, tool_missing_reason,
+    humanize_exception, rc_meaning,
 )
 from .. import storage
 
@@ -171,10 +172,11 @@ class USBTest(TestCase):
         if not lsusb_bin or not fio_bin:
             missing = [n for n, b in (("lsusb", lsusb_bin), ("fio", fio_bin)) if not b]
             result.status = "error"
-            result.error = (
-                f"未找到: {', '.join(missing)}. "
-                "解决: sudo apt install usbutils fio (见 docs/需求设计.md §11.7)"
-            )
+            # ⚠️ **2026-11-12**: 以前写死「sudo apt install usbutils fio」——
+            #   **在 U 盘版上那是条死命令** ⇒ 统一走 `tool_missing_reason()`。
+            result.error = tool_missing_reason(
+                "、".join(missing), deps_fix_hint(),
+                note="PATH 不含 /sbin, 或这台机器上压根没装这些工具")
             await ctx.on_log(f"[USB] ✗ {result.error}")
             return result
         await ctx.on_log(f"[USB] 工具: lsusb={lsusb_bin}, fio={fio_bin}")
@@ -215,7 +217,15 @@ class USBTest(TestCase):
 
         if usb_count == 0:
             result.status = "failed"
-            result.error = "未检测到任何 USB 设备"
+            # ⚠️ **2026-11-12**: 原来只有「未检测到任何 USB 设备」六个字 ——
+            #   工人看到会以为是**板子坏了**(要返修), 实际是**USB 口是空的**
+            #   (盘没插 / 插的是充电头 / 集线器没通电)⇒ 说清楚**下一步做什么**。
+            result.error = (
+                "**没有插 U 盘** —— lsusb 只列出了 root hub(板子自己的 USB "
+                "控制器), 一台外接设备都没有。请把要测的 U 盘插到 USB 口"
+                "(别插充电头 / 别用没通电的集线器)再重测; 这一项**测的是 U 盘"
+                "本身**, 板子有没有坏, 这条测不出来。"
+            )
             return result
 
         # 2. 找 USB 块设备
@@ -320,6 +330,15 @@ class USBTest(TestCase):
                 if killed:
                     await ctx.on_log("[USB] ⚠ 写测试被中断 (取消或超时)")
                     result.status = "stopped"
+                    # ⚠️ **2026-11-12**: 原来**一个字的原因都不写** ⇒ 报告的
+                    #   「未测项明细」里只剩一个光秃秃的 stopped ⇒ 工人不知道
+                    #   是自己按了停止, 还是这一项卡住了。
+                    result.error = (
+                        "写测试被中止 —— 工人中途按了「停止」, 这一项没跑完。"
+                        "没跑完 ≠ 不合格, 补上盘之后可以重测。"
+                        if out.reason == "cancelled" else
+                        "写测试跑到了我们自己的硬上限还没结束, 这一项被收掉了。"
+                        "这一项**没测成** —— 不是「U 盘坏了」。")
                     return result
                 if rc != 0:
                     # ⚠️ 「工具起不来」(rc=127 / 缺共享库) ≠ 「盘写坏了」——
@@ -335,7 +354,9 @@ class USBTest(TestCase):
                     await ctx.on_log(text[-500:])
                     all_passed = False
                     fail_reasons.append(
-                        f"第 {round_idx}/{times} 轮 fio 退出码 {rc}(读写出错, 盘可能已掉或报坏块)"
+                        f"第 {round_idx}/{times} 轮 fio 退出码 {rc}"
+                        f"({rc_meaning(rc)}) —— 读写出错, U 盘可能已掉或报坏块; "
+                        f"换个 USB 口/换根盘重测, 仍然失败 ⇒ 这根盘不合格"
                     )
                     break
 
@@ -350,13 +371,17 @@ class USBTest(TestCase):
                     result.metrics[f"round_{round_idx}_write_mbps"] = write_mbps
                 else:
                     await ctx.on_log("[USB] ⚠️ 未解析到写速度 (不影响判定, fio 已正常退出)")
-            except FileNotFoundError:
+            except FileNotFoundError as e:
                 result.status = "error"
-                result.error = "未安装 fio"
+                result.error = tool_missing_reason(
+                    "fio", deps_fix_hint(),
+                    note="PATH 不含 /sbin, 或这台机器上压根没装这个工具",
+                    detail=str(e))
                 return result
             except Exception as e:
                 result.status = "error"
-                result.error = f"异常: {e!r}"
+                result.error = humanize_exception(
+                    e, item="USB 项", stage=f"第 {round_idx}/{times} 轮写入")
                 return result
 
         if all_passed:
@@ -375,5 +400,13 @@ class USBTest(TestCase):
                 )
         elif result.status == "pending":
             result.status = "failed"
-            result.error = "; ".join(fail_reasons) or "读写失败, 原因未捕获"
+            # ⚠️ **2026-11-12**: 兜底那句以前是「读写失败, 原因未捕获」——
+            #   「未捕获」对工人等于「工具坏了」, 他既不知道测的是什么, 也不知道
+            #   下一步做什么。改成说清: 这一项**测的是 U 盘**、**常见原因**、
+            #   **下一步做什么**。
+            result.error = ("; ".join(fail_reasons) or
+                            "U 盘读写测试没通过 —— 但**没记录到具体原因**"
+                            "(fio 的原始报错在本项日志里)。常见原因: U 盘"
+                            "接触不良 / 盘已掉 / 盘本身报坏块。请换个 USB 口"
+                            "或换根盘重测; 换盘还好 ⇒ 这根盘不合格。")
         return result

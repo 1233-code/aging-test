@@ -8,7 +8,8 @@ from typing import Optional
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import (find_tool, run_cmd, is_root, run_proc_with_wallclock,
                      with_sudo, kill_proc, sudo_hint_if_unavailable,
-                     TtyDemangler, deps_fix_hint)
+                     TtyDemangler, deps_fix_hint, tool_missing_reason,
+                     humanize_exception, tool_exit_reason)
 
 # memtester 的**原始**行可能非常长: 它的进度是原地重绘的, "Random Value"
 # 那一项画的是 -\|/ 转轮, 一行能塞几万字符 (见下面 read 循环的说明)。
@@ -114,10 +115,9 @@ class MemoryTest(TestCase):
         tool = find_tool("memtester")
         if not tool:
             result.status = "error"
-            result.error = (
-                "未找到 memtester (PATH 不含 /sbin, 或未装). "
-                f"解决: {deps_fix_hint()}"
-            )
+            result.error = tool_missing_reason(
+                "memtester", deps_fix_hint(),
+                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具")
             await ctx.on_log(f"[内存] ✗ {result.error}")
             return result
         await ctx.on_log(f"[内存] 工具: {tool}")
@@ -344,9 +344,17 @@ class MemoryTest(TestCase):
                         # 不 break, 继续到下面的 ok_count 统计
                     else:
                         await ctx.on_log(f"[内存] ❌ memtester 返回 {rc} (跑了 {elapsed:.0f}s)")
-                        result.error = (
-                            f"memtester 退出码 {rc} (跑了 {elapsed:.0f}s, 未跑满挂钟)"
-                        )
+                        # ⚠️ **2026-11-12**: 以前只有一句「退出码 N」——
+                        #   对工人是天书(他不知道 137 是什么意思)⇒ 现在把退出码
+                        #   **翻译成人话**, 并说清「跑满了没有」「接下来查什么」。
+                        result.error = tool_exit_reason(
+                            rc, tool="memtester",
+                            stage=f"第 {round_idx}/{times} 轮 (跑了 {elapsed:.0f}s)",
+                            log_tail=result.log,
+                            extra=("这一轮**没跑满挂钟**(上限 "
+                                   f"{timeout_sec}s)就退了 ⇒ 按 §6.10 判"
+                                   "**不合格**。⚠️ 退出码不等于板子坏了 —— "
+                                   "先看下面这行原始输出, 再决定返修还是复测。"))
                         result.status = "failed"
                         all_passed = False
                         break
@@ -425,13 +433,17 @@ class MemoryTest(TestCase):
                     round_sec_est = sum(measured_rounds) / len(measured_rounds)
                 await _report(round_idx, 0.0, f"第 {round_idx}/{times} 轮完成")
 
-            except FileNotFoundError:
+            except FileNotFoundError as e:
                 result.status = "error"
-                result.error = "未找到 memtester (PATH 问题)"
+                result.error = tool_missing_reason(
+                    "memtester", deps_fix_hint(),
+                    note="PATH 不含 /sbin, 或这台机器上压根没装这个工具",
+                    detail=str(e))
                 return result
             except Exception as e:
                 result.status = "error"
-                result.error = f"异常: {e!r}"
+                result.error = humanize_exception(
+                    e, item="内存项", stage=f"第 {round_idx}/{times} 轮")
                 return result
 
             result.metrics[f"round_{round_idx}_size_mb"] = size_mb

@@ -37,7 +37,8 @@ from typing import List, Optional, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import (find_tool, find_wifi_iface, with_sudo, kill_proc,
-                     sudo_hint_if_unavailable, deps_fix_hint)
+                     sudo_hint_if_unavailable, deps_fix_hint,
+                     tool_missing_reason)
 
 # §11.3: 精确正则, 不做 substring 匹配。
 # **注意**: 行内空白一律用 `[ \t]` 不用 `\s` —— Python 的 `\s` 包含 \n,
@@ -61,6 +62,19 @@ _RE_SCAN_COMPLETED = re.compile(
     r"^[ \t]*scan[ \t]+completed[ \t]*$", re.MULTILINE | re.IGNORECASE
 )
 _RE_BSS_HEADER = re.compile(r"^BSS[ \t]+[0-9a-f]{2}(?::[0-9a-f]{2}){5}", re.MULTILINE)
+
+# §6.4 的**四步**分别是什么 —— 报失败原因时**把这一步在测什么写出来**。
+#
+# ⚠️ **2026-11-12 补**: 以前的原因只有「第 N 步失败」—— 「第 N 步」对
+#   **普通工人是天书**(他不知道这四步分别是干什么的, 也不知道是哪一环坏了)
+#   ⇒ 现在报的是「第 N 步失败 —— <这一步在测什么>: <具体现象>」。
+#   ⚠️ 步号**跟 §6.4 的表格一一对应**, 别改。
+_WIFI_STEP_NAMES = {
+    1: "① 软件开关响应(`ip link set … down` → `… up`, 看驱动认不认这两句命令)",
+    2: "② 状态确认(轮询 `ip link show`, 等管理状态变成 UP)",
+    3: "③ 射频检查(`rfkill list wifi`, 看射频有没有被软/硬屏蔽)",
+    4: "④ 扫描执行(`iw dev … scan`, 看射频通路能不能真的完成一次扫描)",
+}
 _RE_RESULTS = re.compile(r"^[ \t]*Results:[ \t]*$", re.MULTILINE)
 # 每条 BSS 的 SSID 行 —— 缩进后跟 "SSID: xxx"
 _RE_SSID_LINE = re.compile(r"^[ \t]+SSID:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
@@ -468,10 +482,9 @@ class WiFiTest(TestCase):
                                  ("iw", iw_bin)) if not b]
         if missing:
             result.status = "error"
-            result.error = (
-                f"未找到: {', '.join(missing)}. 解决: {deps_fix_hint()} "
-                "(见 docs/需求设计.md §11.7)"
-            )
+            result.error = tool_missing_reason(
+                "、".join(missing), deps_fix_hint(),
+                note="PATH 不含 /sbin, 或这台机器上压根没装这些工具")
             await ctx.on_log(f"[WiFi] ✗ {result.error}")
             return result
 
@@ -502,7 +515,12 @@ class WiFiTest(TestCase):
             result.status = "failed"
             result.metrics["step_failed"] = step
             result.metrics["step_failed_reason"] = reason[:400]
-            result.error = f"第 {step} 步失败: {reason[:300]}"
+            # ⚠️ **2026-11-12**: 以前只写「第 3 步失败」—— **「第 3 步」对
+            #   工人是天书**(他不知道这四步分别是干什么的)⇒ 现在把**这一步
+            #   到底在测什么**写在前面, 报告上不用再翻文档就知道是哪一环坏了。
+            result.error = (f"第 {step} 步失败 —— "
+                            f"{_WIFI_STEP_NAMES.get(step, '未知步骤')}: "
+                            f"{reason[:300]}")
             await ctx.on_log(f"[WiFi] ❌ {result.error}")
 
         async def skip_because(reason_code: str, reason: str):

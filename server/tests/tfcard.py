@@ -42,6 +42,10 @@ from ._tools import (
     sudo_hint_if_unavailable,
     sudo_nopasswd_hint,
     with_sudo,
+    deps_fix_hint,
+    tool_missing_reason,
+    humanize_exception,
+    ToolMissing,
 )
 from .emmc import _run_fio_test
 
@@ -547,18 +551,31 @@ class TFCardTest(TestCase):
         except DeviceUnresponsive as e:
             # 卡对读写没应答 = **这张卡卡死了** → failed(不合格, 换一张)
             result.status = "failed"
-            result.error = f"TF 卡无响应: {e} —— 这张卡不合格, 请换一张"
+            result.error = (
+                f"TF 卡**无响应**(对读写没有应答, 卡卡住了) —— 这一项**没测完**, "
+                f"但这张卡**不合格**, 请换一张。具体经过: {e}"
+            )
             await ctx.on_log(f"[TF] ❌ {result.error}")
             await ctx.on_progress(100, "卡无响应")
             return result
-        except FileNotFoundError:
+        except ToolMissing as e:
+            # 「fio 压根没装」—— 原因**已经写好了**, 直接拿来用。
             result.status = "error"
-            result.error = "未安装 fio"
+            result.error = e.reason
+            await ctx.on_progress(100, "缺 fio")
+            return result
+        except FileNotFoundError as e:
+            result.status = "error"
+            result.error = tool_missing_reason(
+                "fio", deps_fix_hint(),
+                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具",
+                detail=str(e))
             await ctx.on_progress(100, "缺 fio")
             return result
         except Exception as e:
             result.status = "error"
-            result.error = f"异常: {e!r}"
+            result.error = humanize_exception(
+                e, item="TF 卡项", stage="读写测试")
             await ctx.on_progress(100, "异常")
             return result
         finally:
@@ -572,8 +589,14 @@ class TFCardTest(TestCase):
             result.status = "failed"
             # ⚠️ **判不合格必须带上原因** —— 否则报告里这一项只有「failed」
             #    两个字, 错误栏是空的 ⇒ 工人无从判断是卡慢还是卡坏。
-            result.error = ("；".join(fail_reasons)
-                            or "TF 卡测试没通过(详见本项日志)")
+            # ⚠️ **2026-11-12**: 兜底那句以前是「详见本项日志」—— 那等于
+            #    把问题**踢回给工人**让他自己翻日志。改成: 说清这一项**测的
+            #    是什么**、**常见原因**、**下一步做什么**。
+            result.error = ("；".join(fail_reasons) or
+                            "TF 卡读写测试没通过 —— 但**没记录到具体原因**"
+                            "(fio 的原始报错在本项日志里)。常见原因: 卡接触"
+                            "不良 / 卡本身坏了 / 读速度低于门槛。"
+                            "请拔插一次 TF 卡重测; 换一张卡还好 ⇒ 这张卡不合格。")
 
         await ctx.on_progress(100, "完成")
         return result

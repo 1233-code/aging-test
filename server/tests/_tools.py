@@ -316,6 +316,166 @@ def deps_fix_hint() -> str:
     return "请运行 sudo bash scripts/install_deps.sh"
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ── 失败原因: 全仓**唯一**的口径 (§9.3) ──
+# ══════════════════════════════════════════════════════════════════════
+#
+# ⚠️ **为什么集中在这里**(2026-11-12 全量排查):
+#   「失败原因」这句话以前散在八个测试项里, 一共四种写法 ——
+#     「未安装 fio」 —— 没给补救办法, 工人不知道该做什么;
+#     「未找到 X. 解决: sudo apt install …」 —— 补救办法**在 U 盘版上是死的**
+#       (产线网络取不到公网, 盘上也没有那个脚本);
+#     「第 3 步失败: …」 —— 「第 3 步」对工人是**天书**;
+#     「异常: RuntimeError('炸了')」 —— **普通工人看不懂**, 只能去翻日志,
+#       翻日志也不会更快。
+#   而且还有一条**压根没写原因**的 ⇒ 报告上只能印
+#   「(未记录原因 —— 属实现缺陷: failed/error 必须写 error 字段)」。
+#
+#   ⇒ 下面这几个函数是**唯一的口径来源**。每一句都必须讲清四件事:
+#     **哪一项 / 出了什么事 / 是不是板子的锅 / 工人下一步做什么**。
+#   ⇒ 新增测试项时**不许自己另写一句** —— 走这几个函数。
+
+
+class ToolMissing(FileNotFoundError):
+    """缺工具 —— 带着一句**已经写好的人话**。
+
+    ⚠️ **继承 FileNotFoundError**: 存储类测试项(eMMC / TF / USB)一直靠
+       `except FileNotFoundError` 区分「工具没装」, 继承它就**不用改那条
+       捕获链**; 而真正的原因放在 `.reason` 里 ⇒ 捕获方**直接拿来用**,
+       不用再拼一遍(以前那一拼就拼出了「未安装 fio」这种没头没尾的半句话)。
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def tool_missing_reason(tools: str, hint: str, *, note: str = "",
+                        detail: str = "") -> str:
+    """缺工具 / 工具起不来 —— **这一项没测成**, 不是「板子不合格」。
+
+    ⚠️ §9.3 的口径: 工具缺失 ⇒ 该项判 `error`(这一项没测成),
+       **不是** `failed`(被测设备不合格)⇒ 所以**第一句就要讲清这一点** ——
+       「工具没装」跟「板子坏了」是两回事, 混起来就是把好板子送去返修
+       (「误杀好板 > 漏判边缘板」)。
+
+    `hint` 传 `deps_fix_hint()` —— **按形态分开说**(U 盘版跟设备版的补救
+    办法**不是同一条**, U 盘版那条在产线上是**死的**, 见 `deps_fix_hint`)。
+    ⚠️ **必须显式传** —— 忘了传就 TypeError, 而不是悄悄给出一条死命令。
+    """
+    parts = [
+        f"未找到 {tools} —— **这一项没测成**(工具没装 / 没带齐, 跟被测设备"
+        f"本身无关, **不是「板子不合格」**)。",
+    ]
+    if note:
+        parts.append(f"常见原因: {note}。")
+    if detail:
+        parts.append(f"(原始信息: {detail})")
+    parts.append(f"怎么办: {hint}")
+    return "".join(parts)
+
+
+# 异常类型 → **人话**(不是 Python 的类名)
+_EXC_PLAIN = {
+    "FileNotFoundError": "要用的程序 / 文件**不存在**",
+    "PermissionError": "**权限不够**(读 / 写被系统拒绝了)",
+    "TimeoutError": "**超时**了 —— 等太久没等到",
+    "ConnectionResetError": "连接被**掐断**了",
+    "BrokenPipeError": "管道被**掐断**了(对面先退出了)",
+    "MemoryError": "**内存不够** —— 测试程序自己被系统掐了",
+    "ValueError": "拿到的数据**不对**(格式对不上)",
+    "TypeError": "数据类型**不对**",
+    "KeyError": "要找的字段**不存在**",
+    "IndexError": "要取的位置**超出了范围**",
+    "ZeroDivisionError": "算的时候**除以了 0**",
+    "RuntimeError": "测试程序**自己报错退出了**",
+    "OSError": "系统调用**失败**了",
+}
+
+
+def humanize_exception(exc: BaseException, *, item: str = "", stage: str = "",
+                       extra: str = "") -> str:
+    """把一个「没头没脑的异常」翻成人话 —— **但把原文留在最后**。
+
+    ⚠️ **为什么**: 以前各处都是 `f"异常: {e!r}"` ⇒ 报告上就一句
+       `异常: PermissionError(13, 'Permission denied')` ⇒ **普通工人看不懂**
+       ⇒ 只能去翻日志 ⇒ 翻日志也不会更快。
+
+    ⇒ 这一句要说清:
+      · **哪一项 / 哪一步**出的问题;
+      · **是什么性质**的问题(不是「板子坏了」);
+      · **原始信息是什么**(给排障的人看, 但不是让工人去读它)。
+
+    ⚠️ **不带 `str(e)` 的完整 repr** —— 原始信息**截断到 200 字**:
+       有些异常的 repr 能有好几 KB, 塞进报告的「原因框」会把真正要看的
+       那句话挤出去。
+    """
+    name = type(exc).__name__
+    plain = _EXC_PLAIN.get(name)
+    if plain is None:
+        errno = getattr(exc, "errno", None)
+        if errno:
+            plain = f"系统调用失败(错误码 {errno})"
+        else:
+            plain = "出了没预料到的错误"
+    where = item or ""
+    if stage:
+        where += ("" if not where else "在") + f"「{stage}」这一步"
+    head = f"{where}出了意外问题: {plain}" if where else f"出了意外问题: {plain}"
+    msg = (f"{head} —— 这一项**没测成**, "
+           f"**不代表被测设备不合格**(§9.3: 没测成 ≠ 不合格)。")
+    if extra:
+        msg += f" {extra}"
+    raw = f"{name}: {exc}".strip()
+    if len(raw) > 200:
+        raw = raw[:200] + "…"
+    msg += f" 原始信息: {raw}"
+    return msg
+
+
+# 退出码 → **人话**。这些码是 GNU coreutils / shell 的约定, 对工人是天书。
+_RC_MEANING = {
+    1: "工具自己报错退出(最常见是参数不对, 或工具报了自己的错)",
+    2: "用法错 —— 命令参数 / 选项不对",
+    3: "工具的内部错误",
+    124: "被 `timeout` **到点杀掉** —— 这一项没跑完",
+    126: "命令找到了但**不能执行**(权限不对 / 不是可执行文件)",
+    127: "命令**找不到**(或缺它依赖的 .so ⇒ 换台板子就起不来)",
+    130: "被 **SIGINT** 中断",
+    137: "被 **SIGKILL** 杀掉(常见于**内存不够, 被 OOM killer 干掉**)",
+    143: "被 **SIGTERM** 终止",
+}
+
+
+def rc_meaning(rc: int) -> str:
+    """退出码 → **人话**(单独拎出来, 方便别处拼句子时用)。"""
+    return _RC_MEANING.get(rc, "工具自己报错退出(退出码不在常见那几种里)")
+
+
+def tool_exit_reason(rc: int, *, tool: str, stage: str = "",
+                     log_tail: str = "", extra: str = "") -> str:
+    """工具跑完了但**退出码不是 0** —— 说清「这个码什么意思 / 接下来查什么」。
+
+    ⚠️ **退出码对工人是天书** —— 「rc=137」没人知道是什么意思。这里把常见
+       那几种**翻译成人话**, 并把原始输出的尾巴附在后面(给排障的人看)。
+
+    ⚠️ **不替你下结论** —— 「这一项算不合格还是算没测成」由调用方按各自
+       的口径写进 `extra`(不同的项口径不一样: 内存项的 timeout 家族是
+       **预期**行为, eMMC 的 124 是**设备没应答**)。
+    """
+    meaning = rc_meaning(rc)
+    where = f"「{stage}」这一步" if stage else "运行过程中"
+    parts = [f"{tool} 在{where}退出码 {rc} —— {meaning}。"]
+    if extra:
+        parts.append(extra)
+    tail = (log_tail or "").strip()
+    if tail:
+        if len(tail) > 300:
+            tail = tail[-300:]
+        parts.append("原始输出(最后几行): " + tail)
+    return "".join(parts)
+
+
 # ── 进程超时管理 (避免 rc=-15 误判) ──
 async def run_proc_with_wallclock(
     cmd: List[str],
@@ -693,7 +853,7 @@ async def kill_proc(proc: Optional[asyncio.subprocess.Process],
                          f"自行收尾, 本次不等它")
         return False
     except Exception as e:
-        await _note(ctx, f"[进程] 终止 {proc.pid} 异常: {e!r}")
+        await _note(ctx, f"[进程] 终止 {proc.pid} 异常: {e}")
         return False
     try:
         await asyncio.wait_for(proc.wait(), wait_sec)

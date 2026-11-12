@@ -772,6 +772,10 @@ class _ProcOut:
     rc = 0
     text = "fake stress-ng output"
     killed = False
+    # ⚠️ **2026-11-12 加**: `ProcOutcome` 有这个字段(「为什么停下来」:
+    #   "" / "cancelled" / "hard_limit"), CPU 项用它写「没跑完」的原因 ⇒
+    #   假的也得有, 不然生产代码一取就 AttributeError。
+    reason = ""
 
 
 # 每一片真的发出去的命令 —— 用来验「封顶值调小 ⇒ 真的按小的压」

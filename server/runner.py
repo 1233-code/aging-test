@@ -10,7 +10,8 @@ from .tests.base import (
 )
 from .tests.registry import get_all_tests
 from .tests._tools import (is_sudo_not_allowed_error, is_sudo_password_error,
-                           sudo_not_allowed_hint, sudo_nopasswd_hint)
+                           sudo_not_allowed_hint, sudo_nopasswd_hint,
+                           humanize_exception)
 from .db import Database, decide_run_status
 from .config import Config
 from . import identity, report
@@ -678,7 +679,12 @@ class TestRunner:
             result = TestResult(status="stopped", error=str(e) or "用户中途停止")
             self.results[name] = result
         except Exception as e:
-            result = TestResult(status="error", error=f"异常: {e!r}")
+            # ⚠️ **2026-11-12**: 以前是 `f"异常: {e!r}"` —— 报告上就一句
+            #   `异常: RuntimeError('炸了')` ⇒ **普通工人看不懂**, 只能去翻
+            #   日志。现在翻成人话, 并把原始信息留在最后。
+            result = TestResult(
+                status="error",
+                error=humanize_exception(e, item=f"「{name}」这一项"))
             self.results[name] = result
         finally:
             self._current_instance = None
@@ -702,6 +708,20 @@ class TestRunner:
                 result.error = ("用户中止整轮测试, 本项未执行" if by_stop
                                 else "用户跳过此项, 直接进入下一项")
                 self.results[name] = result
+
+        # ── **兜底**: 「没跑完 / 没测」但**一个字的原因都没有** ──
+        #
+        # ⚠️ 报告的「未测项明细」表对没写原因的项会印「(未记录原因)」⇒
+        #   工人看到的是一句没头没尾的「已停止 / 未测」⇒ 不知道是自己按了
+        #   停止, 还是这一项卡住了、还是**根本没去测**。
+        # ⇒ 这里**统一补一句**。各测试项自己写好的原因**不会被覆盖**
+        #   (这一段只补空的)。
+        if result.status in ("stopped", "skipped") and not result.error:
+            result.error = (
+                "这一项**没跑完 / 没测成** —— 关于被测设备**还没有任何结论**。"
+                "没跑完 ≠ 不合格: 补上料 / 复位之后可以重测这一项。"
+            )
+            self.results[name] = result
 
         # 日志以**runner 留档的这份**为准。
         #

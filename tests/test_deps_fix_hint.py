@@ -33,8 +33,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.tests import _tools                     # noqa: E402
 from server.tests import cpu as cpu_mod             # noqa: E402
+from server.tests import emmc as emmc_mod           # noqa: E402
 from server.tests import ethernet as eth_mod        # noqa: E402
+from server.tests import gpu as gpu_mod             # noqa: E402
 from server.tests import memory as mem_mod          # noqa: E402
+from server.tests import tfcard as tfcard_mod       # noqa: E402
+from server.tests import usb as usb_mod             # noqa: E402
 from server.tests import wifi as wifi_mod           # noqa: E402
 from server.tests.base import TestContext           # noqa: E402
 from tests._tmp import mkdtemp                      # noqa: E402
@@ -211,13 +215,21 @@ for rel in ("scripts/check_deps.sh", "scripts/check_eth.sh"):
           (sh_text, usb_hint))
 
 # ══════════════════════════════════════════════════════════════════════
-section("【2】四个测试项**不再写死**那条命令(静态)")
+section("【2】所有会报「缺工具」的测试项**不再写死**那条命令(静态)")
 
+# ⚠️ **2026-11-12 扩到八个**: 以前只有 cpu / 内存 / 网口 / WiFi 四项,
+#   后来 eMMC / TF / USB / GPU 四项的「缺工具」也改走了
+#   `tool_missing_reason(..., deps_fix_hint(), ...)` ⇒ 一并纳入这份看护,
+#   免得哪天某一项又自己抄一句命令。
 FOUR = [
     ("cpu", cpu_mod, os.path.join(REPO, "server", "tests", "cpu.py")),
     ("memory", mem_mod, os.path.join(REPO, "server", "tests", "memory.py")),
     ("ethernet", eth_mod, os.path.join(REPO, "server", "tests", "ethernet.py")),
     ("wifi", wifi_mod, os.path.join(REPO, "server", "tests", "wifi.py")),
+    ("emmc", emmc_mod, os.path.join(REPO, "server", "tests", "emmc.py")),
+    ("tfcard", tfcard_mod, os.path.join(REPO, "server", "tests", "tfcard.py")),
+    ("usb", usb_mod, os.path.join(REPO, "server", "tests", "usb.py")),
+    ("gpu", gpu_mod, os.path.join(REPO, "server", "tests", "gpu.py")),
 ]
 for name, mod, path in FOUR:
     with open(path, encoding="utf-8") as f:

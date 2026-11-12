@@ -73,26 +73,34 @@ MUTATIONS = [
     # ── ② 四个测试项: 有一个偷偷写死就红 ──────────────────────────────
     (
         "server/tests/cpu.py",
-        '"error": f"未安装 stress-ng,{deps_fix_hint()}"',
-        '"error": "未安装 stress-ng,sudo bash scripts/install_deps.sh"',
+        '                "stress-ng", deps_fix_hint(),\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具")',
+        '                "stress-ng", "sudo bash scripts/install_deps.sh",\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具")',
         "cpu 项**写死**那条命令(U 盘版上=dead 的补救办法)",
     ),
     (
         "server/tests/memory.py",
-        '                f"解决: {deps_fix_hint()}"',
-        '                "解决: sudo bash scripts/install_deps.sh"',
+        '                "memtester", deps_fix_hint(),\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具")',
+        '                "memtester", "sudo bash scripts/install_deps.sh",\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具")',
         "内存项**写死**那条命令",
     ),
     (
         "server/tests/ethernet.py",
-        '                f"未找到: {\', \'.join(missing)}. 解决: {deps_fix_hint()} "',
-        '                f"未找到: {\', \'.join(missing)}. 解决: sudo bash scripts/install_deps.sh "',
+        '                "、".join(missing), deps_fix_hint(),\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这些工具"',
+        '                "、".join(missing), "sudo bash scripts/install_deps.sh",\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这些工具"',
         "网口项**写死**那条命令",
     ),
     (
         "server/tests/wifi.py",
-        '                f"未找到: {\', \'.join(missing)}. 解决: {deps_fix_hint()} "',
-        '                f"未找到: {\', \'.join(missing)}. 解决: sudo bash scripts/install_deps.sh "',
+        '                "、".join(missing), deps_fix_hint(),\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这些工具")',
+        '                "、".join(missing), "sudo bash scripts/install_deps.sh",\n'
+        '                note="PATH 不含 /sbin, 或这台机器上压根没装这些工具")',
         "WiFi 项**写死**那条命令",
     ),
     # ── ③ 诊断脚本 check_deps.sh ───────────────────────────────────────

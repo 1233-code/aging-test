@@ -8,7 +8,7 @@ from typing import Optional
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import (
     find_tool, with_sudo, sudo_hint_if_unavailable, run_proc_with_progress,
-    deps_fix_hint,
+    deps_fix_hint, tool_missing_reason, humanize_exception, tool_exit_reason,
 )
 from ..boot_evidence import cpu_evidence_path, current_boot_id
 
@@ -937,6 +937,27 @@ async def _spawn_proc(cmd):
     )
 
 
+def _slice_stopped_reason(reason: str, label: str) -> str:
+    """一片加压**没跑完**(被中止)—— 说清是**谁**叫停的。
+
+    ⚠️ **2026-11-12 补**: 以前这条只置 `status = "stopped"`, **一个字的原因
+    都不写** ⇒ 报告的「未测项明细」里只剩一个光秃秃的「stopped」
+    (模板兜底印「(未记录原因)」)⇒ 工人不知道是自己按了停止, 还是工具卡住了。
+
+    ⚠️ 两种「停下来」性质完全不同, **不许混成一句**:
+      · `cancelled`  —— **工人自己**按了「停止」⇒ 没跑完 ≠ 不合格;
+      · `hard_limit` —— **我们自己的硬上限**到了(挂钟上限 + 30s)⇒ 工具/环境
+        没让这一项跑完, 同样**不是**板子的结论。
+    """
+    if reason == "cancelled":
+        return (f"加压被中止 —— 工人中途按了「停止」, 这一项没跑完"
+                f"({label})。没跑完 ≠ 不合格, 补上料/复位之后可以重测。")
+    if reason == "hard_limit":
+        return (f"加压跑到了我们自己的硬上限还没结束, 这一项被收掉了"
+                f"({label})。这一项**没测成** —— 不是「板子不合格」。")
+    return (f"加压被中止, 这一项没跑完({label})。没跑完 ≠ 不合格, 可以重测。")
+
+
 @register
 class CPUTest(TestCase):
     name = "cpu"
@@ -1054,10 +1075,9 @@ class CPUTest(TestCase):
         stress_bin = find_tool("stress-ng")
         if not stress_bin:
             result.status = "error"
-            result.error = (
-                "未找到 stress-ng. 解决: sudo apt install stress-ng "
-                "(见 docs/需求设计.md §11.7 打包必装清单)"
-            )
+            result.error = tool_missing_reason(
+                "stress-ng", deps_fix_hint(),
+                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具")
             await ctx.on_log(f"[CPU] ✗ {result.error}")
             evidence.close()
             return result
@@ -1238,10 +1258,27 @@ class CPUTest(TestCase):
                     # 不用裸 terminate/kill —— 子进程是 sudo 起的 root 进程,
                     # 普通用户对它发信号必然 EPERM。见 kill_proc。
                     result.status = "stopped"
+                    result.error = _slice_stopped_reason(out.get("reason", ""),
+                                                        label)
                     all_passed = False
                     break
                 if round_rc != 0:
+                    # ⚠️ **2026-11-12 补**: 以前这里**只打了一行日志**, `result.error`
+                    #   是空的 ⇒ 落到下面的 `result.status = "failed"` ⇒ 报告上
+                    #   这一项是「不合格」+ **一个原因都没有**(报告模板只能印
+                    #   「(未记录原因 —— 属实现缺陷)」)⇒ 工人看到「CPU 不合格」
+                    #   却不知道是**板子扛不住**还是**工具自己挂了**。
+                    #   ⇒ 现在把**退出码翻译成人话**写进原因框, 并把原始输出
+                    #   的尾巴附上(排障的人要看那几行)。
+                    result.error = tool_exit_reason(
+                        round_rc, tool="stress-ng", stage=label,
+                        log_tail=round_text,
+                        extra=("这一轮加压**没跑完** ⇒ 按 §6.2「通过 = 退出码 0 "
+                               "且峰值温度 ≤ 判定线」, 这一项**判不合格**。"
+                               "⚠️ 退出码不等于板子坏了 —— 请先看下面这行原始"
+                               "输出, 再决定是返修还是重测。"))
                     await ctx.on_log(f"[CPU] ❌ stress-ng 返回非 0: {round_rc}")
+                    await ctx.on_log(f"[CPU] ❌ {result.error}")
                     all_passed = False
                     break
 
@@ -1338,8 +1375,12 @@ class CPUTest(TestCase):
             #    或者 stress-ng 自己挂了(status=error), 那才是那次跑的原因 ——
             #    别拿温度把它盖掉(半路停的峰值不作数)。
             result.status = "failed"
+            # ⚠️ **2026-11-12**: 前面可能**已经写过原因**(stress-ng 退出码
+            #   非 0 那条)⇒ 这里**追加**而不是覆盖 —— 两个都是真的事实,
+            #   盖掉一个就等于少告诉工人一件事。
             result.error = (
-                f"CPU 压力超温 —— 峰值 {peak_temp}°C > 判定线 {max_temp}°C"
+                ((result.error + " / ") if result.error else "")
+                + f"CPU 压力超温 —— 峰值 {peak_temp}°C > 判定线 {max_temp}°C"
                 f"(收手线 {abort_temp}°C)。"
                 f"板子没崩, 但散热扛不住满载"
             )
@@ -1349,6 +1390,15 @@ class CPUTest(TestCase):
             result.status = "passed"
         elif result.status == "pending":
             result.status = "failed"
+            # ⚠️ **2026-11-12 兜底**: 走到这里 = 「这一项没通过, 但前面那些
+            #   分支都没写原因」。**没有原因 = 报告上印「(未记录原因 —— 属实现
+            #   缺陷)」** ⇒ 工人只看到「不合格」两个字, 不知道该查什么。
+            #   ⇒ 这里补一句兜底的话; **前面已经写过原因就不覆盖**。
+            result.error = result.error or (
+                "CPU 压力测试没通过 —— 但**没记录到具体原因**(stress-ng 的"
+                "原始输出在本项日志里)。常见原因: 加压中途 stress-ng 自己退出"
+                "了 / 达到了温度收手线。请看本项日志, 再决定复测还是返修。"
+            )
 
         await ctx.on_progress(100, "完成")
         evidence.close()
@@ -1394,11 +1444,15 @@ class CPUTest(TestCase):
             proc = await _spawn_proc(cmd)
         except FileNotFoundError:
             return {"rc": -1, "text": "", "killed": False, "peak_temp": 0.0,
-                    "temp": None,
-                    "error": f"未安装 stress-ng,{deps_fix_hint()}"}
+                    "temp": None, "reason": "",
+                    "error": tool_missing_reason(
+                        "stress-ng", deps_fix_hint(),
+                        note="PATH 不含 /sbin, 或这台机器上压根没装这个工具")}
         except Exception as e:
             return {"rc": -1, "text": "", "killed": False, "peak_temp": 0.0,
-                    "temp": None, "error": f"异常: {e!r}"}
+                    "temp": None, "reason": "",
+                    "error": humanize_exception(
+                        e, item="CPU 压力项", stage="起 stress-ng 子进程")}
 
         async def tick(e: float):
             """按挂钟驱动进度与温度采样 —— **不看 stress-ng 吐不吐行**。
@@ -1460,7 +1514,11 @@ class CPUTest(TestCase):
             if temp is not None and temp > slice_peak:
                 slice_peak = temp
         return {"rc": out.rc, "text": out.text, "killed": out.killed,
-                "peak_temp": slice_peak, "temp": temp, "error": None}
+                "peak_temp": slice_peak, "temp": temp, "error": None,
+                # ⚠️ 用 getattr 而不是 out.reason —— 回归测试把
+                #    `run_proc_with_progress` 换成了假的, 那个假的**不一定**
+                #    带 reason 字段 ⇒ 直接取属性会 AttributeError。
+                "reason": getattr(out, "reason", "")}
 
 
 def _read_cpu_stat() -> Optional[tuple]:

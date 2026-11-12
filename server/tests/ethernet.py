@@ -33,7 +33,7 @@ from .base import (
     TestCase, TestContext, TestResult, register, OPERATOR_WAIT_SHORT_SEC,
 )
 from ._tools import (find_tool, with_sudo, kill_proc, sudo_hint_if_unavailable,
-                     deps_fix_hint)
+                     deps_fix_hint, tool_missing_reason, tool_exit_reason)
 
 # §11.3: 用精确正则而非 substring 模糊匹配 —— 宽松 in 匹配会被无关文本骗到
 _RE_LINK = re.compile(r"^\s*Link detected:\s*(yes|no)\s*$", re.MULTILINE)
@@ -265,7 +265,7 @@ class EthTest(TestCase):
                     f"[网口] ⚠ 收尾: 静态兜底地址 {addr.split('/')[0]} 删不掉"
                     f"(rc={rc})—— 手工查一下 {iface}")
         except Exception as e:
-            await ctx.on_log(f"[网口] ⚠ 收尾: 删静态地址时出错(不影响结论): {e!r}")
+            await ctx.on_log(f"[网口] ⚠ 收尾: 删静态地址时出错(不影响结论): {e}")
 
     async def _run_once_inner(self, ctx: TestContext) -> TestResult:
         result = TestResult()
@@ -289,10 +289,10 @@ class EthTest(TestCase):
                                  ("udhcpc", udhcpc_bin), ("ping", ping_bin)) if not b]
         if missing:
             result.status = "error"
-            result.error = (
-                f"未找到: {', '.join(missing)}. 解决: {deps_fix_hint()} "
-                "(见 docs/需求设计.md §11.7 —— udhcpc 由 busybox 提供, 不依赖镜像自带)"
-            )
+            result.error = tool_missing_reason(
+                "、".join(missing), deps_fix_hint(),
+                note="PATH 不含 /sbin, 或这台机器上压根没装这些工具"
+                     "(udhcpc 由 busybox 提供, 不依赖镜像自带)")
             await ctx.on_log(f"[网口] ✗ {result.error}")
             return result
         await ctx.on_log(
@@ -311,7 +311,15 @@ class EthTest(TestCase):
         rc, text = await self._run(with_sudo([ethtool_bin, iface]), 10)
         if rc != 0:
             result.status = "error"
-            result.error = f"ethtool 执行失败 rc={rc}: {text.strip()[:300]}"
+            # ⚠️ **2026-11-12**: 以前是「ethtool 执行失败 rc=1: <原始输出>」——
+            #   对工人是天书(退出码 + 一段英文)。现在把退出码**翻译成人话**,
+            #   把原始输出放到最后当细节。
+            result.error = tool_exit_reason(
+                rc, tool="ethtool", stage=f"读 {iface} 的链路状态",
+                log_tail=text,
+                extra=("这一项**没测成**, 板子本身还没结论 —— 链路检测这一步"
+                       "没跑起来。常见原因: 网卡没被内核认出来 / ethtool 与这"
+                       "块网卡的驱动不认 / 网口名变了。"))
             await ctx.on_log(f"[网口] ✗ {result.error}")
             return result
 
@@ -409,8 +417,9 @@ class EthTest(TestCase):
                 result.metrics["skipped_reason"] = "no_ip"
                 result.status = "skipped"
                 result.error = (
-                    f"DHCP 与静态兜底均无法取 IP —— 工位环境不具备条件, 不判 failed "
-                    f"(静态兜底失败: {text2.strip()[:200]})"
+                    "DHCP 与静态兜底均无法取 IP —— 工位环境不具备条件, "
+                    "不判 failed(这一项**没测成**, 不是板子不合格)。"
+                    f"静态兜底失败的原因: {text2.strip()[:200] or '(没有输出)'}"
                 )
                 await ctx.on_log(f"[网口] ⏭ {result.error}")
                 await ctx.on_progress(100, "环境不具备取 IP 条件")

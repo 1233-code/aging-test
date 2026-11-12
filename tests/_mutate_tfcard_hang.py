@@ -41,15 +41,21 @@ MUTATIONS = [
     (
         "server/tests/tfcard.py",
         '            result.status = "failed"\n'
-        '            result.error = f"TF 卡无响应: {e} —— 这张卡不合格, 请换一张"',
+        '            result.error = (\n'
+        '                f"TF 卡**无响应**(对读写没有应答, 卡卡住了) —— 这一项**没测完**, "\n'
+        '                f"但这张卡**不合格**, 请换一张。具体经过: {e}"\n'
+        '            )',
         '            result.status = "error"\n'
-        '            result.error = f"TF 卡无响应: {e} —— 这张卡不合格, 请换一张"',
+        '            result.error = (\n'
+        '                f"TF 卡**无响应**(对读写没有应答, 卡卡住了) —— 这一项**没测完**, "\n'
+        '                f"但这张卡**不合格**, 请换一张。具体经过: {e}"\n'
+        '            )',
         "TF: 卡没应答被判成 error (设备不合格该判 failed, 该拦下来换卡)",
     ),
     (
         "server/tests/tfcard.py",
-        'result.error = f"TF 卡无响应: {e} —— 这张卡不合格, 请换一张"',
-        'result.error = f"TF 卡异常: {e} —— 这张卡不合格, 请换一张"',
+        'f"TF 卡**无响应**(对读写没有应答, 卡卡住了) —— 这一项**没测完**, "',
+        'f"TF 卡异常(卡卡住了) —— 这一项**没测完**, "',
         "TF: 报错里不说「无响应」(工人分不清是卡的问题还是工具的问题)",
     ),
     (

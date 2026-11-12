@@ -14,6 +14,7 @@ from ._tools import (
     find_tool, with_sudo, sudo_hint_if_unavailable,
     run_proc_with_progress, fio_runtime_args, fio_timeout_sec,
     leftover_fio_pids, remove_file_async, loader_error_message,
+    deps_fix_hint, tool_missing_reason, humanize_exception, ToolMissing,
 )
 
 
@@ -142,9 +143,12 @@ async def _run_fio_test(
     metrics = {}
     fio_bin = find_tool("fio")
     if not fio_bin:
-        raise FileNotFoundError(
-            "fio: 未找到. 解决: sudo apt install fio (见 docs/需求设计.md §11.7)"
-        )
+        # ⚠️ **2026-11-12**: 这条消息以前写死了「sudo apt install fio」——
+        #   **在 U 盘版上那是条死命令**(产线取不到公网, 盘上也没有那个脚本)⇒
+        #   工人照着做只会白跑。统一走 `tool_missing_reason()`。
+        raise ToolMissing(tool_missing_reason(
+            "fio", deps_fix_hint(),
+            note="PATH 不含 /sbin, 或这台机器上压根没装这个工具"))
 
     rt = fio_runtime_args(duration_sec, size_mb)
     tmo = fio_timeout_sec(duration_sec)
@@ -311,16 +315,29 @@ class EMMCTest(TestCase):
         except DeviceUnresponsive as e:
             # 设备对读写没应答 = **设备本身坏了** → failed(不合格, 换板子)
             result.status = "failed"
-            result.error = f"设备无响应: {e}"
+            result.error = (
+                f"eMMC **无响应**(对读写没有应答, 卡在 D 态收不掉) —— 这一项"
+                f"**没测完**, 但被测的存储**不合格**(要返修)。"
+                f"具体经过: {e}"
+            )
             await ctx.on_log(f"[eMMC] ❌ {result.error}")
             return result
-        except FileNotFoundError:
+        except ToolMissing as e:
+            # 「fio 压根没装」—— 原因**已经写好了**, 直接拿来用。
             result.status = "error"
-            result.error = "未安装 fio"
+            result.error = e.reason
+            return result
+        except FileNotFoundError as e:
+            result.status = "error"
+            result.error = tool_missing_reason(
+                "fio", deps_fix_hint(),
+                note="PATH 不含 /sbin, 或这台机器上压根没装这个工具",
+                detail=str(e))
             return result
         except Exception as e:
             result.status = "error"
-            result.error = f"异常: {e!r}"
+            result.error = humanize_exception(
+                e, item="eMMC 项", stage="读写测试")
             return result
         finally:
             # 清理 —— **走子进程**, 绝不在事件循环里直接 os.unlink:

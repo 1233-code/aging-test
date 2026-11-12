@@ -43,8 +43,11 @@ MUTATIONS = [
     ),
     (
         "server/tests/tfcard.py",
-        '            result.error = ("；".join(fail_reasons)\n'
-        '                            or "TF 卡测试没通过(详见本项日志)")',
+        '            result.error = ("；".join(fail_reasons) or\n'
+        '                            "TF 卡读写测试没通过 —— 但**没记录到具体原因**"\n'
+        '                            "(fio 的原始报错在本项日志里)。常见原因: 卡接触"\n'
+        '                            "不良 / 卡本身坏了 / 读速度低于门槛。"\n'
+        '                            "请拔插一次 TF 卡重测; 换一张卡还好 ⇒ 这张卡不合格。")',
         '            result.error = ""',
         "TF: 判了 failed 但**错误栏照样是空的**",
     ),

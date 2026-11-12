@@ -69,7 +69,7 @@ from typing import List, NamedTuple, Optional, Tuple
 
 from .base import TestCase, TestContext, TestResult, register
 from ._tools import (find_tool, kill_proc, run_cmd, sudo_hint_if_unavailable,
-                     with_sudo)
+                     with_sudo, deps_fix_hint, tool_missing_reason)
 from .gpu_benchmarks import (
     BENCHMARKS, build_bench_args, expected_identities, identity as scene_identity,
 )
@@ -856,7 +856,10 @@ async def _probe_x11(display: str, env: dict) -> Tuple[Optional[bool], str]:
         try:
             rc, out, err = await run_cmd(cmd, timeout=12)
         except Exception as e:      # 探测失败不该掀翻整个测试项
-            return False, f"{tool} 探测出错: {e}"
+            return False, (
+                f"{tool} 这个**探测工具自己报错**了 —— 它是**用来判环境的**"
+                f", 判不了**不等于**板子不合格。具体: {e}"
+            )
         if rc == 0:
             return True, f"{tool} 实连成功({display})"
         lines = (err or out).strip().splitlines()
@@ -1230,12 +1233,13 @@ class GPUTest(TestCase):
         )
         if not glmark_bin:
             result.status = "error"
-            result.error = (
-                f"未找到 glmark2 (原因: {why}). 解决: "
-                "sudo apt install glmark2-es2 glmark2-es2-wayland "
-                "(两个变体都装上, 由本测试按当前会话自动选; "
-                "见 docs/需求设计.md §11.7)"
-            )
+            # ⚠️ **2026-11-12**: 以前写死「sudo apt install glmark2-es2
+            #   glmark2-es2-wayland」—— **在 U 盘版上那是条死命令**
+            #   (产线取不到公网)⇒ 统一走 `tool_missing_reason()`。
+            result.error = tool_missing_reason(
+                "glmark2", deps_fix_hint(),
+                note=f"这次没选中的原因: {why}(两个变体 glmark2-es2 / "
+                     "glmark2-es2-wayland 都装上, 由本测试按当前会话自动选)")
             await ctx.on_log(f"[GPU] ✗ {result.error}")
             return result
         result.metrics["glmark_variant"] = variant
