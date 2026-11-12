@@ -310,7 +310,7 @@ class USBTest(TestCase):
                 f"--filename={dev}", "--rw=write",
                 "--output-format=normal",
             ] + rt, timeout_sec=tmo)
-            t0 = time.time()
+            t0 = time.monotonic()
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -326,7 +326,7 @@ class USBTest(TestCase):
                     proc, duration, ctx=ctx, on_tick=tick, hard_limit_sec=tmo + 30,
                 )
                 rc, text, killed = out.rc, out.text, out.killed
-                elapsed = time.time() - t0
+                elapsed = time.monotonic() - t0
                 if killed:
                     await ctx.on_log("[USB] ⚠ 写测试被中断 (取消或超时)")
                     result.status = "stopped"

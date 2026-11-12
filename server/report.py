@@ -280,9 +280,12 @@ def render_html(run: dict, results: list, filename: str = "",
     **捞不到就不画**: 编一段「疑似原因」比没有更糟(会把排查方向带偏)。
 
     `cpu_evidence` 是**加压过程中的逐秒现场记录**(温度/负载/线程数), 由
-    `boot_evidence.read_cpu_evidence(run_id)` 给 —— 空串就不渲染那一节。
-    它跟 `boot_evidence` 是两回事: 前者是**内核视角**(板子死时内核说了什么),
-    后者是**我们自己的视角**(加压到哪一秒、几线程、多少度、负载多少)。
+    `boot_evidence.read_cpu_evidence(run_id)` 给。
+
+    ⚠️ **2026-11-12 用户要求: 报告里不印这一节原始数据**(「这一栏不要,
+    别人也看懂不了」)⇒ 它只用来**算结论**(「板子死在哪一级加压」那节),
+    **不进模板**。原始数据照旧逐行 fsync 落盘 —— 那是判定「板子死在加压
+    途中」的第二条通道, 动不得。
 
     `clock_skew` 是 §9.3.4 的**时钟旁挂文件** —— 这一轮的时间戳是不是
     「推算值」(板子硬复位过, 系统时钟被退回了上次干净关机那一刻)。
@@ -383,27 +386,33 @@ def render_html(run: dict, results: list, filename: str = "",
     #    **分不清**「压根没有这份记录」和「有, 但被硬复位带走了」⇒ 什么
     #    都不说 ⇒ 而这恰恰是最该有证据的一次。
     #
-    # ⇒ 报告里**明写**这一节为什么是空的, 并指向「板子死在哪一级加压」
-    #   那节(它能从上一次启动的日志里读出结论)。
-    cpu_evidence_note = ""
+    # ⚠️ **2026-11-12**: 报告里**不再印**「加压现场记录」那一节**原始
+    #    数据**(用户: 「这一栏不要, 别人也看不懂」)⇒ 原来这一段解释
+    #    「为什么那一节是空的」**没地方放了** ⇒ 折进**上面那节结论** ——
+    #    「读不出死在几线程」这个事实**必须留着**(不说, 读者会以为我们
+    #    没查就写了结论), 但不必再摆一堆原始数据。
+    #
+    # ⇒ 原始数据本身**一个字都没少**: 照旧逐行 fsync 落盘(那是判定「板子
+    #   死在加压途中」的第二条通道, 见 boot_evidence.cpu_evidence_cut_short),
+    #   只是**报告不印**了。
     if died_in_item_key == "cpu" and died_hard_reset:
         state = boot_evidence_mod.cpu_evidence_state(run.get("id"))
         if state == boot_evidence_mod.CPU_EVIDENCE_EMPTY:
-            cpu_evidence_note = (
-                "「加压现场记录」那个文件**存在, 但一个字节都没有** —— "
-                "板子被硬复位的时候, 还没写进存储的那几行**跟着内存一起没了**"
-                "(这一版之前只把数据交给内核缓存, 没强制刷进存储)。"
-                "⇒ **这一节没有现场数据**; "
-            )
             if cpu_death_summary:
-                cpu_evidence_note += (
-                    "但板子死在第几片, 上一次启动的日志里还读得出来 "
-                    "⇒ 见上面「板子死在哪一级加压」。"
+                cpu_death_summary += (
+                    "\n\n⚠ 加压过程本来每一刻都有记录(每 200 毫秒一行), "
+                    "但那个记录文件**一个字节都没有** —— 板子被硬复位时, "
+                    "还没来得及写进存储的那几行**跟着内存一起没了**。"
+                    "⇒ 上面这句结论是从**上一次启动的日志**里读出来的, "
+                    "不是从记录本身。"
                 )
             else:
-                cpu_evidence_note += (
-                    "而板子死在第几片**这次也没读出来**(上一次启动的日志里连 "
-                    "`stress-ng --cpu N` 都没有)⇒ 这一轮只能确定"
+                cpu_death_summary = (
+                    "板子死在 CPU 加压这一项上, 但**死在几线程这次也没读出来** "
+                    "—— 加压过程本来每一刻都有记录(每 200 毫秒一行), "
+                    "那个记录文件**存在, 却一个字节都没有**(板子被硬复位时, "
+                    "还没写进存储的那几行跟着内存一起没了); 上一次启动的日志里"
+                    "也读不到 `stress-ng --cpu N` ⇒ 这一轮只能确定"
                     "「板子死在 CPU 加压这一项上」, 死在几线程**不知道**。"
                 )
 
@@ -437,8 +446,8 @@ def render_html(run: dict, results: list, filename: str = "",
             # 这不是「异常」, 是**板子把这一项打断了** —— 说清楚, 别让
             # 读报告的人以为工具出了 bug。
             body = ("(本项被板子硬复位打断 —— 这一项的日志还没来得及落库, "
-                    "跟着进程一起没了。死因看上面「板子为什么死」那两节: "
-                    "上一次启动的日志尾巴 + 加压现场记录。)")
+                    "跟着进程一起没了。死因看上面「板子为什么死」那几节: "
+                    "上一次启动的日志尾巴, 以及板子死在哪一级加压的结论。)")
         else:
             body = "(本项没有产生任何日志 —— 属异常: 跑过的项都该有日志)"
         m = r.get("metrics") or {}
@@ -591,10 +600,10 @@ def render_html(run: dict, results: list, filename: str = "",
         has_retest_log=bool(retest_log),
         boot_evidence=boot_evidence,
         has_boot_evidence=bool(boot_evidence),
-        cpu_evidence=cpu_evidence,
-        has_cpu_evidence=bool(cpu_evidence),
-        cpu_evidence_note=cpu_evidence_note,
-        has_cpu_evidence_note=bool(cpu_evidence_note),
+        # ⚠️ **2026-11-12**: `cpu_evidence`(加压现场原始数据)**不再进模板**
+        #   —— 用户要求报告里去掉那一栏(「别人也看不懂」)。
+        #   原始数据照旧落盘、照旧参与判定, 只是**不印在报告上**;
+        #   报告上留的是 `cpu_death_summary`(读得懂的结论)。
         # §9.3.4 时钟推算值横幅 —— 纸面归档的人得知道这批时间戳不能当准点用
         clock_skew=clock_skew,
         has_clock_skew=bool(clock_skew),

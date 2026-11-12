@@ -285,18 +285,11 @@ MUTATIONS = [
         '    return evidence_dir() / "cpu_evidence_wrong_name.txt"',
         "EVID: 现场记录写到别的文件名(报告读不回来)",
     ),
-    (
-        "server/report.py",
-        "        boot_evidence=boot_evidence,\n"
-        "        has_boot_evidence=bool(boot_evidence),\n"
-        "        cpu_evidence=cpu_evidence,",
-        "        boot_evidence=boot_evidence,\n"
-        "        has_boot_evidence=bool(boot_evidence),\n"
-        '        cpu_evidence="",',
-        "REPORT: 报告里不印「加压现场记录」这一节 "
-        "[锚点带上下文 ⇒ 只改喂给模板的那处; 导出那处改了没用 —— "
-        "render_html 收不到 None 会自己从盘上读回来]",
-    ),
+    # ⚠️ **2026-11-12 这条变异作废**: 原来它把喂给模板的 `cpu_evidence` 清空,
+    #   验证「没有记录就不画那一节」—— 现在那一节**永远不画**了(用户:
+    #   「这一栏不要, 别人也看不懂」)⇒ 那个锚点本身已经不存在。
+    #   ⇒ 换成下面那条: 把原始数据**混回结论里**(= 那一栏又回来了)——
+    #   那才是今天真正要守住的那条。
     (
         "server/report.py",
         "    if cpu_evidence is None:\n"
@@ -352,10 +345,21 @@ MUTATIONS = [
     (
         "server/report.py",
         '            body = ("(本项被板子硬复位打断 —— 这一项的日志还没来得及落库, "\n'
-        '                    "跟着进程一起没了。死因看上面「板子为什么死」那两节: "\n'
-        '                    "上一次启动的日志尾巴 + 加压现场记录。)")',
+        '                    "跟着进程一起没了。死因看上面「板子为什么死」那几节: "\n'
+        '                    "上一次启动的日志尾巴, 以及板子死在哪一级加压的结论。)")',
         '            body = "(本项没有产生任何日志 —— 属异常: 跑过的项都该有日志)"',
         "REPORT: 硬复位那一项的日志说明还是那句「属异常」(板子打断 ≠ 工具异常)",
+    ),
+    # ⚠️ **2026-11-12 用户要求**: 报告里去掉「加压现场记录」那一栏 ——
+    #    「这一栏不要, 别人也看不懂」⇒ 原始数据只用来**算结论**, 不进报告。
+    #    这个变异把原始数据**混回结论里**(= 那一栏又回来了)⇒ 必须变红。
+    (
+        "server/report.py",
+        "        cpu_death_summary = boot_evidence_mod.summarize_cpu_death(cpu_evidence)",
+        "        cpu_death_summary = (boot_evidence_mod.summarize_cpu_death(cpu_evidence)\n"
+        "                             + \"\\n\" + cpu_evidence)",
+        "REPORT: 加压现场记录的原始数据又混进报告了(那一栏 2026-11-12 已按用户"
+        "要求去掉 —— 工人看不懂)",
     ),
     # ── 2026-11-02 13:50 那次实测加的: **fsync** + 空文件的解释 ──
     (

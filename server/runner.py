@@ -17,6 +17,7 @@ from .config import Config
 from . import identity, report
 from . import clock
 from . import usb_export
+from .item_marker import ItemMarker
 
 
 def _report_cfg() -> dict:
@@ -168,6 +169,11 @@ class TestRunner:
         # 工人跑到一半刷新了页面, 重连后计时条要接着走, 而不是消失。
         self._current_expected_sec: Optional[float] = None
         self._current_started_at: Optional[float] = None
+        # 「板子死在哪一项上」的现场记录(写) —— 见 server/item_marker.py。
+        # 每一项**起跑**时写一行, **跑完**时写一行, 立刻 fsync ⇒ 板子挂死
+        # 时记录还在 ⇒ 收尾时能说出「板子死在 GPU 这一项上」⇒ 那一项判
+        # failed(被测设备不合格), 而不是 `stopped`(放行坏板子)。
+        self._marker: Optional[ItemMarker] = None
 
         # Mini-run 模式
         self.mode: str = "full"               # 'full' | 'mini'
@@ -669,6 +675,10 @@ class TestRunner:
         try:
             self._current_instance = instance   # 供 stop() 拿到真实实例去 kill 子进程
             self.results[name] = TestResult(status="running")
+            # 「板子死在哪一项上」—— **起跑**就记一行(立刻 fsync)。
+            # ⚠️ 记在**跑起来之前** —— 板子死在半路时, 后面那些行压根没机会写。
+            if self._marker is not None:
+                self._marker.start(name)
             t0 = time.monotonic()   # §9.3.4: 时长用单调钟, 墙钟跳变算不出负数
             result = await instance.run(ctx)
             result.duration_sec = time.monotonic() - t0
@@ -688,6 +698,11 @@ class TestRunner:
             self.results[name] = result
         finally:
             self._current_instance = None
+            # 这一项**跑完了**(不管结论是什么)—— 记一行「结束」。
+            # ⚠️ 这一行**只在正常跑完时才写** ⇒ 「最后一行是『起跑』」就说明
+            #    这一项没跑完 ⇒ 板子死在这一项上(收尾时据此判不合格)。
+            if self._marker is not None:
+                self._marker.done(name)
 
         # ── 工人主动打断了这一项 → 记 **skipped**(2026-10-29 新口径) ──
         #
@@ -951,6 +966,9 @@ class TestRunner:
         这一层把异常兜住、记进日志、并以 status=error 正常收尾, 让操作员
         至少能看到「这一轮出问题了」和原因, 而不是面对一个冻住的界面。
         """
+        # 「板子死在哪一项上」的现场记录 —— 开跑前就建好(头里记开机 ID)。
+        # ⚠️ 建不出来也不能影响测试(那只是「加分项」) ⇒ 写端自己兜住异常。
+        self._marker = ItemMarker(self.run_id)
         try:
             await self._run_tests_body(enabled_tests, config, write_to_parent)
         except asyncio.CancelledError:
@@ -982,6 +1000,13 @@ class TestRunner:
                 "finished_at": self.finished_at,
                 "error": self.run_error,
             })
+        finally:
+            # 「板子死在哪一项上」的现场记录 —— 落文件、逐行 fsync,
+            # 板子挂死时它还在(U 盘上)。收尾时靠它判断「板子死在哪一项上」
+            # ⇒ 那一项判 failed(被测设备不合格), 而不是放行。
+            # 详见 server/item_marker.py。
+            if self._marker is not None:
+                self._marker.close()
 
     async def _run_tests_body(self, enabled_tests, config: dict, write_to_parent: bool):
         if not enabled_tests:

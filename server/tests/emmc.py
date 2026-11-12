@@ -283,12 +283,12 @@ class EMMCTest(TestCase):
                         f" {phase_elapsed:.0f}s / {phase_total:.0f}s",
                     )
 
-                t0 = time.time()
+                t0 = time.monotonic()
                 m = await _run_fio_test(
                     test_file, size_mb, ctx, duration,
                     on_metric=ctx.on_metric, on_progress=tick,
                 )
-                elapsed = time.time() - t0
+                elapsed = time.monotonic() - t0
 
                 read = m.get("read_mbps", 0)
                 write = m.get("write_mbps", 0)

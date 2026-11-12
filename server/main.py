@@ -17,6 +17,7 @@ from . import db
 from . import identity
 from . import report
 from . import boot_evidence
+from . import item_marker
 from . import clock
 from . import usb_export
 from .runner import runner
@@ -147,9 +148,41 @@ async def startup():
                               "起手了、没跑完 ⇒ 板子死在加压途中 ⇒ "
                               "正在跑的那一项判 failed(被测设备不合格)" % kind)
                     else:
-                        print("[server] 上一次是**%s**, 但日志尾巴里看不见我们"
-                              "自己的测试, 加压现场记录也看不出「起手了没跑完」"
-                              " ⇒ 不赖到板子头上, 照旧 stopped" % kind)
+                        # ── ③ 第三条通道: 「板子死在哪**一项**上」现场记录 ──
+                        #    (2026-11-12 加)。前两条通道对 GPU / 内存这两项
+                        #    **都答不上来**: journal 尾巴里认不出
+                        #    `glmark2`/`memtester`(它们几乎不说话; 内核 oops
+                        #    里的 `Comm: glmark2` 那几行常被挤出尾巴), 而
+                        #    「加压现场记录」**只管 CPU 那一项**。
+                        #    ⇒ 板子死在 GPU 项上时**没有任何证据** ⇒ 那一项
+                        #    只能判 stopped ⇒ **坏板子被放行**(§9.3: 静默的
+                        #    「通过」比明确的「失败」有害得多)。
+                        #    这一条通道记的是**每一项**的起跑/跑完, 落文件、
+                        #    逐行 fsync ⇒ 板子挂死(U 盘还在)也带不走。
+                        #    ⚠️ 它自己已经带了「板子真的重启过没有」这道关
+                        #        (开机 ID 变了没有)—— 板子没重启 ⇒ 是**我们**
+                        #        的进程没了 ⇒ **不赖**板子(冤枉好板)。
+                        item = None
+                        for r in stuck:
+                            try:
+                                item = item_marker.marker_cut_short(r.get("id"))
+                            except Exception:
+                                item = None
+                            if item:
+                                break
+                        if item:
+                            hard_reset = True
+                            print("[server] 上一次是**%s**, 但日志尾巴里看不见我们"
+                                  "自己的测试, 加压现场记录也看不出「起手了没跑完」"
+                                  " ⇒ **「板子死在哪一项上」现场记录**显示板子"
+                                  f"死在「{item}」这一项上(且开机 ID 变了 ⇒ "
+                                  "板子真的重启过) ⇒ 那一项判 failed"
+                                  "(被测设备不合格)" % kind)
+                        else:
+                            print("[server] 上一次是**%s**, 但日志尾巴里看不见我们"
+                                  "自己的测试, 加压现场记录也看不出「起手了没跑完」"
+                                  ", 「板子死在哪一项上」也看不出 ⇒ "
+                                  "不赖到板子头上, 照旧 stopped" % kind)
             except Exception as e:
                 print(f"[server] ⚠ 取上一次启动的日志失败(不影响收尾): {e!r}")
 
@@ -585,8 +618,12 @@ def _do_exit(reason: str):
 #   · 心跳断了、**且当前没有测试在跑**、且静默超过 idle_exit_sec → 退出
 #   · 心跳断了、**但正在跑测试** → 绝不退出, 等测试跑完再说
 #   · 页面关窗时用 sendBeacon 主动告别 → 走快通道, goodbye_grace_sec 后就退
-_SERVICE_T0 = time.time()
-_last_seen = time.time()
+# ⚠️ 空闲计时一律用**单调钟**(§9.3.4) —— 不用墙钟:
+#    板子的墙钟会被校时**往前拨**(NTP 把 fake-hwclock 退回的时钟拨回来),
+#    拨的那一下 `now >= deadline` 立刻成立 ⇒ 服务在两项之间被当成「空闲」
+#    自己退掉(工人只看到「服务没了」)。单调钟不受校时影响。
+_SERVICE_T0 = time.monotonic()
+_last_seen = time.monotonic()
 _ever_connected = False
 _goodbye_at = None            # Optional[float]
 
@@ -600,7 +637,7 @@ def _touch(connected: bool = False):
     实测就是这么挂的: 日志里退出行写「静默 2s」—— 心跳 2 秒前刚来过。
     """
     global _last_seen, _ever_connected, _goodbye_at
-    _last_seen = time.time()
+    _last_seen = time.monotonic()
     if _goodbye_at is not None and _last_seen > _goodbye_at:
         # 告别之后**又**有活动 → 页面回来了, 那是刷新/切页, 不是真关窗。
         _goodbye_at = None
@@ -647,7 +684,7 @@ async def _idle_watchdog():
         # ① 测试在跑 → 永不退出。这是硬红线: 一次 8 小时烧机不能被心跳误杀。
         if runner.status == "running":
             continue
-        now = time.time()
+        now = time.monotonic()
         if not _ever_connected:
             # 起了服务但没人连上来 (比如 xdg-open 失败) —— 给足 1 小时, 别刚
             # 启动就被当成空闲杀掉。

@@ -362,7 +362,7 @@ try:
 except Exception as e:      # noqa: BLE001
     check(False, "读板子状态不该抛异常", repr(e))
 
-section("【4】报告里多一节「加压现场记录」; 没有就不画")
+section("【4】报告里**不再印**「加压现场记录」那一节原始数据(工人看不懂)")
 
 
 def make_run():
@@ -382,13 +382,19 @@ def make_run():
 
 html = report_mod.render_html(make_run(), [], "SN-CPU-EV-0001_20261030_100000.pdf",
                                cpu_evidence=body)
-check("加压现场记录" in html, "报告里有「加压现场记录」这一节")
-check("threads=4" in html, "现场记录原文进了报告")
-check("每 200 毫秒" in html, "写明了这是多密地记的(读者才知道这些行之间隔多久)")
+# ⚠️ **2026-11-12 用户要求**: 报告里去掉「加压现场记录」那一栏 ——
+#    「别人也看不懂」。原始数据**照旧落盘、照旧参与判定**, 只是不印。
+#    (判定通道 = boot_evidence.cpu_evidence_cut_short, 不经过模板。)
+check("加压现场记录" not in html,
+      "报告里**没有**「加压现场记录」那一节(原始数据不印)", html[:0])
+check("threads=4" not in html,
+      "现场记录的原始行**没有**进报告", html[:0])
+check("每 200 毫秒" not in html,
+      "连「每 200 毫秒记一行」那句说明也没了(那一栏整个去掉)", html[:0])
 
 html_no = report_mod.render_html(make_run(), [], "SN-CPU-EV-0001_20261030_100000.pdf")
 check("加压现场记录" not in html_no,
-      "**没有记录就不画那一节** —— 不编「疑似过热」", html_no[:0])
+      "**没有记录也不编「疑似过热」**", html_no[:0])
 
 section("【5】板子死在哪一项 —— 报告要**点名**")
 
@@ -530,7 +536,7 @@ html7 = report_mod.render_html(make_run(), hard_results, "x.pdf",
                                boot_evidence="[上一次启动的 journal]\n"
                                              "【上一次是硬复位】",
                                cpu_evidence="")
-check("板子死在哪一级加压" not in html7,
+check("板子死在哪一级加压 —— 结论" not in html7,
       "两个来源都没有 ⇒ 不画这一节(不编)", html7[:0])
 
 # 现场记录**在** ⇒ 优先用它(它比日志细: 有温度/频率/片数)
@@ -542,6 +548,12 @@ check("第 3/12 片" in html8,
       "现场记录在 ⇒ 用它(更细: 片数/温度/频率)", html8[:0])
 check("死在 <strong>4 线程" not in html8 and "4 线程" in html8,
       "现场记录在 ⇒ 结论以它为准", html8[:0])
+# ⚠️ **2026-11-12 用户要求**: 原始数据**只用来算结论**, 不进报告 ——
+#    「这一栏不要, 别人也看不懂」。⇒ 报告上只有读得懂的结论那几行。
+check("加压现场记录" not in html8,
+      "原始数据(那一栏)不在报告里 —— 只留结论", html8[:0])
+check("采样间隔" not in html8,
+      "原始数据的表头也不在报告里", html8[:0])
 
 section("【5d】**落盘要 fsync** —— 光 flush 到页缓存, 硬复位会把它一起带走")
 
@@ -595,7 +607,7 @@ try:
 finally:
     os.fsync = _orig_fsync
 
-section("【5d-3】报告里要**明说**「现场记录文件在, 却是空的」")
+section("【5d-3】报告里要**明说**「现场记录文件在, 却是空的」(折进结论那一节)")
 
 # 造一个 0 字节的现场记录文件(就是板子上的样子)—— **run id 要对上**
 # (报告是按这一轮的 run_id 去读那个文件的)
@@ -613,10 +625,11 @@ html9 = report_mod.render_html(empty_run, hard_results, "x.pdf",
                                boot_evidence="[上一次启动的 journal]\n"
                                              "【上一次是硬复位】\n" + JOURNAL_2TH,
                                cpu_evidence="")
-check("为什么这一节是空的" in html9,
-      "报告里**明说**了「加压现场记录」那一节为什么是空的", html9[:0])
+check("加压现场记录" not in html9,
+      "原始数据那一节整个没了(2026-11-12 用户要求)", html9[:0])
 check("一个字节都没有" in html9,
-      "说清了是「文件在, 但一个字节都没有」(不是「压根没记」)", html9[:0])
+      "「文件在, 但一个字节都没有」这件事**折进结论里**说清了"
+      "(不是「压根没记」)", html9[:0])
 check("2 线程" in html9,
       "空文件不影响结论 —— 照样从日志里读出「死在 2 线程那一片」", html9[:0])
 
@@ -625,8 +638,10 @@ html10 = report_mod.render_html(make_run(), hard_results, "x.pdf",
                                 boot_evidence="[上一次启动的 journal]\n"
                                               "【上一次是硬复位】\n" + JOURNAL_2TH,
                                 cpu_evidence="")
-check("为什么这一节是空的" not in html10,
-      "压根没那个文件 ⇒ 不解释(没东西可解释)", html10[:0])
+check("一个字节都没有" not in html10,
+      "压根没那个文件 ⇒ 不解释「一个字节都没有」(没东西可解释)", html10[:0])
+check("2 线程" in html10,
+      "结论照样在(从日志里读出来的)", html10[:0])
 
 # 空文件 **且** 日志里连 `stress-ng --cpu N` 都没有 ⇒ 「死在几线程」也
 #    读不出来 ⇒ 说明里**不许**说「2 线程」(那等于编)
@@ -634,10 +649,10 @@ html10b = report_mod.render_html(empty_run, hard_results, "x.pdf",
                                  boot_evidence="[上一次启动的 journal]\n"
                                                "【上一次是硬复位】\n",
                                  cpu_evidence="")
-check("为什么这一节是空的" in html10b,
+check("一个字节都没有" in html10b,
       "空文件 ⇒ 照样要解释(不能静悄悄地不画)", html10b[:0])
 check("这次也没读出来" in html10b,
-      "日志里也读不出「死在几线程」⇒ 说明里**明说不知道**", html10b[:0])
+      "日志里也读不出「死在几线程」⇒ **明说不知道**", html10b[:0])
 check("2 线程" not in html10b,
       "读不出来的时候不许编「死在 2 线程」", html10b[:0])
 

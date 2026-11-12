@@ -349,7 +349,7 @@ class EthTest(TestCase):
         await ctx.on_log(f"[网口] ② 取 IP —— DHCP (超时 {dhcp_timeout}s)...")
         await ctx.on_progress(20, "② DHCP 取 IP")
 
-        t0 = time.time()
+        t0 = time.monotonic()
         # -f 前台 / -n 拿不到 lease 就退出 / -q 拿到就退出 —— 防止 udhcpc 自行 daemonize
         # **必须带 timeout_sec**: udhcpc 在部分驱动/交换机组合下拿不到 lease
         # 也不退出, 会一直挂着。而它被 §11.2 sudo 提权成 root 进程后, 我们
@@ -360,7 +360,7 @@ class EthTest(TestCase):
                       timeout_sec=dhcp_timeout),
             dhcp_timeout + 8,
         )
-        dhcp_ms = int((time.time() - t0) * 1000)
+        dhcp_ms = int((time.monotonic() - t0) * 1000)
         result.metrics["dhcp_duration_ms"] = dhcp_ms
 
         if rc == 0:

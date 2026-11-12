@@ -923,7 +923,7 @@ class WiFiTest(TestCase):
                 )
                 await asyncio.sleep(scan_retry_gap)
 
-            t0 = time.time()
+            t0 = time.monotonic()
             # **必须带 timeout_sec**: 部分驱动的 `iw scan` 在射频异常时会一直
             # 挂着不返回。而它被 §11.2 提权成 root 进程后, 我们 (普通用户)
             # 发不了信号收它 —— 只能让同为 root 的 `timeout` 到点自己杀它,
@@ -932,7 +932,7 @@ class WiFiTest(TestCase):
                 with_sudo([iw_bin, "dev", iface, "scan"], timeout_sec=scan_timeout),
                 scan_timeout + 8,
             )
-            scan_ms = int((time.time() - t0) * 1000)
+            scan_ms = int((time.monotonic() - t0) * 1000)
             last_out, last_err = out, err
             done = _scan_completed(out)
             scan_cmd_ok = (rc == 0) and done

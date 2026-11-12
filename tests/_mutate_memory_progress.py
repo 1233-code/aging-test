@@ -17,6 +17,12 @@
 #   ④ 开场就报整项的预计、收尾报这一项一共花了多久 —— 前后都有账;
 #   ⑤ 本轮真跑完之前不许显示 100%(提前显示「完成」是骗人)。
 #
+# 2026-11-12 追加的那一类: **墙钟跳变**(校时)。
+#   产线反馈「内存测试日志里时间突然飙升」⇒ 查出来是**校时**(fake-hwclock
+#   还原的钟 + ntp 往前拨, 而内存项是**第一项** ⇒ 拨钟正好落在内存项里)。
+#   ⇒ 规矩: **时长一律单调钟**; 跳钟要**报出来**; `timeout` **提前**收尾
+#     ⇒ 这一项**没测成**(不是「板子不合格」, 也不能算通过)。
+#
 # ⚠️ **这些改动全部只发生在临时副本里** —— 仓库里 server/tests/memory.py
 #   是产线在跑的那份, 一个字都不动。副本跑完就扔, 不用还原。
 #
@@ -52,8 +58,8 @@ MUTATIONS = [
     ),
     (
         "server/tests/memory.py",
-        "                elapsed = time.time() - item_t0\n",
-        "                elapsed = time.time() - item_t0 + 30\n",
+        "                elapsed = item_sw.elapsed\n",
+        "                elapsed = item_sw.elapsed + 30\n",
         "内存: 「已用」不是真实经过的时间"
         "(⇒ 文案里的时间对不上真实进度, 工人一比就发现条跟时间脱节)",
     ),
@@ -65,7 +71,7 @@ MUTATIONS = [
     ),
     (
         "server/tests/memory.py",
-        '        await ctx.on_progress(100, f"完成 · 共 {time.time() - item_t0:.0f}s")\n',
+        '        await ctx.on_progress(100, f"完成 · 共 {item_sw.elapsed:.0f}s")\n',
         '        await ctx.on_progress(100, "完成")\n',
         "内存: 收尾不报这一项一共花了多久",
     ),
@@ -74,6 +80,38 @@ MUTATIONS = [
         "    frac = min(max(frac, 0.0), 0.99)\n",
         "    frac = min(max(frac, 0.0), 1.0)\n",
         "内存: 轮内刻度不封顶(本轮还没真跑完就显示 100% ⇒ 骗人)",
+    ),
+
+    # ── 2026-11-12 新增: 「墙钟跳变」那一类 ──────────────────────────
+    # 起因: 产线反馈「内存测试日志里时间突然飙升」⇒ 查出来是**校时**:
+    #   那台板子的钟是 fake-hwclock 还原的(硬复位后能差 42 天),
+    #   ntp 一联网就往前拨, 而内存项是**第一项** ⇒ 拨钟正好落在内存项里。
+    (
+        "server/clock.py",
+        "        return time.monotonic() - self._m0\n",
+        "        return time.time() - self._w0\n",
+        "时长改回用**墙钟**算"
+        "(⇒ 校时一拨, 「已用」就暴涨; 校时往前拨还会让 `timeout` 提前收尾)",
+    ),
+    (
+        "server/tests/memory.py",
+        "                if round_sw.jumped:\n",
+        "                if False:\n",
+        "内存: 校时跳钟不报(工人看不到「时间突然飙升」的原因)",
+    ),
+    (
+        "server/tests/memory.py",
+        "                ran_full = elapsed >= timeout_sec * 0.9\n",
+        "                ran_full = True\n",
+        "内存: `timeout` 提前收尾也算「跑满挂钟」"
+        "(⇒ 跑了几秒就算**通过** —— 静默的假通过)",
+    ),
+    (
+        "server/tests/memory.py",
+        "                    if rc == 124 and not ran_full:\n",
+        "                    if False:\n",
+        "内存: `timeout` 提前收尾不报「这一项没测成」"
+        "(⇒ 只当普通失败, 分不清「板子坏」还是「没测成」)",
     ),
 ]
 

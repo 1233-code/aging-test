@@ -26,6 +26,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.tests import memory as mem
+from server import clock as clock_mod
 
 FAILS = []
 PASSES = 0
@@ -45,23 +46,50 @@ def check(cond, msg, extra=""):
 #
 # 内存项的进度是**按挂钟**推的, 不控表就没法测 —— 真等 60 秒一轮, 一个测试
 # 要跑两分钟。
+#
+# ⚠️ **2026-11-12**: 内存项的时长现在走 `server/clock.py::Duration`
+#    (**单调钟**), 墙钟只用来「发现校时跳变」⇒ 假表要**两个钟**:
+#    · `m` = 单调钟 (真实流逝) —— 进度条、文案里的「已用 Ns」靠它;
+#    · `t` = 墙钟 —— 平时跟单调钟一起走; **校时**时只有它跳。
 
 class FakeClock:
     def __init__(self, t0=1_700_000_000.0):
-        self.t = t0
+        self.t = t0          # 墙钟
+        self.m = t0          # 单调钟
+        self._m0 = t0
+        # 校时: 墙钟往前跳多少秒, 以及在第几秒跳(None = 不跳)
+        self.jump_sec = 0.0
+        self.jump_at = None
+        self.jumped = False
 
     def advance(self, dt):
+        self.m += dt
         self.t += dt
+        self._maybe_jump()
+
+    def jump_wall(self, dt):
+        """校时: **只有墙钟**跳, 单调钟不动(真实时间并没有变)。"""
+        self.t += dt
+
+    def _maybe_jump(self):
+        if self.jump_at is None or self.jumped:
+            return
+        if self.m - self._m0 >= self.jump_at:
+            self.jumped = True
+            self.jump_wall(self.jump_sec)
 
 
 class FakeTime:
-    """顶替 memory.py 里的 `time` —— 它只用到 time.time()。"""
+    """顶替 `server/clock.py` 里的 `time` —— 它用到 time.time() 和 time.monotonic()。"""
 
     def __init__(self, clock):
         self._clock = clock
 
     def time(self):
         return self._clock.t
+
+    def monotonic(self):
+        return self._clock.m
 
 
 # ── 假的子进程 ──
@@ -146,23 +174,25 @@ def round_lines():
 _ORIGINALS = {}
 
 
-def patch(clock, every_per_round):
+def patch(clock, every_per_round, rc=0):
     """把内存这一项的外部依赖换成假的。every_per_round: 每轮的行间隔秒数。"""
     _ORIGINALS["find_tool"] = mem.find_tool
     _ORIGINALS["sudo_hint"] = mem.sudo_hint_if_unavailable
     _ORIGINALS["with_sudo"] = mem.with_sudo
-    _ORIGINALS["time"] = mem.time
+    _ORIGINALS["time"] = clock_mod.time
     _ORIGINALS["exec"] = mem.asyncio.create_subprocess_exec
 
     mem.find_tool = lambda name: "/fake/memtester"
     mem.sudo_hint_if_unavailable = lambda result, label: True
     mem.with_sudo = lambda cmd, timeout_sec=None: ["memtester", "1024M", "1"]
-    mem.time = FakeTime(clock)
+    # ⚠️ 换的是 **server/clock.py 看到的 `time`** —— 内存项的时长走
+    #    `clock.Duration`(单调钟), 换 `mem.time` 一点用都没有。
+    clock_mod.time = FakeTime(clock)
 
     it = iter(every_per_round)
 
     async def fake_exec(*cmd, **kw):
-        return FakeProc(round_lines(), clock, next(it), rc=0)
+        return FakeProc(round_lines(), clock, next(it), rc=rc)
 
     mem.asyncio.create_subprocess_exec = fake_exec
 
@@ -171,7 +201,7 @@ def restore():
     mem.find_tool = _ORIGINALS["find_tool"]
     mem.sudo_hint_if_unavailable = _ORIGINALS["sudo_hint"]
     mem.with_sudo = _ORIGINALS["with_sudo"]
-    mem.time = _ORIGINALS["time"]
+    clock_mod.time = _ORIGINALS["time"]
     mem.asyncio.create_subprocess_exec = _ORIGINALS["exec"]
 
 
@@ -363,6 +393,88 @@ async def case6():
           "第 1 轮走完: 条在 50%, 文案是「已用 60s / 预计 120s」", half[:2])
 
 
+async def case7():
+    print("\n【7】校时把墙钟往前拨 ⇒ 「已用 Ns」不许飙, 条跟文案仍然对得上")
+    # 产线原话(2026-11-12): 「内存测试日志里面那个时间……导致时间突然飙升」。
+    #
+    # 病根: 本板时钟由 `fake-hwclock` 管(只在**干净关机**时存 ⇒ 硬复位后退回
+    # 「上次干净关机」那一刻, 实测**倒跳 42 天**), `ntp.service` 开机联网后
+    # 把它**往前拨**回来 —— 而内存项是**整个流程的第一项**, 那一下正好落在
+    # 这一项跑着的时候 ⇒ 用墙钟算出来的时长跟着跳 ⇒ 日志里冒出
+    # 「已用 3600000s / 预计 60s」。
+    #
+    # ⇒ 时长必须走**单调钟**(墙钟跳变算不出负数, 也不会飙)。
+    clock = FakeClock()
+    clock.jump_sec = 42 * 86400.0        # 42 天(实测的倒跳量)
+    clock.jump_at = 20.0                 # 跑到第 20 秒时校时
+    patch(clock, [10])                   # 一轮 60s
+    ctx = FakeCtx({"times": 1, "size_mb": 1024, "timeout_sec": 60})
+    result = await mem.MemoryTest().run(ctx)
+    prog = ctx.progress
+    msgs = [m for _, m in prog]
+
+    used = []
+    for _pct, msg in prog:
+        mo = _TIME_RE.search(msg)
+        if mo:
+            used.append(float(mo.group(1)))
+    check(bool(used), "文案里有「已用 Ns」可查", msgs[:3])
+    check(max(used) < 120 if used else False,
+          "「已用」没跟着校时飙(真实只跑了 ~60 秒)", max(used) if used else None)
+
+    # 条上的百分比跟文案里的时间仍然要是同一个比例
+    bad = []
+    for pct, msg in prog:
+        mo = _TIME_RE.search(msg)
+        if not mo:
+            continue
+        u, t = float(mo.group(1)), float(mo.group(2))
+        if t <= 0:
+            bad.append((pct, msg, "预计是 0"))
+            continue
+        if abs(int(u / t * 100) - pct) > 1:
+            bad.append((pct, msg, f"按时间是 {int(u / t * 100)}%"))
+    check(not bad, "校时之后, 文案里的时间跟条上的百分比仍然对得上", bad[:3])
+
+    # 校时这件事**要说出来** —— 不说的话, 工人只看到「时间对不上」, 没法查
+    check(any("系统时钟" in l for l in ctx.logs),
+          "日志里说清楚「系统时钟被校正了」", ctx.logs[-3:])
+    # 校时本身**不判失败** —— 板子没做错什么
+    check(result.status == "passed", "只是校时的话, 这一项照旧判 passed",
+          result.status)
+
+
+async def case8():
+    print("\n【8】`timeout` 提前收尾(rc=124 但没跑满) ⇒ 判「没测成」, 不许判通过")
+    # `timeout` 走的是 **CLOCK_REALTIME(墙钟)**(strace 实测)⇒ 校时把墙钟往前
+    # 拨 ⇒ `timeout` **提前**到点 ⇒ rc=124, 但这一轮其实只跑了几秒。
+    #
+    # ⚠️ 旧代码只认退出码(124 = 「跑满挂钟」= 预期行为)⇒ 几秒钟的测试被
+    #    当成「跑满了一分钟」⇒ **静默的假通过**(§9.3 点名的危险失效模式)。
+    # ⇒ 现在「跑满挂钟」必须**用单调钟的实测时长**来认。
+    clock = FakeClock()
+    patch(clock, [0.5], rc=124)    # 每行只推进 1 秒 ⇒ 一轮 ~6 秒(远不到 60 秒上限)
+    ctx = FakeCtx({"times": 1, "size_mb": 1024, "timeout_sec": 60})
+    result = await mem.MemoryTest().run(ctx)
+    check(result.status == "error", "判成 error(这一项没测成), 不是 passed",
+          result.status)
+    err = result.error or ""
+    check("没测成" in err, "原因里说清「这一项没测成」", err[:120])
+    check("板子不合格" in err and "不是" in err,
+          "原因里说清「不是板子不合格」(别冤枉好板)", err[:160])
+
+
+async def case9():
+    print("\n【9】真的跑满挂钟才被 `timeout` 收尾 ⇒ 还是算「跑满」(预期行为)")
+    clock = FakeClock()
+    patch(clock, [10], rc=124)     # 一轮 ~60s = 上限
+    ctx = FakeCtx({"times": 1, "size_mb": 1024, "timeout_sec": 60})
+    result = await mem.MemoryTest().run(ctx)
+    check(result.status == "passed", "判成 passed", result.status)
+    check(any("跑满挂钟" in l for l in ctx.logs), "日志里写明「跑满挂钟」",
+          ctx.logs[-3:])
+
+
 async def main():
     try:
         await case1()
@@ -371,6 +483,9 @@ async def main():
         await case4()
         await case5()
         await case6()
+        await case7()
+        await case8()
+        await case9()
     finally:
         restore()
     print("\n" + ("全部通过" if not FAILS else f"有失败项 ({len(FAILS)})"))

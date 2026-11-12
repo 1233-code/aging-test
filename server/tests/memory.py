@@ -1,11 +1,11 @@
 """内存测试 - memtester"""
 import asyncio
 import os
-import time
 import re
 from typing import Optional
 
 from .base import TestCase, TestContext, TestResult, register
+from ..clock import Duration
 from ._tools import (find_tool, run_cmd, is_root, run_proc_with_wallclock,
                      with_sudo, kill_proc, sudo_hint_if_unavailable,
                      TtyDemangler, deps_fix_hint, tool_missing_reason,
@@ -142,7 +142,15 @@ class MemoryTest(TestCase):
         # ⚠️ 进度文案里的「已用 Ns」用它, 而且必须是**整项**的尺度 ——
         #    跟那根条的百分比同一个尺度(见 `_report` 里的说明)。工人拿到
         #    「已用 30s / 预计 60s」就能算出该是 50%, 拿条一比就知道条没骗人。
-        item_t0 = time.time()
+        #
+        # ⚠️ **用单调钟**(`Duration`), 不用墙钟(2026-11-12 产线反馈:
+        #    日志里「已用 Ns」突然飙到几百万秒)。病根是**校时**: 本板时钟
+        #    由 `fake-hwclock` 管(只在干净关机时存 ⇒ 硬复位后退回「上次干净
+        #    关机」那一刻, 实测倒跳 42 天), `ntp.service` 开机联网后把它
+        #    **往前拨**回来 —— 而内存项是**整个流程的第一项**, 那一下正好
+        #    落在这一项跑着的时候 ⇒ 墙钟算出来的时长跟着跳。
+        #    详见 `server/clock.py::Duration`。
+        item_sw = Duration()
         await ctx.on_progress(0, f"准备开始 · 预计 {times * timeout_sec:.0f}s")
 
         # ── 进度条的分母: 一轮该用多少秒 ──
@@ -191,7 +199,7 @@ class MemoryTest(TestCase):
                 # 整项的「已用 / 预计」—— 与百分比同一个尺度。
                 # 分母用**自校准后**的 round_sec_est(第一轮前是 timeout_sec),
                 # 所以「预计」跟条的分母是同一个数, 不会各说各话。
-                elapsed = time.time() - item_t0
+                elapsed = item_sw.elapsed
                 total = times * round_sec_est
                 msg = f"{msg} · 已用 {elapsed:.0f}s / 预计 {total:.0f}s"
                 if (pct, msg) == last_sent:
@@ -208,7 +216,7 @@ class MemoryTest(TestCase):
             cmd = with_sudo([tool, f"{size_mb}M", "1"], timeout_sec=timeout_sec)
             await ctx.on_log(f"[内存] 执行: {' '.join(cmd)}")
 
-            t0 = time.time()
+            round_sw = Duration()   # 本轮的计时 —— **单调钟**(见上面 item_sw)
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -263,9 +271,9 @@ class MemoryTest(TestCase):
                         #    工人看那根条不动, 只觉得工具卡住了。
                         #    现在按「轮次 + 轮内挂钟」推: 一轮约一分钟(见
                         #    MEMTESTER_ROUND_SEC), 条就一直在走。
-                        await _report(i, (time.time() - t0) / round_sec_est,
+                        await _report(i, round_sw.elapsed / round_sec_est,
                                       f"第 {round_idx}/{times} 轮")
-                        if not hit_wallclock and time.time() - t0 > timeout_sec * 0.95:
+                        if not hit_wallclock and round_sw.elapsed > timeout_sec * 0.95:
                             hit_wallclock = True
                             await ctx.on_log(f"[内存] ⏰ 挂钟 {timeout_sec}s 快到 —— 由 `timeout` 收尾")
                         continue
@@ -297,11 +305,11 @@ class MemoryTest(TestCase):
                         m = re.search(r"^\s*(\w[\w\s]+?)\s*:.*?(\d+%)", v)
                         detail = f"{m.group(1).strip()} {m.group(2)}" if m else ""
                         msg = f"第 {round_idx}/{times} 轮" + (f" · {detail}" if detail else "")
-                        await _report(i, (time.time() - t0) / round_sec_est, msg)
+                        await _report(i, round_sw.elapsed / round_sec_est, msg)
 
                 # 挂钟必须**无条件**算 —— 旧代码只在进度分支里赋值, 一旦 memtester
                 # 输出里没匹配到百分比行, 下面的 elapsed 会 NameError。
-                elapsed = time.time() - t0
+                elapsed = round_sw.elapsed
                 # 进程被挂钟掐掉时, 最后一段没有换行 —— 也要交出来(可能是半个
                 # 测试项, 下面据此说明"没跑完")。
                 for visible in dem.flush():
@@ -319,6 +327,17 @@ class MemoryTest(TestCase):
 
                 rc = await proc.wait() if proc.returncode is None else proc.returncode
 
+                # ── 墙钟有没有在校准? ─────────────────────────────────────
+                # 校时(NTP 把被 `fake-hwclock` 退回的时钟拨回来)会把
+                # `timeout` 的到点时刻**提前** ⇒ 这一轮实际没跑够就被掐断。
+                # 这种情况**必须说出来** —— 不说的话, 下面那句「跑满挂钟」
+                # 就成了一句假话(工人会以为内存真的测满了一分钟)。
+                if round_sw.jumped:
+                    jump_note = round_sw.jump_text()
+                    await ctx.on_log(f"[内存] ⚠ {jump_note}")
+                    result.metrics[f"round_{round_idx}_wall_clock_jump_sec"] = round(
+                        round_sw.wall_jump, 1)
+
                 # memtester 退出码 + 特定失败模式双重判断
                 if rc != 0 and not await ctx.is_cancelled():
                     # `timeout` 到点收尾时退出码是 124 (GNU coreutils 约定),
@@ -333,10 +352,40 @@ class MemoryTest(TestCase):
                     #      143 = 进程自己收到 SIGTERM
                     #    这三个 + 确实跑满了挂钟 → 算「跑满挂钟」, 不判失败;
                     #    其它非 0 退出码 → 一律判 failed。
-                    timed_out = (rc == 124)
-                    killed_by_timeout = (
-                        rc in (137, 143) and elapsed >= timeout_sec * 0.9
-                    )
+                    #
+                    # ⚠️ **2026-11-12**: 「确实跑满了挂钟」现在**一律用单调钟
+                    #    的实测时长**来认(以前 `elapsed` 是墙钟算的)。这一条
+                    #    不是洁癖 —— `timeout` 走的是 **CLOCK_REALTIME(墙钟)**
+                    #    (strace 实测), 墙钟被校时往前拨 ⇒ `timeout` **提前**
+                    #    到点 ⇒ rc=124 但实际只跑了几秒 ⇒ 旧代码把那当成
+                    #    「跑满挂钟」(预期行为)⇒ **静默的假通过**(§9.3 点名
+                    #    的危险失效模式: 静默的「通过」比明确的「失败」有害)。
+                    ran_full = elapsed >= timeout_sec * 0.9
+                    timed_out = (rc == 124) and ran_full
+                    killed_by_timeout = (rc in (137, 143)) and ran_full
+                    if rc == 124 and not ran_full:
+                        # `timeout` 提前收尾 —— **这一项没测成**:
+                        #   · 不是「板子不合格」(板子没做错什么, 是时钟被拨了);
+                        #   · 也不能算「通过」(内存到底好不好, 这次没测出来)。
+                        # ⇒ 判 `error`(§9.3: 没测成 ≠ 不合格)。
+                        await ctx.on_log(
+                            f"[内存] ⚠ `timeout` 只跑了 {elapsed:.0f}s 就收尾"
+                            f"(上限 {timeout_sec}s) —— 提前收尾, 这一轮**没测成**"
+                        )
+                        result.error = tool_exit_reason(
+                            rc, tool="memtester",
+                            stage=(f"第 {round_idx}/{times} 轮 "
+                                   f"(只跑了 {elapsed:.0f}s, 上限 {timeout_sec}s)"),
+                            log_tail=result.log,
+                            extra=("这一轮**没跑满**就被 `timeout` 收尾 —— "
+                                   "`timeout` 走的是**墙钟**, 系统时钟在测试"
+                                   "中途被校正过它就会**提前**到点 ⇒ "
+                                   "**这一项没测成**(不是「板子不合格」, 也不能"
+                                   "算通过: 内存到底好不好, 这次没测出来)。"
+                                   "⚠️ 退出码不等于板子坏了 —— 先看下面这行"
+                                   "原始输出, 再决定复测还是返修。"))
+                        result.status = "error"
+                        return result
                     if timed_out or killed_by_timeout:
                         why = ("`timeout` 到点收尾" if timed_out
                                else f"被信号 {rc} 收尾(挂钟已跑满)")
@@ -427,7 +476,7 @@ class MemoryTest(TestCase):
                 # 本轮结束 —— 进度条推到下一个轮次刻度(第 i/N 轮 → i/N 完成),
                 # 并把**实测**的轮长记下来: 下一轮的分母改用它(自校准), 换板子
                 # 不用改代码 —— 原来"算不出总时长"的难题, 用测出来的数解决了。
-                round_dur = time.time() - t0
+                round_dur = round_sw.elapsed
                 if round_dur > 0.5:
                     measured_rounds.append(round_dur)
                     round_sec_est = sum(measured_rounds) / len(measured_rounds)
@@ -453,5 +502,5 @@ class MemoryTest(TestCase):
         elif result.status == "pending":
             result.status = "failed"
 
-        await ctx.on_progress(100, f"完成 · 共 {time.time() - item_t0:.0f}s")
+        await ctx.on_progress(100, f"完成 · 共 {item_sw.elapsed:.0f}s")
         return result

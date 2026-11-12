@@ -250,9 +250,36 @@ def classify_reboot(text: str) -> Tuple[str, str]:
 #: (每 5 分钟存一次时钟、每分钟被厂商看门狗查一次)也在日志里, 拿它当证据
 #: 等于「服务还活着」也算「测试在跑」⇒ 板子平时被硬拉死也会赖到测试头上。
 #: 实测这台机器上, `sudo … PWD=/usr/lib/aging-test` 每 5 分钟就出现一次。
+#:
+#: ⚠️ **2026-11-12 补上 `glmark2` / `memtester`** —— 之前漏了这两个:
+#:   产线另一台设备上, 板子在**GPU 项**跑着的时候弹出了内核崩溃画面
+#:   (`crashdump now, please connect to tigerdump tool and keep power on`),
+#:   板子挂死 ⇒ 工人断电重上 ⇒ 那一轮卡在「运行中」。
+#:   而 `our_run_at_death` 认的是「日志尾巴里有没有我们拉起来的工具」——
+#:   **GPU 项拉的是 `glmark2`, 内存项拉的是 `memtester`, 两个都不在名单里**
+#:   ⇒ 板子明明死在我们的测试里, 却判成「不是我们跑的时候死的」
+#:   ⇒ 那一项判 `stopped`(没跑完)⇒ **板子被放行**。
+#:   ⇒ GPU/内存是**唯二**两项「跑起来几乎不说话」的项, 必须认。
+#:   (内核 oops 自己也会打 `Comm: glmark2` —— 崩的那一刻正在跑谁, 日志里写着。)
 _OUR_RUN_RE = re.compile(
     r"stress-ng|\bfio\b|ffmpeg|chromium|ethtool|smartctl|lsusb|"
-    r"wpa_supplicant|\[server\]|\[runner\]")
+    r"glmark2|memtester|wpa_supplicant|\[server\]|\[runner\]")
+
+
+# ⚠️ 这里**曾经**有过一个「认内核 panic」的通道(`kernel_panic_at_death`),
+#   2026-11-12 **删掉了**, 原因:
+#     ① 它**分不清「这次的崩」还是「老账」** —— 跨重启累积的日志里, 上一次
+#        的 panic 可能还在尾巴附近; 只能靠厂商自己写的那句「最后一条可疑行
+#        距文件末尾还有 N 行」来兜底, 那是**看运气**的;
+#     ② 它只能说出「板子崩了」, **说不出崩在哪一项上** —— 而那才是工人
+#        和返修要的答案;
+#     ③ 判错的方向**不对称**: 拿老账判这一轮 ⇒ **冤枉好板**(比漏判边缘板
+#        更糟, 见 §9.3)。
+#   ⇒ 现在这条通道换成了 `server/item_marker.py`: 「板子死在哪一项上」是
+#     **我们自己写的、逐行 fsync 的**记录, 配上**开机 ID 变了**这道关 ——
+#     判错的方向反过来了(拿不准就**不赖**板子)。
+#   ⇒ 内核崩溃的**原文**仍然会出现在报告的「死因」里(那是给人看的证据),
+#     不参与判定。
 
 
 def our_run_at_death(text: str, tail_chars: int = 3000) -> bool:
@@ -444,8 +471,7 @@ def summarize_cpu_death_from_journal(text: str) -> str:
                    + f" 线程 ⇒ 这一轮里, **{death_threads} 线程是这块板子的"
                      f"天花板**。")
     out.append("⚠️ 这一条是从**上一次启动的日志**里读出来的(sudo 命令行里的 "
-               "`--cpu N`), 没有温度/频率 —— 那些在「加压现场记录」里, "
-               "那份文件这次没读出来。")
+               "`--cpu N`), 没有温度/频率 —— 那份逐秒记录这次没读出来。")
     return "\n".join(out)
 
 

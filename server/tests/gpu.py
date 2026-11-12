@@ -1206,7 +1206,7 @@ class GPUTest(TestCase):
         """
         while True:
             await asyncio.sleep(_HEARTBEAT_SEC)
-            elapsed = time.time() - t0
+            elapsed = time.monotonic() - t0
             # 留最后一点给收尾判定, 所以封到 span-10
             pct = pct_lo + min(max(span - 10, 1),
                                int(elapsed / max(expect_sec, 1.0) * (span - 10)))
@@ -1304,7 +1304,7 @@ class GPUTest(TestCase):
         # 多轮时每轮各占进度条的一段 (§10.1) —— 别每轮都从头冲到 90%
         span_total = 100 - _PRECHECK_DONE_PCT
         per = span_total / rounds
-        total_t0 = time.time()
+        total_t0 = time.monotonic()
         for idx in range(1, rounds + 1):
             if await ctx.is_cancelled():
                 result.status = "stopped"
@@ -1345,7 +1345,7 @@ class GPUTest(TestCase):
 
             # 最后一轮的标量指标 = 本项对外口径 (§6.3: score 取最后一轮)
             result.metrics["score"] = round_result["score"]
-            result.metrics["elapsed_sec"] = round(total_t0 and (time.time() - total_t0), 1)
+            result.metrics["elapsed_sec"] = round(total_t0 and (time.monotonic() - total_t0), 1)
             result.metrics["exit_code"] = round_result["exit_code"]
             result.metrics["scenes_completed"] = round_result["scenes"]
             # glmark2 不报逐帧计数, 用"跑完的场景数"作为渲染单元数的代理指标
@@ -1452,7 +1452,7 @@ class GPUTest(TestCase):
             }
         self.sid = await self._adopt_session(ctx, tag)
 
-        t0 = time.time()
+        t0 = time.monotonic()
         self._pump_task = asyncio.create_task(self._pump_stdout(ctx, tag))
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat(ctx, t0, expect_sec or timeout_sec, len(expected),
@@ -1469,12 +1469,12 @@ class GPUTest(TestCase):
                 cancelled = True
                 await self.cancel()
                 break
-            if time.time() - t0 > timeout_sec:
+            if time.monotonic() - t0 > timeout_sec:
                 timed_out = True
                 await self.cancel()
                 break
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         # 收尾: 等读端和心跳退出
         for task in (self._pump_task, self._heartbeat_task):
             task.cancel()

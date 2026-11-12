@@ -501,7 +501,7 @@ async def run_proc_with_wallclock(
     except FileNotFoundError:
         return None, -1, "", 0.0, False
 
-    t0 = time.time()
+    t0 = time.monotonic()   # 时长用单调钟(§9.3.4) —— 墙钟跳变算不出负数
     killed_by_us = False
     try:
         await asyncio.wait_for(proc.wait(), timeout=duration_sec + grace_sec)
@@ -513,7 +513,7 @@ async def run_proc_with_wallclock(
         await kill_proc(proc, signal.SIGTERM, wait_sec=2.0)
         raise
 
-    elapsed = time.time() - t0
+    elapsed = time.monotonic() - t0
     rc = proc.returncode if proc.returncode is not None else -1
     try:
         out, _ = await proc.communicate()

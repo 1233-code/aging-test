@@ -240,11 +240,11 @@ async def _wait_for_dev(dev: str, timeout_sec: float = 3.0) -> bool:
     刚插上就点「已插好重测」的时候, 节点可能还没出来。那种时候说「没插
     卡」是冤枉人, 所以先等一等。
     """
-    t0 = time.time()
+    t0 = time.monotonic()
     while True:
         if os.path.exists(dev):
             return True
-        if time.time() - t0 >= timeout_sec:
+        if time.monotonic() - t0 >= timeout_sec:
             return False
         await asyncio.sleep(0.2)
 
@@ -513,12 +513,12 @@ class TFCardTest(TestCase):
                         f" {phase_elapsed:.0f}s / {phase_total:.0f}s",
                     )
 
-                t0 = time.time()
+                t0 = time.monotonic()
                 m = await _run_fio_test(
                     test_file, size_mb, ctx, duration,
                     on_metric=ctx.on_metric, on_progress=tick,
                 )
-                elapsed = time.time() - t0
+                elapsed = time.monotonic() - t0
 
                 read_mbps = m.get("read_mbps", 0)
                 write_mbps = m.get("write_mbps", 0)

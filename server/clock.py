@@ -270,6 +270,82 @@ def raw_now() -> float:
     return time.time()
 
 
+#: **墙钟跳变**的判定门槛(秒) —— 墙钟比单调钟多走(或少走)超过这个数,
+#: 才算「跳了」。
+#:
+#: 为什么不是 0: NTP 的**微调**(slew)本来就一点点, 闰秒/频率微调也会让
+#: 墙钟和单调钟差零点几秒 —— 那些**不该**被判成「时钟跳变」(否则每次校时
+#: 都留一句警告, 多了就没人看了)。2 秒是个「肯定不是微调」的门槛。
+WALL_JUMP_TOLERANCE_SEC = 2.0
+
+
+class Duration:
+    """一段「时长」的测量 —— **时长走单调钟**, 墙钟跳变单独记账。
+
+    **为什么要有这个类** (2026-11-12 产线反馈: 内存项日志里「已用 Ns」
+    突然飙到几百万秒):
+
+      · 本板的系统时钟是 `fake-hwclock` 管的 —— 那个文件**只在干净关机时
+        写** ⇒ 每硬复位一次, 下次开机就退回「上次干净关机」那一刻
+        (新板实测: **倒跳 42 天**);
+      · 把它扳回来的是 `ntp.service` —— 开机联网后**往前拨**一次。
+        而**内存项是整个流程的第一项**(runner 的 `RECOMMENDED_ORDER`),
+        那一下**正好落在内存项跑着的时候**;
+      · ⇒ 用墙钟算出来的时长跟着跳: 日志里冒出「已用 3600000s / 预计
+        60s」, 而**进度条上的百分比还是按真实进度算的** ⇒ 工人一比就知道
+        「条和文案对不上」;
+      · ⇒ 更要命的是 GNU `timeout` 用的是 **CLOCK_REALTIME**(墙钟,
+        strace 实测: `timer_create(CLOCK_REALTIME, …)`)—— 墙钟往前拨,
+        `timeout` 就**提前**到点 ⇒ 内存项只跑了几秒就被掐断, 而旧代码把
+        那当成「跑满挂钟」(预期行为)⇒ **静默的假通过**(§9.3 点名的
+        危险失效模式)。
+
+    ⇒ 所以规矩是: **时长一律用单调钟**; 墙钟跳变**记下来、说出来**,
+      但**不许混进时长**。
+
+    用法::
+
+        sw = Duration()
+        ...
+        elapsed = sw.elapsed          # 单调钟 —— 永远是对的
+        if sw.jumped:
+            log(sw.jump_text())       # 墙钟被校正了 —— 说清楚, 但不影响判定
+    """
+
+    def __init__(self) -> None:
+        self._m0 = time.monotonic()
+        self._w0 = time.time()
+
+    @property
+    def elapsed(self) -> float:
+        """已经过了多少秒 —— **单调钟**, 墙钟跳变算不出负数, 也不会飙。"""
+        return time.monotonic() - self._m0
+
+    @property
+    def wall_jump(self) -> float:
+        """墙钟比「真实流逝」多走了多少秒。
+
+        正数 = 墙钟**往前跳**了(NTP 把倒跳的时钟拨了回来);
+        负数 = 墙钟**往回跳**了(又校回去了一点)。
+        """
+        return (time.time() - self._w0) - self.elapsed
+
+    @property
+    def jumped(self) -> bool:
+        """墙钟有没有「跳」过(超过 `WALL_JUMP_TOLERANCE_SEC`)。"""
+        return abs(self.wall_jump) > WALL_JUMP_TOLERANCE_SEC
+
+    def jump_text(self) -> str:
+        """墙钟跳变的一句话说明(给日志用)。没跳就返回空串。"""
+        if not self.jumped:
+            return ""
+        jump = self.wall_jump
+        direction = "往前" if jump > 0 else "往回"
+        return (f"系统时钟在测试中途被校正了(墙钟{direction}跳了 {jump:.0f} 秒)"
+                f" —— 时长按**单调钟**算, 不受影响; 但 `timeout` 走的是墙钟, "
+                f"可能被提前收尾")
+
+
 def note_wall_clock(ts: float) -> bool:
     """登记一个「已知正确」的墙钟 —— 只接受往前的。
 
