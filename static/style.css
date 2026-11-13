@@ -1132,6 +1132,35 @@ a.btn-secondary {
 }
 
 /* ============== 依赖检查 banner ============== */
+/* ⚠️ 盘上空间提醒 (2026-11-13) —— **只在空间不够的时候才出现**。
+   刻意**不用** `.wizard-alert` 那套(大字 + 闪烁 + 橙底红字): 那是给
+   「屏幕马上要黑了」这种真告警用的 ⇒ 拿来挂一句「盘快满了」会吓人,
+   工人会读成「这根盘废了, 不能用」。⇒ 这里用**安静的浅色条**:
+   一行字, 看得清, 但不抢戏 —— 而且第一句就讲「现在还能不能测」。 */
+.disk-warning {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: #fff8e1;
+    border-left: 4px solid #f9a825;
+    color: #4e342e;
+    padding: 12px 18px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    line-height: 1.6;
+}
+.disk-warning.critical {
+    background: #fff3e0;
+    border-left-color: #ef6c00;
+}
+.disk-warning-icon {
+    font-size: 18px;
+}
+.disk-warning-text {
+    flex: 1;
+}
+
 .dep-banner {
     display: flex;
     align-items: center;

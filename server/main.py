@@ -18,6 +18,7 @@ from . import identity
 from . import report
 from . import boot_evidence
 from . import item_marker
+from . import disk_space
 from . import clock
 from . import usb_export
 from .runner import runner
@@ -466,6 +467,10 @@ async def get_config():
         #    ⇒ 这件事只留在 logs/server.log 和文档里; 要查就 curl 这个接口。
         #    (前端不许再拿它渲染东西 —— 有 tests/test_frontend_history_db_silent.js 盯着)
         "history_db": db.history_db_status(),
+        # ⚠️ **盘上空间提醒**(2026-11-13) —— **只在空间不够的时候才有值**;
+        #   够 ⇒ None ⇒ 前端一个字都不显示(用户定的: 「其他时候任何地方
+        #   不显示提醒」)。详见 server/disk_space.py。
+        "disk": disk_space.disk_warning(),
     }
 
 
@@ -499,7 +504,20 @@ async def test_start(req: StartRequest):
     if name:
         rep["operator"] = name
     config["report"] = rep
-    return await runner.start(config)
+    res = await runner.start(config)
+    # ⚠️ **盘上空间提醒**(2026-11-13) —— 放在**开跑这一刻**再查一次:
+    #   页面加载时的那份是**快照**, 页面开着不动几小时是常事 ⇒ 到真开跑
+    #   的时候可能早就写满了。
+    #   ⇒ 空间够 ⇒ `disk` 是 None ⇒ 前端**一个字都不显示**;
+    #     不够 ⇒ 前端在页面上挂一条提醒(**不拦**: 空间不够也照样能测)。
+    #   这只是**提醒**, 不改判定, 也不拦开跑(盘真满了还拦着不让测,
+    #   那是另一种事故: 板子白烧一轮)。
+    if isinstance(res, dict):
+        try:
+            res["disk"] = disk_space.disk_warning()
+        except Exception:
+            res["disk"] = None
+    return res
 
 
 @app.post("/api/test/stop")

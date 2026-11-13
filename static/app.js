@@ -73,6 +73,19 @@ createApp({
         // 后端推 alert 事件 → setAlert(); text 为空串 = **收起**横幅
         // (倒计时走完、后端开始真操作了 —— 那会儿屏已经是黑的, 挂着没意义)。
         const alertBanner = ref(null);
+        // ⚠️ **盘上空间提醒** (2026-11-13) —— **只在空间不够的时候才有值**。
+        //
+        //   空间够 ⇒ null ⇒ 界面上**一个字都不显示**。这是用户定的规矩:
+        //   「只在U盘空间不足的时候显示, 其他时候任何地方不显示提醒」。
+        //   ⇒ **不许**挂「剩余 54 GB」那种仪表盘 —— 工人不看, 看了也只会
+        //   麻木(狼来了 ⇒ 真出事那天他就不当回事了)。
+        //
+        //   不够 ⇒ 页面上挂一条提醒, 但**不拦开跑** —— 盘真满了还拦着不让
+        //   测, 那是另一种事故: 板子白烧一轮, 数据一样没存下来。
+        //
+        //   ⚠️ 这条**不是**「磁盘已满, 请勿使用」那种吓人的说法 ——
+        //   **第一句先讲「现在还能不能测」** (见 server/disk_space.py 的文案)。
+        const diskWarning = ref(null);
         let alertTimer = null;
         const setAlert = (text, level, seconds) => {
             if (alertTimer) { clearInterval(alertTimer); alertTimer = null; }
@@ -465,6 +478,8 @@ createApp({
             // ⚠️ loadConfig() 只在挂载时调一次, goConfig() **不重载** ——
             //    所以这里预填的值不会把工人已经改好的名字冲掉。
             testerName.value = (data.report && data.report.operator) || '';
+            // 盘上空间 (2026-11-13) —— **够 ⇒ null ⇒ 界面上一个字都不显示**。
+            diskWarning.value = data.disk || null;
             // 历史库坏过没有 —— **前端不留这一项**(2026-11-10 用户定:
             // 界面一个字都不许提, 只在 logs/ 和文档里说)。留着它就等于
             // 给「哪天又手痒加个提示」留了个口子 ⇒ 在这儿就掐掉。
@@ -540,6 +555,10 @@ createApp({
                 return;
             }
             runId.value = data.run_id;
+            // 盘上空间 —— **开跑这一刻再查一次**(页面加载时那份是快照;
+            // 页面开着不动几小时是常事 ⇒ 到真开跑的时候可能早写满了)。
+            // 够 ⇒ null ⇒ 不显示; 不够 ⇒ 挂一条提醒(**不拦**开跑)。
+            diskWarning.value = data.disk || null;
             isRunning.value = true;
             logs.value = [];
             window._retesting = false;
@@ -1513,6 +1532,7 @@ createApp({
             view, config, testList, tests, testOrder,
             isRunning, resultList, logs, logEl, logVisibleLines, computeLogLines,
             alertBanner, setAlert,
+            diskWarning,
             history, historyDetail, runId, expandedId,
             exportingId, exportError, reportPath, reportError, reportRunId,
             usbReportNote,

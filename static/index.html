@@ -127,6 +127,19 @@
             <button class="btn-text" @click="loadDeps">重新检查</button>
         </div>
 
+        <!-- ⚠️ 盘上空间提醒 (2026-11-13) —— **只在空间不够的时候才出现**。
+             空间够 ⇒ 这一整块**不渲染**(用户定的规矩: 「只在U盘空间不足的
+             时候显示, 其他时候任何地方不显示提醒」⇒ 不挂「剩余 54 GB」那种
+             仪表盘 —— 工人不看, 看了也只会麻木)。
+             放在各视图**外面**(依赖 banner 下面)⇒ 配置页 / 跑测试那屏 /
+             历史页都能看见 —— 因为盘是**一直在写**的, 不光是开跑那一刻。
+             ⚠️ 提醒**不拦开跑**: 盘真满了也照样能测, 拦着不让测板子就白
+             烧一轮。第一句先讲「现在还能不能测」(文案在后端出, 单一口径)。 -->
+        <div v-if="diskWarning" :class="['disk-warning', diskWarning.level]">
+            <span class="disk-warning-icon">⚠</span>
+            <span class="disk-warning-text">{{ diskWarning.message }}</span>
+        </div>
+
         <!-- =============== 配置页 =============== -->
         <main v-if="view === 'main'">
             <section class="config-panel">
